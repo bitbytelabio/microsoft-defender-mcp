@@ -1,0 +1,43 @@
+[package]
+name = "microsoft-defender-mcp-server"
+version = "0.1.0"
+edition = "2024"
+description = "MCP server for Microsoft Defender (Graph Security and Endpoint) APIs with read-only majority and gated mutations"
+license = "MIT"
+repository = "https://github.com/nguyenthdat/microsoft-defender-mcp"
+
+[dependencies]
+rmcp = { version = "1.8", features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+    "schemars",
+] }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "signal", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+anyhow = "1"
+thiserror = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"], default-features = false }
+percent-encoding = "2.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+axum = "0.8"
+tokio-util = "0.7"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 3
