@@ -2,9 +2,16 @@
 name = "microsoft-defender-mcp-server"
 version = "0.1.0"
 edition = "2024"
-description = "MCP server for Microsoft Defender (Graph Security and Endpoint) APIs with read-only majority and gated mutations"
+description = "Rust MCP server for Microsoft Defender XDR and Defender for Endpoint APIs"
 license = "MIT"
-repository = "https://github.com/nguyenthdat/microsoft-defender-mcp"
+repository = "https://github.com/bitbytelabio/microsoft-defender-mcp"
+homepage = "https://github.com/bitbytelabio/microsoft-defender-mcp"
+readme = "README.md"
+rust-version = "1.88"
+keywords = ["mcp", "microsoft-defender", "xdr", "secops", "cybersecurity"]
+categories = ["command-line-utilities", "network-programming"]
+publish = ["crates-io"]
+include = ["src/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [dependencies]
 rmcp = { version = "1.8", features = [

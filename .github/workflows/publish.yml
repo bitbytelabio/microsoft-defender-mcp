@@ -1,0 +1,50 @@
+name: Publish crate
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: crates-io-publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: crates-io
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install --profile minimal
+
+      - name: Validate release branch and package version
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "${GIT_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]]; then
+            echo "Publication is restricted to the default branch" >&2
+            exit 1
+          fi
+          package_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          echo "Publishing microsoft-defender-mcp-server ${package_version}"
+
+      - name: Verify package
+        run: cargo package --locked
+
+      - name: Publish crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish --locked

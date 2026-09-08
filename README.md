@@ -106,11 +106,27 @@ Following the principle of **least privilege**, grant only the application permi
 
 ## Installation & Build
 
-Build from source with an up-to-date Rust toolchain that supports the Rust 2024 edition. This project does not currently declare a minimum supported Rust version (MSRV).
+### Install via Cargo (crates.io)
+
+Install the pre-published crate directly from [crates.io](https://crates.io/crates/microsoft-defender-mcp-server):
+
+```bash
+cargo install microsoft-defender-mcp-server --locked
+```
+
+This installs the executable:
+```text
+microsoft-defender-mcp-server
+```
+Ensure Cargo's binary installation directory (typically `~/.cargo/bin`) is in your system `PATH`.
+
+### Build from Source
+
+Alternatively, build from source with an up-to-date Rust toolchain that supports the Rust 2024 edition:
 
 ```bash
 # Clone the repository
-git clone https://github.com/nguyenthdat/microsoft-defender-mcp.git
+git clone https://github.com/bitbytelabio/microsoft-defender-mcp.git
 cd microsoft-defender-mcp
 
 # Build release binary using locked dependencies
