@@ -3732,7 +3732,7 @@ impl DefenderServer {
 
 #[tool_handler(
     name = "microsoft-defender-mcp",
-    version = "0.1.0",
+    version = "0.2.0",
     instructions = "Investigate Microsoft Defender through Microsoft Graph Security and Defender for Endpoint APIs. \
                     86 tools are read-only. defender_library_file_upload and defender_endpoint_live_response_run \
                     can change cloud library files or endpoint state: clients must obtain explicit human approval \

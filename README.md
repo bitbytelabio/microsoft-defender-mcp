@@ -2,7 +2,7 @@
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for security investigation, threat intelligence, vulnerability management, and response workflows across Microsoft Defender XDR and Microsoft Defender for Endpoint (MDE).
 
-Built in Rust with the official [`rmcp`](https://crates.io/crates/rmcp) SDK (v1.8), the server exposes **88 tools** across Microsoft Graph Security and Defender for Endpoint APIs. **86 tools are read-only**. The two mutating tools—Live Response execution and library file upload—are disabled by default through `DEFENDER_ENABLE_LIVE_RESPONSE`; command execution can be narrowed further with an optional command allowlist.
+Built in Rust with the official [`rmcp`](https://crates.io/crates/rmcp) SDK (v3), the server exposes **88 tools** across Microsoft Graph Security and Defender for Endpoint APIs. **86 tools are read-only**. The two mutating tools—Live Response execution and library file upload—are disabled by default through `DEFENDER_ENABLE_LIVE_RESPONSE`; command execution can be narrowed further with an optional command allowlist.
 
 > **Security warning**
 > `defender_library_file_upload` changes the tenant's Live Response library. `defender_endpoint_live_response_run` can copy files to, execute scripts on, or retrieve files from managed endpoints. MCP clients should require explicit human confirmation before invoking either tool.
