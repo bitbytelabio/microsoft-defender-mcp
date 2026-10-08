@@ -20,24 +20,16 @@ Built in Rust with the official [`rmcp`](https://crates.io/crates/rmcp) SDK (v3)
 
 The server implements **88 tools** partitioned across two upstream API scopes:
 
-```text
-                               +-------------------------------------+
-                               |          MCP Client (LLM)           |
-                               +-------------------------------------+
-                                                  |
-                                   MCP Protocol (stdio / HTTP)
-                                                  |
-                               +-------------------------------------+
-                               |    microsoft-defender-mcp-server    |
-                               |    (In-memory OAuth2 token cache)   |
-                               +-------------------------------------+
-                                       /                     \
-       OAuth scope: https://graph.microsoft.com/.default     OAuth scope: https://api.securitycenter.microsoft.com/.default
-                                     /                         \
-            +-------------------------------+    +------------------------------------+
-            |      Microsoft Graph API      |    |    Defender for Endpoint API       |
-            | (Advanced Hunting, TI, XDR)   |    | (Machines, TVM, Alerts, Response)  |
-            +-------------------------------+    +------------------------------------+
+```mermaid
+flowchart TD
+    Client["MCP Client (LLM)"]
+    Server["microsoft-defender-mcp-server<br/>(in-memory OAuth2 token cache)"]
+    Graph["Microsoft Graph API<br/>(Advanced Hunting, TI, XDR)"]
+    MDE["Defender for Endpoint API<br/>(Machines, TVM, Alerts, Response)"]
+
+    Client -->|"MCP protocol (stdio / HTTP)"| Server
+    Server -->|"OAuth scope: https://graph.microsoft.com/.default"| Graph
+    Server -->|"OAuth scope: https://api.securitycenter.microsoft.com/.default"| MDE
 ```
 
 ### Tool Inventory & Categorization (88 Tools)
