@@ -50,3 +50,39 @@ pub fn internal_error(message: impl Into<std::borrow::Cow<'static, str>>) -> Mcp
 pub fn invalid_params(message: impl Into<std::borrow::Cow<'static, str>>) -> McpError {
     McpError::invalid_params(message, None)
 }
+
+/// Build a structured error for read-only violations.
+pub fn read_only_violation(tool_or_action: &str) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "error": format!("Server is operating in read-only mode: mutating operation '{tool_or_action}' is disallowed"),
+        "code": "read_only_violation"
+    }))
+}
+
+/// Build a protocol-level error for unknown tool actions.
+pub fn unknown_action_error(tool: &str, action: &str, valid_actions: &[&str]) -> McpError {
+    McpError::invalid_params(
+        format!(
+            "Unknown action '{action}' for tool '{tool}'. Valid actions are: {}",
+            valid_actions.join(", ")
+        ),
+        None,
+    )
+}
+
+/// Build a tool-level error for an investigation package that is still in progress (HTTP 404).
+pub fn package_not_ready(status: &str) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "error": format!("Investigation package is not ready yet (current status: {status}). Please retry when status is Succeeded."),
+        "httpStatus": 404,
+        "status": status,
+    }))
+}
+
+/// Build a tool-level error for artifact download and staging filesystem failures.
+pub fn staging_filesystem_error(err: impl std::fmt::Display) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "error": format!("Filesystem error in artifact staging directory: {err}"),
+        "code": "filesystem_error"
+    }))
+}

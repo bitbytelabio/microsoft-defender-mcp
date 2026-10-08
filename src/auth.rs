@@ -140,7 +140,6 @@ impl TokenManager {
     }
 }
 
-#[cfg(test)]
 impl TokenManager {
     /// Create a test token manager pre-seeded with valid dummy tokens for Graph and Endpoint scopes.
     pub fn for_test(http: reqwest::Client) -> Self {

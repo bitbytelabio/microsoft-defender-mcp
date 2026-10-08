@@ -8,6 +8,39 @@ use crate::constants::{
     GRAPH_SCOPE,
 };
 use crate::error::{http_error, network_error};
+use sha2::{Digest, Sha256};
+use std::path::Path;
+use tokio::io::AsyncWriteExt;
+
+/// Downloaded investigation or quarantine artifact details.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DownloadedArtifact {
+    pub status: String,
+    pub file_path: String,
+    pub file_size_bytes: u64,
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_action_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_sha1: Option<String>,
+}
+
+/// Ensure the staging directory exists. On Unix every directory created here gets mode
+/// `0700`, and the leaf directory is re-restricted to `0700` if it already existed.
+pub fn ensure_staging_directory(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        builder.mode(0o700);
+        builder.create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    builder.create(dir)?;
+    Ok(())
+}
 
 /// OData query parameters for list endpoints.
 #[derive(Debug, Default, Clone)]
@@ -312,9 +345,94 @@ impl EndpointClient {
 
         Ok(response_body)
     }
+
+    /// Stream a pre-authenticated (SAS) artifact URL into `dest_dir/dest_filename`.
+    ///
+    /// No bearer token is sent: SAS URLs carry their own authorization. The file is created
+    /// with mode `0600` on Unix (no window with wider permissions), the SHA-256 digest is
+    /// computed while streaming, and a partially written file is removed on failure.
+    pub async fn download_artifact(
+        &self,
+        download_url: &str,
+        dest_dir: &Path,
+        dest_filename: &str,
+        source_action_id: Option<String>,
+        source_sha1: Option<String>,
+    ) -> Result<DownloadedArtifact, rmcp::model::CallToolResult> {
+        ensure_staging_directory(dest_dir).map_err(|e| {
+            crate::error::staging_filesystem_error(format!(
+                "failed to create staging directory {}: {e}",
+                dest_dir.display()
+            ))
+        })?;
+
+        let resp = self
+            .http
+            .get(download_url)
+            .send()
+            .await
+            .map_err(|e| network_error(&e, "artifact download"))?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(http_error(status, "artifact download"));
+        }
+
+        let file_path = dest_dir.join(dest_filename);
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(&file_path).await.map_err(|e| {
+            crate::error::staging_filesystem_error(format!(
+                "failed to create artifact file {}: {e}",
+                file_path.display()
+            ))
+        })?;
+
+        let (file_size_bytes, sha256) = match stream_to_file(resp, file).await {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&file_path).await;
+                return Err(e);
+            }
+        };
+
+        let file_path = std::fs::canonicalize(&file_path).unwrap_or(file_path);
+        Ok(DownloadedArtifact {
+            status: "Downloaded".to_string(),
+            file_path: file_path.to_string_lossy().into_owned(),
+            file_size_bytes,
+            sha256,
+            source_action_id,
+            source_sha1,
+        })
+    }
 }
 
-#[cfg(test)]
+/// Copy a response body into `file`, returning the byte count and lowercase hex SHA-256.
+async fn stream_to_file(
+    mut resp: reqwest::Response,
+    mut file: tokio::fs::File,
+) -> Result<(u64, String), rmcp::model::CallToolResult> {
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| network_error(&e, "artifact download streaming"))?
+    {
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.map_err(|e| {
+            crate::error::staging_filesystem_error(format!("failed to write artifact file: {e}"))
+        })?;
+        total += chunk.len() as u64;
+    }
+    file.flush().await.map_err(|e| {
+        crate::error::staging_filesystem_error(format!("failed to flush artifact file: {e}"))
+    })?;
+    Ok((total, format!("{:x}", hasher.finalize())))
+}
+
 impl GraphClient {
     /// Test constructor supporting loopback fixture endpoints.
     pub fn for_test(token_manager: TokenManager, base_url: String) -> Self {
@@ -325,8 +443,6 @@ impl GraphClient {
         }
     }
 }
-
-#[cfg(test)]
 impl EndpointClient {
     /// Test constructor supporting loopback fixture endpoints.
     pub fn for_test(token_manager: TokenManager, base_url: String) -> Self {

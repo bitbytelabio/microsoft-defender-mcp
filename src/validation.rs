@@ -130,6 +130,54 @@ pub fn validate_sha1(hash: &str) -> Result<&str, rmcp::ErrorData> {
     Ok(trimmed)
 }
 
+/// Validate a Defender machine ID (40-character hex string).
+///
+/// Returns the trimmed machine ID slice on success.
+pub fn validate_machine_id(machine_id: &str) -> Result<&str, rmcp::ErrorData> {
+    let trimmed = machine_id.trim();
+    if !SHA1_RE.is_match(trimmed) {
+        return Err(invalid_params(
+            "machine_id must be a 40-character hex string (Defender machine ID)",
+        ));
+    }
+    Ok(trimmed)
+}
+
+/// Validate a machine action ID (hex string or GUID).
+///
+/// Returns the trimmed ID. Only ASCII alphanumerics and `-` are accepted (max 64 chars), so
+/// the value is safe both as a URL path segment and inside a staged artifact file name.
+pub fn validate_action_id(action_id: &str) -> Result<&str, rmcp::ErrorData> {
+    let trimmed = action_id.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 64
+        || !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(invalid_params(
+            "action_id must be a machine action GUID or hex ID (ASCII letters, digits, and '-' only)",
+        ));
+    }
+    Ok(trimmed)
+}
+
+/// Validate a request comment (>= 10 characters).
+pub fn validate_comment<'a>(
+    comment: &'a str,
+    field_name: &str,
+) -> Result<&'a str, rmcp::ErrorData> {
+    let trimmed = comment.trim();
+    let char_count = trimmed.chars().count();
+    if char_count < crate::constants::MIN_LIVE_RESPONSE_COMMENT_LEN {
+        return Err(invalid_params(format!(
+            "{field_name} must be at least {} characters describing the purpose (got {char_count})",
+            crate::constants::MIN_LIVE_RESPONSE_COMMENT_LEN
+        )));
+    }
+    Ok(trimmed)
+}
+
 /// Validate a file hash — accepts MD5 (32), SHA1 (40), or SHA256 (64) hex hash.
 ///
 /// Returns the trimmed hash slice on success.
@@ -334,26 +382,9 @@ pub fn validate_kql_query(query: &str) -> Result<(), rmcp::ErrorData> {
 // Live Response validators
 // ---------------------------------------------------------------------------
 
-/// Validate the Live Response commands array.
+/// Validate the Live Response commands array against size limits and an optional
+/// operator allowlist (resolved from `--allowed-commands` / `DEFENDER_LIVE_RESPONSE_ALLOWED_COMMANDS`).
 pub fn validate_live_response_commands(
-    commands: &[crate::server::LiveResponseCommand],
-) -> Result<(), rmcp::ErrorData> {
-    let allowed: Option<Vec<String>> =
-        std::env::var(crate::constants::ENV_LIVE_RESPONSE_ALLOWED_COMMANDS)
-            .ok()
-            .map(|s| {
-                s.split(',')
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-                    .collect()
-            });
-
-    validate_live_response_commands_with_allowlist(commands, allowed.as_deref())
-}
-
-/// Pure helper for validating Live Response commands with an optional allowlist.
-/// Extracted so unit tests can test allowlist rules without mutating global process environment.
-fn validate_live_response_commands_with_allowlist(
     commands: &[crate::server::LiveResponseCommand],
     allowed: Option<&[String]>,
 ) -> Result<(), rmcp::ErrorData> {
@@ -382,21 +413,6 @@ fn validate_live_response_commands_with_allowlist(
     }
 
     Ok(())
-}
-
-/// Validate the Live Response comment.
-///
-/// Returns the trimmed comment slice. Requires at least 10 trimmed characters
-/// (based on Unicode character count, not raw byte length) describing the purpose.
-pub fn validate_live_response_comment(comment: &str) -> Result<&str, rmcp::ErrorData> {
-    let trimmed = comment.trim();
-    if trimmed.chars().count() < crate::constants::MIN_LIVE_RESPONSE_COMMENT_LEN {
-        return Err(invalid_params(format!(
-            "comment must be at least {} trimmed characters describing the purpose of this live response action",
-            crate::constants::MIN_LIVE_RESPONSE_COMMENT_LEN
-        )));
-    }
-    Ok(trimmed)
 }
 
 // ---------------------------------------------------------------------------
@@ -846,7 +862,7 @@ mod tests {
 
     #[test]
     fn test_lr_commands_empty_rejected() {
-        let result = validate_live_response_commands_with_allowlist(&[], None);
+        let result = validate_live_response_commands(&[], None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("cannot be empty"));
@@ -858,7 +874,7 @@ mod tests {
         for _ in 0..21 {
             cmds.push(make_cmd(crate::server::LiveResponseCommandType::GetFile));
         }
-        let result = validate_live_response_commands_with_allowlist(&cmds, None);
+        let result = validate_live_response_commands(&cmds, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("exceeds maximum"));
@@ -870,7 +886,7 @@ mod tests {
             make_cmd(crate::server::LiveResponseCommandType::GetFile),
             make_cmd(crate::server::LiveResponseCommandType::RunScript),
         ];
-        assert!(validate_live_response_commands_with_allowlist(&cmds, None).is_ok());
+        assert!(validate_live_response_commands(&cmds, None).is_ok());
     }
 
     #[test]
@@ -880,14 +896,14 @@ mod tests {
             make_cmd(crate::server::LiveResponseCommandType::GetFile),
             make_cmd(crate::server::LiveResponseCommandType::RunScript),
         ];
-        assert!(validate_live_response_commands_with_allowlist(&cmds, Some(&allowed)).is_ok());
+        assert!(validate_live_response_commands(&cmds, Some(&allowed)).is_ok());
     }
 
     #[test]
     fn test_lr_commands_allowlist_rejected() {
         let allowed = vec!["GetFile".to_string()];
         let cmds = vec![make_cmd(crate::server::LiveResponseCommandType::RunScript)];
-        let result = validate_live_response_commands_with_allowlist(&cmds, Some(&allowed));
+        let result = validate_live_response_commands(&cmds, Some(&allowed));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("not in the allowed list"));
@@ -897,15 +913,18 @@ mod tests {
     #[test]
     fn test_lr_comment_valid_ascii() {
         assert_eq!(
-            validate_live_response_comment("Investigating suspicious process on the endpoint")
-                .unwrap(),
+            validate_comment(
+                "Investigating suspicious process on the endpoint",
+                "comment"
+            )
+            .unwrap(),
             "Investigating suspicious process on the endpoint"
         );
     }
 
     #[test]
     fn test_lr_comment_short_rejected() {
-        let result = validate_live_response_comment("short");
+        let result = validate_comment("short", "comment");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("must be at least"));
@@ -913,8 +932,8 @@ mod tests {
 
     #[test]
     fn test_lr_comment_empty_rejected() {
-        assert!(validate_live_response_comment("").is_err());
-        assert!(validate_live_response_comment("          ").is_err());
+        assert!(validate_comment("", "comment").is_err());
+        assert!(validate_comment("          ", "comment").is_err());
     }
 
     #[test]
@@ -923,13 +942,13 @@ mod tests {
         let short_multibyte = "你好世界！";
         assert_eq!(short_multibyte.len(), 15);
         assert_eq!(short_multibyte.chars().count(), 5);
-        assert!(validate_live_response_comment(short_multibyte).is_err());
+        assert!(validate_comment(short_multibyte, "comment").is_err());
 
         // 10 multibyte characters (30 UTF-8 bytes) -> accepted because character count 10 >= 10
         let valid_multibyte = "你好世界！你好世界！";
         assert_eq!(valid_multibyte.chars().count(), 10);
         assert_eq!(
-            validate_live_response_comment(valid_multibyte).unwrap(),
+            validate_comment(valid_multibyte, "comment").unwrap(),
             valid_multibyte
         );
     }
@@ -937,9 +956,31 @@ mod tests {
     #[test]
     fn test_lr_comment_whitespace_trim() {
         assert_eq!(
-            validate_live_response_comment("   Investigating suspicious process on endpoint   ")
-                .unwrap(),
+            validate_comment(
+                "   Investigating suspicious process on endpoint   ",
+                "comment"
+            )
+            .unwrap(),
             "Investigating suspicious process on endpoint"
         );
+    }
+
+    #[test]
+    fn test_validate_machine_id() {
+        let valid = "1e5bc9d7e413ddd7902c2932e418702b84d0cc07";
+        assert_eq!(validate_machine_id(valid).unwrap(), valid);
+        assert!(validate_machine_id("invalid-id").is_err());
+        assert!(validate_machine_id("1e5bc9d7e413ddd7902c2932e418702b84d0cc0").is_err()); // 39 chars
+    }
+
+    #[test]
+    fn test_validate_action_id() {
+        let valid = "7327b54fd718525cbca07dacde913b5ac3c85673";
+        assert_eq!(validate_action_id(valid).unwrap(), valid);
+        assert!(validate_action_id("").is_err());
+        assert!(validate_action_id("..").is_err());
+        assert!(validate_action_id("../etc/passwd").is_err());
+        assert!(validate_action_id("action/id").is_err());
+        assert!(validate_action_id("action\\id").is_err());
     }
 }

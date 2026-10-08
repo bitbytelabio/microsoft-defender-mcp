@@ -2,10 +2,16 @@
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for security investigation, threat intelligence, vulnerability management, and response workflows across Microsoft Defender XDR and Microsoft Defender for Endpoint (MDE).
 
-Built in Rust with the official [`rmcp`](https://crates.io/crates/rmcp) SDK (v3), the server exposes **88 tools** across Microsoft Graph Security and Defender for Endpoint APIs. **86 tools are read-only**. The two mutating tools—Live Response execution and library file upload—are disabled by default through `DEFENDER_ENABLE_LIVE_RESPONSE`; command execution can be narrowed further with an optional command allowlist.
+Built in Rust with the official [`rmcp`](https://crates.io/crates/rmcp) SDK (v3), the server exposes Microsoft Graph Security and Defender for Endpoint APIs in one of two catalogs:
+
+- **Granular mode** (default): **88 tools**, **86 read-only**. The two mutating tools—Live Response execution and library file upload—are disabled unless the server starts with `--enable-live-response`.
+- **Consolidated mode** (`--tool-mode consolidated`): **7 action-based tools** covering the same capabilities plus forensic artifact retrieval—6 read-only (`defender_hunting`, `defender_ti`, `defender_incidents_alerts`, `defender_machines`, `defender_vulnerabilities`, `defender_forensics`) and 1 mutating (`defender_response`).
+
+`--read-only` hides every mutating tool from `tools/list` and rejects calls to them locally, before any upstream request.
 
 > **Security warning**
-> `defender_library_file_upload` changes the tenant's Live Response library. `defender_endpoint_live_response_run` can copy files to, execute scripts on, or retrieve files from managed endpoints. MCP clients should require explicit human confirmation before invoking either tool.
+> `defender_library_file_upload` changes the tenant's Live Response library. `defender_endpoint_live_response_run` can copy files to, execute scripts on, or retrieve files from managed endpoints. `defender_response` can additionally collect investigation packages and stop-and-quarantine files. MCP clients should require explicit human confirmation before invoking any of them.
+> `defender_forensics` downloads investigation packages and retrieved (potentially malicious) files to the local quarantine directory. Files are written with mode `0600` and never executed; analyze them only in an isolated environment.
 > The HTTP transport has no built-in TLS or client authentication. Binding beyond `127.0.0.1` requires an authenticated reverse proxy, VPN, or equivalent trusted network boundary.
 
 ---
@@ -98,9 +104,11 @@ Following the principle of **least privilege**, grant only the application permi
 | **Defender for Endpoint** | `File.Read.All` | Global file reputation and organizational file prevalence |
 | **Defender for Endpoint** | `Alert.Read.All` | Endpoint alerts plus IP- and user-related alerts |
 | **Defender for Endpoint** | `Alert.ReadWrite.All` | Required by the upstream API for domain- and file-related alert queries; also accepted for IP/user alert queries |
-| **Defender for Endpoint** | `Machine.ReadWrite.All` | Required by the upstream API for domain-, file-, and user-related machine queries and Live Response result links |
-| **Defender for Endpoint** | `Machine.LiveResponse` | Live Response command execution (`defender_endpoint_live_response_run`) |
-| **Defender for Endpoint** | `Library.Manage` | Live Response library uploads (`defender_library_file_upload`) |
+| **Defender for Endpoint** | `Machine.ReadWrite.All` | Required by the upstream API for domain-, file-, and user-related machine queries, Live Response result links, and investigation package download links (`getPackageUri`) |
+| **Defender for Endpoint** | `Machine.LiveResponse` | Live Response command execution (`defender_endpoint_live_response_run`, `defender_response` `live_response_run`) |
+| **Defender for Endpoint** | `Library.Manage` | Live Response library uploads (`defender_library_file_upload`, `defender_response` `upload_library_file`) |
+| **Defender for Endpoint** | `Machine.CollectForensics` | Investigation package collection (`defender_response` `collect_investigation_package`) |
+| **Defender for Endpoint** | `Machine.StopAndQuarantine` | Stop-and-quarantine (`defender_response` `stop_and_quarantine_file`) |
 
 ---
 
@@ -142,18 +150,24 @@ target/release/microsoft-defender-mcp-server
 
 ## Configuration
 
-Configuration is managed entirely through environment variables.
+Credentials come from environment variables. Every server option is a CLI flag with an environment-variable fallback; a flag on the command line overrides its environment variable. Run `microsoft-defender-mcp-server --help` for the full list.
 
 | Variable | Required | Default | Description |
 | :--- | :---: | :---: | :--- |
 | `AZURE_TENANT_ID` | **Yes** | — | Microsoft Entra ID Directory (tenant) ID (GUID). |
 | `AZURE_CLIENT_ID` | **Yes** | — | Application (client) ID registered in Entra ID (GUID). |
 | `AZURE_CLIENT_SECRET` | **Yes** | — | Application client secret string. |
-| `TRANSPORT` | No | `stdio` | Transport protocol: `stdio` (default) or `http`. |
-| `BIND_ADDRESS` | No | `127.0.0.1:8000` | Socket address for HTTP transport (`TRANSPORT=http`). |
-| `DEFENDER_ENABLE_LIVE_RESPONSE` | No | `false` | Gatekeeper for Live Response tools. Must be set to `true` to enable mutating and result tools. |
-| `DEFENDER_LIVE_RESPONSE_ALLOWED_COMMANDS` | No | *(all)* | Optional comma-separated allowlist for `defender_endpoint_live_response_run`: `PutFile`, `RunScript`, `GetFile`. It does not restrict library uploads or result-link retrieval. |
 | `RUST_LOG` | No | `info` | Tracing log level filter (e.g. `info`, `debug`, `warn`). |
+
+| Flag | Environment variable | Default | Description |
+| :--- | :--- | :---: | :--- |
+| `--transport <stdio\|http>` | `TRANSPORT` | `stdio` | MCP transport. |
+| `--bind-address <ADDR>` | `BIND_ADDRESS` | `127.0.0.1:8000` | Socket address for HTTP transport. A non-loopback address prints a security warning to `stderr`. |
+| `--tool-mode <granular\|consolidated>` | `DEFENDER_TOOL_MODE` | `granular` | Tool catalog: 88 granular tools or 7 action-based tools. |
+| `--read-only` | `DEFENDER_READ_ONLY` | `false` | Hide mutating tools from discovery and reject mutating calls locally. Overrides `--enable-live-response`. |
+| `--enable-live-response` | `DEFENDER_ENABLE_LIVE_RESPONSE` | `false` | Enable mutating tools/actions (Live Response, library upload, investigation package collection, stop-and-quarantine) and Live Response result links. |
+| `--allowed-commands <LIST>` | `DEFENDER_LIVE_RESPONSE_ALLOWED_COMMANDS` | *(all)* | Comma-separated Live Response command allowlist: `PutFile`, `RunScript`, `GetFile`. Restricts only Live Response runs. |
+| `--quarantine-dir <DIR>` | `DEFENDER_QUARANTINE_DIR` | `./quarantine_artifacts` | Where `defender_forensics` stages downloads (created with mode `0700`). |
 
 ### Testing & Development Overrides (Advanced)
 
@@ -242,7 +256,41 @@ Add the server to your MCP client configuration (e.g., `claude_desktop_config.js
 }
 ```
 
-Enabling `DEFENDER_ENABLE_LIVE_RESPONSE` also enables library upload and result-link retrieval. The command allowlist narrows only `defender_endpoint_live_response_run`; it is not an upload allowlist.
+Enabling Live Response also enables library upload and result-link retrieval. The command allowlist narrows only Live Response runs; it is not an upload allowlist.
+
+### Consolidated, Read-Only Configuration
+
+Seven action-based tools, no mutating surface:
+
+```json
+{
+  "mcpServers": {
+    "microsoft-defender": {
+      "command": "/absolute/path/to/microsoft-defender-mcp/target/release/microsoft-defender-mcp-server",
+      "args": ["--tool-mode", "consolidated", "--read-only", "--quarantine-dir", "/secure/quarantine"],
+      "env": {
+        "AZURE_TENANT_ID": "00000000-0000-0000-0000-000000000000",
+        "AZURE_CLIENT_ID": "11111111-1111-1111-1111-111111111111",
+        "AZURE_CLIENT_SECRET": "your-azure-client-secret"
+      }
+    }
+  }
+}
+```
+
+### Consolidated Tool Catalog
+
+Each consolidated tool takes an `action` plus the parameters of the corresponding granular tool (`id` stands in for the action's identifier). Unknown actions and parameters an action does not support are rejected with `invalid_params`, which lists the valid actions. The full action list and parameters are in each tool's description and JSON schema.
+
+| Tool | Annotations | Actions |
+| :--- | :--- | :--- |
+| `defender_hunting` | read-only | `run` |
+| `defender_ti` | read-only | 39 actions mirroring every `defender_ti_*` tool (profiles, articles, indicators, hosts, SSL, WHOIS, passive DNS, CVEs) |
+| `defender_incidents_alerts` | read-only | `xdr_alert_list/get`, `xdr_incident_list/get`, `endpoint_alert_list/get`, `ip_/domain_/file_/user_related_alerts` |
+| `defender_machines` | read-only | `machine_list/get`, `logged_on_users`, `find_by_tag`, `installed_software`, `security_recommendations`, `ip_/domain_/file_statistics`, `domain_/file_/user_related_machines`, `file_get` |
+| `defender_vulnerabilities` | read-only | `software_*`, `vulnerability_*`, `recommendation_*`, `remediation_*`, `exposure_score`, `exposure_score_by_machine_groups` |
+| `defender_forensics` | read-only | `machine_action_list`, `machine_action_get_status`, `get_investigation_package_sas_url`, `download_investigation_package`, `download_quarantined_file`, `live_response_get_result` |
+| `defender_response` | **destructive** | `collect_investigation_package`, `stop_and_quarantine_file`, `live_response_run`, `upload_library_file` |
 
 ---
 
@@ -359,6 +407,32 @@ Fetches the SAS download URL for the output of a completed `RunScript` or `GetFi
 ```
 *Validation:* `command_index` must be zero or positive (`>= 0`).
 
+### 5. Forensic Artifact Retrieval (Consolidated Mode)
+
+Collect an investigation package (mutating; requires `--enable-live-response` and human approval), poll the action, then stage the archive locally:
+
+```json
+{ "name": "defender_response", "arguments": { "action": "collect_investigation_package", "machine_id": "1e5bc9d7e413ddd7902c2932e418702b84d0cc07", "comment": "Incident 4124 triage: suspicious PowerShell" } }
+{ "name": "defender_forensics", "arguments": { "action": "machine_action_get_status", "action_id": "7327b54fd718525cbca07dacde913b5ac3c85673" } }
+{ "name": "defender_forensics", "arguments": { "action": "download_investigation_package", "action_id": "7327b54fd718525cbca07dacde913b5ac3c85673" } }
+```
+
+The download response reports the staged file:
+
+```json
+{
+  "status": "Downloaded",
+  "file_path": "/secure/quarantine/investigation_package_7327b54fd718525cbca07dacde913b5ac3c85673.zip",
+  "file_size_bytes": 14258900,
+  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "source_action_id": "7327b54fd718525cbca07dacde913b5ac3c85673"
+}
+```
+
+- If the package is not ready, the tool returns `httpStatus: 404` with the action's current `status`; retry once it is `Succeeded`. `getPackageUri` is rate-limited upstream to 2 calls/minute.
+- **Malware samples:** the public API has no "download quarantined file by SHA-1" endpoint (that is portal-only). Retrieve a file with a Live Response `GetFile` command, then call `download_quarantined_file` with the run's `action_id`, the `command_index` of the `GetFile` command, and optionally `sha1` to name the archive `quarantine_{sha1}.zip`.
+- `destination_dir` may name a relative subdirectory inside the quarantine directory; absolute paths and `..` are rejected. SAS URLs are fetched without the bearer token, a partial download is deleted on failure, and staged files are never executed.
+
 ---
 
 ## Limits, Pagination & Error Handling
@@ -412,6 +486,10 @@ The test matrix exercises:
 - KQL, IP, hostname, hash, filename, and Unicode-boundary validation.
 - Live Response gating, typed commands, command allowlists, and result indices.
 - Upstream success parsing and HTTP error-status preservation through real loopback requests.
+- Granular (88) and consolidated (7) catalogs and their exact safety annotations; routing of every advertised consolidated action.
+- `--read-only` enforcement end to end over MCP stdio against the real binary: mutating tools hidden and rejected with `read_only_violation`.
+- CLI flags, environment fallbacks, and flag-over-environment precedence.
+- Forensic staging: `0700`/`0600` permissions, SHA-256 digests, package-not-ready reporting, and quarantine-directory confinement.
 
 ---
 

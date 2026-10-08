@@ -365,7 +365,7 @@ impl LiveResponseCommandType {
 }
 
 /// A single command in a Live Response sequence.
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LiveResponseCommand {
     /// Command type. PutFile copies a library file to the device; RunScript executes a
@@ -380,7 +380,7 @@ pub struct LiveResponseCommand {
 }
 
 /// A key-value parameter for a Live Response command.
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LiveResponseParam {
     /// Microsoft command parameter key, such as FileName, ScriptName, Path, or Args.
@@ -699,26 +699,446 @@ pub struct LiveResponseLibraryUploadInput {
 }
 
 // ---------------------------------------------------------------------------
+// Consolidated domain dispatchers: action catalogs and inputs
+// ---------------------------------------------------------------------------
+
+/// Tools (granular or consolidated) that can change endpoint or tenant state. They are omitted
+/// from discovery and rejected before any network call when the server runs `--read-only`.
+pub const MUTATING_TOOLS: &[&str] = &[
+    "defender_library_file_upload",
+    "defender_endpoint_live_response_run",
+    "defender_response",
+];
+
+pub const HUNTING_ACTIONS: &[&str] = &["run"];
+
+pub const TI_ACTIONS: &[&str] = &[
+    "intel_profiles_list",
+    "intel_profile_get",
+    "intel_profile_indicators_list",
+    "intel_profile_indicator_get",
+    "intel_profile_indicators_global_list",
+    "articles_list",
+    "article_get",
+    "article_indicators_list",
+    "article_indicator_get",
+    "article_indicators_global_list",
+    "host_get",
+    "host_reputation_get",
+    "host_components_list",
+    "host_component_get",
+    "host_cookies_list",
+    "host_cookie_get",
+    "host_ports_list",
+    "host_port_get",
+    "host_trackers_list",
+    "host_tracker_get",
+    "host_subdomains_list",
+    "host_ssl_certs_list",
+    "host_whois_get",
+    "host_whois_history_list",
+    "host_pairs_list",
+    "host_pair_get",
+    "host_child_pairs_list",
+    "host_parent_pairs_list",
+    "host_passive_dns_list",
+    "host_passive_dns_reverse_list",
+    "ssl_certs_list",
+    "ssl_cert_get",
+    "ssl_cert_related_hosts_list",
+    "whois_records_list",
+    "whois_record_get",
+    "passive_dns_get",
+    "vulnerability_get",
+    "vulnerability_components_list",
+    "vulnerability_component_get",
+];
+
+pub const INCIDENTS_ALERTS_ACTIONS: &[&str] = &[
+    "xdr_alert_list",
+    "xdr_alert_get",
+    "xdr_incident_list",
+    "xdr_incident_get",
+    "endpoint_alert_list",
+    "endpoint_alert_get",
+    "ip_related_alerts",
+    "domain_related_alerts",
+    "file_related_alerts",
+    "user_related_alerts",
+];
+
+pub const MACHINES_ACTIONS: &[&str] = &[
+    "machine_list",
+    "machine_get",
+    "logged_on_users",
+    "find_by_tag",
+    "installed_software",
+    "security_recommendations",
+    "ip_statistics",
+    "domain_statistics",
+    "domain_related_machines",
+    "file_get",
+    "file_statistics",
+    "file_related_machines",
+    "user_related_machines",
+];
+
+pub const VULNERABILITIES_ACTIONS: &[&str] = &[
+    "software_list",
+    "software_get",
+    "software_machines",
+    "software_vulnerabilities",
+    "software_missing_kbs",
+    "software_distribution",
+    "vulnerability_list",
+    "vulnerability_get_by_cve",
+    "vulnerability_get_machines",
+    "vulnerability_get_by_machine_software",
+    "recommendation_list",
+    "recommendation_get",
+    "recommendation_machines",
+    "recommendation_vulnerabilities",
+    "recommendation_by_software",
+    "remediation_list",
+    "remediation_get",
+    "remediation_exposed_devices",
+    "exposure_score",
+    "exposure_score_by_machine_groups",
+];
+
+pub const FORENSICS_ACTIONS: &[&str] = &[
+    "machine_action_list",
+    "machine_action_get_status",
+    "get_investigation_package_sas_url",
+    "download_investigation_package",
+    "download_quarantined_file",
+    "live_response_get_result",
+];
+
+pub const RESPONSE_ACTIONS: &[&str] = &[
+    "collect_investigation_package",
+    "live_response_run",
+    "upload_library_file",
+    "stop_and_quarantine_file",
+];
+
+fn default_hunting_action() -> String {
+    "run".to_string()
+}
+
+/// Input for `defender_hunting`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HuntingInput {
+    /// Hunting action (only `run`; default `run`).
+    #[serde(default = "default_hunting_action")]
+    pub action: String,
+    /// Read-only KQL query against the Defender XDR advanced-hunting schema.
+    #[schemars(length(min = 1, max = 128000))]
+    pub query: String,
+    /// ISO 8601 duration or interval (default `P30D`).
+    #[serde(default)]
+    pub timespan: Option<String>,
+}
+
+/// Input for `defender_ti`. Unused fields must be omitted; each action accepts the same
+/// fields as its granular `defender_ti_<action>` tool, with `id` standing in for the
+/// action's identifier (profile, article, indicator, certificate, record, or CVE ID).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ThreatIntelInput {
+    /// Threat-intelligence action name (see tool description).
+    pub action: String,
+    /// Entity identifier: profile/article/indicator/component/cookie/port/tracker/pair/certificate/record ID, or CVE ID for `vulnerability_*`.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Domain name or IP literal for `host_*` actions.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// Component ID for `vulnerability_component_get`.
+    #[serde(default)]
+    pub component_id: Option<String>,
+    /// Page size (default 50, max 1000).
+    #[serde(default)]
+    pub top: Option<i32>,
+    /// Number of results to skip.
+    #[serde(default)]
+    pub skip: Option<i32>,
+    /// OData `$filter` expression.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// OData `$select` list.
+    #[serde(default)]
+    pub select: Option<String>,
+    /// OData `$expand` list.
+    #[serde(default)]
+    pub expand: Option<String>,
+    /// OData `$search` term (articles).
+    #[serde(default)]
+    pub search: Option<String>,
+    /// Request `$count=true`.
+    #[serde(default)]
+    pub count: Option<bool>,
+}
+
+/// Input for `defender_incidents_alerts`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IncidentsAlertsInput {
+    /// Incident/alert action name (see tool description).
+    pub action: String,
+    /// Alert ID, incident ID, or indicator (IP, domain, SHA-1, username) for `*_related_alerts`.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Page size.
+    #[serde(default)]
+    pub top: Option<i32>,
+    /// Number of results to skip.
+    #[serde(default)]
+    pub skip: Option<i32>,
+    /// OData `$filter` expression.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// OData `$select` list (XDR lists).
+    #[serde(default)]
+    pub select: Option<String>,
+    /// OData `$expand` list (XDR lists, `xdr_incident_get`).
+    #[serde(default)]
+    pub expand: Option<String>,
+    /// OData `$search` term (XDR lists).
+    #[serde(default)]
+    pub search: Option<String>,
+    /// Request `$count=true` (XDR lists).
+    #[serde(default)]
+    pub count: Option<bool>,
+}
+
+/// Input for `defender_machines`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MachinesInput {
+    /// Machine action name (see tool description).
+    pub action: String,
+    /// 40-hex Defender machine ID for `machine_get`, `logged_on_users`, `installed_software`, `security_recommendations`.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    /// Indicator for indicator actions: IP, domain, file hash, username, or tag name.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Tag value for `find_by_tag`.
+    #[serde(default)]
+    pub tag_name: Option<String>,
+    /// Prefix tag matching for `find_by_tag`.
+    #[serde(default)]
+    pub use_starts_with: Option<bool>,
+    /// Statistics look-back hours (1–720).
+    #[serde(default)]
+    pub look_back_hours: Option<i32>,
+    /// Page size (max 10000).
+    #[serde(default)]
+    pub top: Option<i32>,
+    /// Number of results to skip.
+    #[serde(default)]
+    pub skip: Option<i32>,
+    /// OData `$filter` expression.
+    #[serde(default)]
+    pub filter: Option<String>,
+}
+
+/// Input for `defender_vulnerabilities`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VulnerabilitiesInput {
+    /// Vulnerability/software action name (see tool description).
+    pub action: String,
+    /// Software ID, CVE ID, recommendation ID, or remediation ID.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// CVE identifier (alternative to `id` for `vulnerability_*`).
+    #[serde(default)]
+    pub cve_id: Option<String>,
+    /// Software ID (alternative to `id` for `software_*`).
+    #[serde(default)]
+    pub software_id: Option<String>,
+    /// Page size (max 10000).
+    #[serde(default)]
+    pub top: Option<i32>,
+    /// Number of results to skip.
+    #[serde(default)]
+    pub skip: Option<i32>,
+    /// OData `$filter` expression.
+    #[serde(default)]
+    pub filter: Option<String>,
+}
+
+/// Input for `defender_forensics` (read-only remotely; download actions write to local staging).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ForensicsInput {
+    /// Forensics action name (see tool description).
+    pub action: String,
+    /// Machine action ID (GUID or hex).
+    #[serde(default)]
+    pub action_id: Option<String>,
+    /// SHA-1 of the retrieved file; names the staged archive `quarantine_{sha1}.zip`.
+    #[serde(default)]
+    pub sha1: Option<String>,
+    /// Zero-based Live Response command index (default 0).
+    #[serde(default)]
+    pub command_index: Option<i32>,
+    /// Relative subdirectory inside the configured quarantine directory; absolute paths and `..` are rejected.
+    #[serde(default)]
+    pub destination_dir: Option<String>,
+    /// Page size for `machine_action_list` (max 10000).
+    #[serde(default)]
+    pub top: Option<i32>,
+    /// Number of results to skip.
+    #[serde(default)]
+    pub skip: Option<i32>,
+    /// OData `$filter` expression.
+    #[serde(default)]
+    pub filter: Option<String>,
+}
+
+/// Input for `defender_response` (mutating, gated).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseInput {
+    /// Response action name (see tool description).
+    pub action: String,
+    /// Target 40-hex Defender machine ID.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    /// Audit justification (at least 10 characters).
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// Live Response commands for `live_response_run` (max 20).
+    #[serde(default)]
+    pub commands: Option<Vec<LiveResponseCommand>>,
+    /// Library file basename for `upload_library_file`.
+    #[serde(default)]
+    pub file_name: Option<String>,
+    /// Non-empty UTF-8 content for `upload_library_file`.
+    #[serde(default)]
+    pub file_content: Option<String>,
+    /// Library file description for `upload_library_file`.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Script parameter guidance for `upload_library_file`.
+    #[serde(default)]
+    pub parameters_description: Option<String>,
+    /// Overwrite an existing library file (destructive).
+    #[serde(default)]
+    pub override_if_exists: Option<bool>,
+    /// 40-hex SHA-1 for `stop_and_quarantine_file`.
+    #[serde(default)]
+    pub sha1: Option<String>,
+}
+
+/// Serialize a dispatcher input into granular-tool arguments: drop `action` and absent fields.
+fn granular_args<T: Serialize>(input: &T) -> serde_json::Map<String, serde_json::Value> {
+    let mut args = match serde_json::to_value(input) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    args.remove("action");
+    args.retain(|_, v| !v.is_null());
+    args
+}
+
+/// Move `from` to `to` when the target granular input has no `id` alias for that field.
+fn rename_arg(args: &mut serde_json::Map<String, serde_json::Value>, from: &str, to: &str) {
+    if !args.contains_key(to)
+        && let Some(v) = args.remove(from)
+    {
+        args.insert(to.to_string(), v);
+    }
+}
+
+/// Extract `httpStatus` from a structured tool error produced by `error::http_error`.
+fn http_status_of(result: &CallToolResult) -> Option<u64> {
+    result
+        .structured_content
+        .as_ref()
+        .and_then(|v| v.get("httpStatus"))
+        .and_then(serde_json::Value::as_u64)
+}
+
+fn required<'a>(value: &'a Option<String>, name: &str, action: &str) -> Result<&'a str, McpError> {
+    value
+        .as_deref()
+        .ok_or_else(|| crate::error::invalid_params(format!("action '{action}' requires '{name}'")))
+}
+
+// ---------------------------------------------------------------------------
 // Server struct
 // ---------------------------------------------------------------------------
+
+type Router = rmcp::handler::server::router::tool::ToolRouter<DefenderServer>;
 
 #[derive(Clone)]
 pub struct DefenderServer {
     client: GraphClient,
     endpoint: EndpointClient,
-    live_response_enabled: bool,
+    config: crate::cli::ServerConfig,
+    /// Tool catalog for the configured mode, with mutating tools removed under `--read-only`.
+    router: std::sync::Arc<Router>,
 }
 
 impl DefenderServer {
-    pub fn new(client: GraphClient, endpoint: EndpointClient) -> Self {
-        let live_response_enabled = std::env::var(crate::constants::ENV_LIVE_RESPONSE_ENABLED)
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false);
+    pub fn new_with_config(
+        client: GraphClient,
+        endpoint: EndpointClient,
+        config: crate::cli::ServerConfig,
+    ) -> Self {
+        let mut router = match config.tool_mode {
+            crate::cli::ToolMode::Granular => Self::tool_router(),
+            crate::cli::ToolMode::Consolidated => Self::consolidated_tool_router(),
+        };
+        if config.read_only {
+            for name in MUTATING_TOOLS {
+                router.remove_route(name);
+            }
+        }
         Self {
             client,
             endpoint,
-            live_response_enabled,
+            config,
+            router: std::sync::Arc::new(router),
         }
+    }
+
+    /// Tools exposed by `tools/list` for the active configuration.
+    pub fn list_tools_for_config(&self) -> Vec<Tool> {
+        self.router.list_all()
+    }
+
+    /// Pre-network barrier for mutating tools: `Some(error)` when `--read-only` is active.
+    fn read_only_barrier(&self, tool: &str) -> Option<CallToolResult> {
+        self.config
+            .read_only
+            .then(|| crate::error::read_only_violation(tool))
+    }
+
+    /// Resolve the staging directory for a download, confining `destination_dir` to a
+    /// relative subdirectory of the configured quarantine directory.
+    fn staging_dir(&self, destination_dir: Option<&str>) -> Result<std::path::PathBuf, McpError> {
+        let Some(sub) = destination_dir.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(self.config.quarantine_dir.clone());
+        };
+        let sub_path = std::path::Path::new(sub);
+        let confined = sub_path.components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        });
+        if !confined {
+            return Err(crate::error::invalid_params(
+                "destination_dir must be a relative subdirectory of the quarantine directory (no absolute paths or '..')",
+            ));
+        }
+        Ok(self.config.quarantine_dir.join(sub_path))
     }
 
     // ---- Shared helpers ----
@@ -3572,7 +3992,10 @@ impl DefenderServer {
         &self,
         Parameters(params): Parameters<LiveResponseLibraryUploadInput>,
     ) -> Result<CallToolResult, McpError> {
-        if !self.live_response_enabled {
+        if let Some(blocked) = self.read_only_barrier("defender_library_file_upload") {
+            return Ok(blocked);
+        }
+        if !self.config.live_response_enabled {
             return Ok(crate::error::tool_error(
                 "Live Response is disabled. Set DEFENDER_ENABLE_LIVE_RESPONSE=true to enable.",
             ));
@@ -3642,15 +4065,21 @@ impl DefenderServer {
         &self,
         Parameters(params): Parameters<LiveResponseRunInput>,
     ) -> Result<CallToolResult, McpError> {
-        if !self.live_response_enabled {
+        if let Some(blocked) = self.read_only_barrier("defender_endpoint_live_response_run") {
+            return Ok(blocked);
+        }
+        if !self.config.live_response_enabled {
             return Ok(crate::error::tool_error(
                 "Live Response is disabled. Set DEFENDER_ENABLE_LIVE_RESPONSE=true to enable.",
             ));
         }
 
         let machine_id = validation::validate_required_id(&params.machine_id, "machine_id")?;
-        let comment = validation::validate_live_response_comment(&params.comment)?;
-        validation::validate_live_response_commands(&params.commands)?;
+        let comment = validation::validate_comment(&params.comment, "comment")?;
+        validation::validate_live_response_commands(
+            &params.commands,
+            self.config.live_response_allowed_commands.as_deref(),
+        )?;
 
         tracing::info!(
             machine_id = %machine_id,
@@ -3703,7 +4132,7 @@ impl DefenderServer {
         &self,
         Parameters(params): Parameters<LiveResponseResultInput>,
     ) -> Result<CallToolResult, McpError> {
-        if !self.live_response_enabled {
+        if !self.config.live_response_enabled {
             return Ok(crate::error::tool_error(
                 "Live Response is disabled. Set DEFENDER_ENABLE_LIVE_RESPONSE=true to enable.",
             ));
@@ -3727,25 +4156,769 @@ impl DefenderServer {
 }
 
 // ---------------------------------------------------------------------------
+// Consolidated domain dispatchers (`--tool-mode consolidated`)
+// ---------------------------------------------------------------------------
+
+/// Deserialize dispatcher arguments into the granular tool's typed input and invoke it, so the
+/// consolidated surface reuses every granular validation rule and endpoint mapping unchanged.
+macro_rules! call_granular {
+    ($self:ident, $method:ident, $args:expr) => {{
+        let params = serde_json::from_value(serde_json::Value::Object($args)).map_err(|e| {
+            crate::error::invalid_params(format!("invalid arguments for this action: {e}"))
+        })?;
+        $self.$method(Parameters(params)).await
+    }};
+}
+
+/// Extract the SAS download URL from a Defender `{ "value": "<url>" }` response.
+fn sas_url(value: &serde_json::Value) -> Result<String, CallToolResult> {
+    value
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            crate::error::tool_error("upstream response did not contain a download URL in 'value'")
+        })
+}
+
+impl DefenderServer {
+    /// Fetch the investigation package SAS URL; a 404 while the action exists is reported as
+    /// "package not ready" with the action's current status.
+    async fn investigation_package_url(&self, action_id: &str) -> Result<String, CallToolResult> {
+        let encoded = validation::encode_path_segment(action_id);
+        match self
+            .endpoint
+            .endpoint_get(&format!("/api/machineactions/{encoded}/getPackageUri"), &[])
+            .await
+        {
+            Ok(v) => sas_url(&v),
+            Err(not_found) if http_status_of(&not_found) == Some(404) => {
+                match self
+                    .endpoint
+                    .endpoint_get(&format!("/api/machineactions/{encoded}"), &[])
+                    .await
+                {
+                    Ok(action) => {
+                        let status = action
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("Unknown");
+                        Err(crate::error::package_not_ready(status))
+                    }
+                    // The action itself is unknown: surface the original 404.
+                    Err(_) => Err(not_found),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Download `url` into the staging directory and return the artifact record.
+    async fn stage_artifact(
+        &self,
+        url: &str,
+        dir: &std::path::Path,
+        file_name: &str,
+        action_id: &str,
+        sha1: Option<&str>,
+    ) -> CallToolResult {
+        match self
+            .endpoint
+            .download_artifact(
+                url,
+                dir,
+                file_name,
+                Some(action_id.to_owned()),
+                sha1.map(str::to_owned),
+            )
+            .await
+        {
+            Ok(artifact) => {
+                tracing::info!(
+                    file_path = %artifact.file_path,
+                    sha256 = %artifact.sha256,
+                    bytes = artifact.file_size_bytes,
+                    "Forensic artifact staged"
+                );
+                match serde_json::to_value(&artifact) {
+                    Ok(v) => CallToolResult::structured(v),
+                    Err(e) => crate::error::tool_error(format!("failed to encode artifact: {e}")),
+                }
+            }
+            Err(e) => e,
+        }
+    }
+
+    async fn ep_post(&self, path: &str, body: &serde_json::Value) -> CallToolResult {
+        match self.endpoint.endpoint_post(path, body).await {
+            Ok(v) => CallToolResult::structured(v),
+            Err(e) => e,
+        }
+    }
+}
+
+#[tool_router(router = consolidated_tool_router)]
+impl DefenderServer {
+    /// Consolidated Advanced Hunting dispatcher.
+    #[tool(
+        name = "defender_hunting",
+        description = "Run a read-only KQL query across Microsoft Defender XDR advanced hunting tables \
+                       (DeviceProcessEvents, DeviceNetworkEvents, EmailEvents, IdentityLogonEvents, etc.). \
+                       action: 'run' (default). Params: query (required), timespan (ISO 8601, default P30D). \
+                       Upstream limits: 100,000 rows, 50 MB, ~3-minute timeout. Requires \
+                       ThreatHunting.Read.All.",
+        annotations(
+            title = "Defender Hunting",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub async fn defender_hunting(
+        &self,
+        Parameters(input): Parameters<HuntingInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if input.action != "run" {
+            return Err(crate::error::unknown_action_error(
+                "defender_hunting",
+                &input.action,
+                HUNTING_ACTIONS,
+            ));
+        }
+        call_granular!(self, defender_advanced_hunting_run, granular_args(&input))
+    }
+
+    /// Consolidated threat-intelligence dispatcher.
+    #[tool(
+        name = "defender_ti",
+        description = "Microsoft Defender Threat Intelligence lookups (read-only). Actions: \
+                       intel_profiles_list, intel_profile_get, intel_profile_indicators_list, \
+                       intel_profile_indicator_get, intel_profile_indicators_global_list, articles_list, \
+                       article_get, article_indicators_list, article_indicator_get, \
+                       article_indicators_global_list, host_get, host_reputation_get, host_components_list, \
+                       host_component_get, host_cookies_list, host_cookie_get, host_ports_list, host_port_get, \
+                       host_trackers_list, host_tracker_get, host_subdomains_list, host_ssl_certs_list, \
+                       host_whois_get, host_whois_history_list, host_pairs_list, host_pair_get, \
+                       host_child_pairs_list, host_parent_pairs_list, host_passive_dns_list, \
+                       host_passive_dns_reverse_list, ssl_certs_list, ssl_cert_get, ssl_cert_related_hosts_list, \
+                       whois_records_list, whois_record_get, passive_dns_get, vulnerability_get, \
+                       vulnerability_components_list, vulnerability_component_get. host_* list/get-by-host \
+                       actions take hostname (domain or IP literal); *_get actions take id (opaque IDs copied \
+                       verbatim; CVE ID for vulnerability_*); vulnerability_component_get also takes \
+                       component_id. Lists accept top (max 1000), skip, and, where the endpoint supports them, \
+                       filter, select, expand, search, count. Unsupported fields are rejected. Requires \
+                       ThreatIntelligence.Read.All and a Defender TI license.",
+        annotations(
+            title = "Defender Threat Intelligence",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub async fn defender_ti(
+        &self,
+        Parameters(input): Parameters<ThreatIntelInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let action = input.action.as_str();
+        let mut args = granular_args(&input);
+        let host_by_name = action.starts_with("host_")
+            && !matches!(
+                action,
+                "host_component_get"
+                    | "host_cookie_get"
+                    | "host_port_get"
+                    | "host_tracker_get"
+                    | "host_pair_get"
+            );
+        if host_by_name {
+            rename_arg(&mut args, "id", "hostname");
+        }
+        if action.starts_with("vulnerability_") {
+            rename_arg(&mut args, "id", "vulnerability_id");
+        }
+        match action {
+            "intel_profiles_list" => call_granular!(self, defender_ti_intel_profiles_list, args),
+            "intel_profile_get" => call_granular!(self, defender_ti_intel_profile_get, args),
+            "intel_profile_indicators_list" => {
+                call_granular!(self, defender_ti_intel_profile_indicators_list, args)
+            }
+            "intel_profile_indicator_get" => {
+                call_granular!(self, defender_ti_intel_profile_indicator_get, args)
+            }
+            "intel_profile_indicators_global_list" => {
+                call_granular!(self, defender_ti_intel_profile_indicators_global_list, args)
+            }
+            "articles_list" => call_granular!(self, defender_ti_articles_list, args),
+            "article_get" => call_granular!(self, defender_ti_article_get, args),
+            "article_indicators_list" => {
+                call_granular!(self, defender_ti_article_indicators_list, args)
+            }
+            "article_indicator_get" => {
+                call_granular!(self, defender_ti_article_indicator_get, args)
+            }
+            "article_indicators_global_list" => {
+                call_granular!(self, defender_ti_article_indicators_global_list, args)
+            }
+            "host_get" => call_granular!(self, defender_ti_host_get, args),
+            "host_reputation_get" => call_granular!(self, defender_ti_host_reputation_get, args),
+            "host_components_list" => call_granular!(self, defender_ti_host_components_list, args),
+            "host_component_get" => call_granular!(self, defender_ti_host_component_get, args),
+            "host_cookies_list" => call_granular!(self, defender_ti_host_cookies_list, args),
+            "host_cookie_get" => call_granular!(self, defender_ti_host_cookie_get, args),
+            "host_ports_list" => call_granular!(self, defender_ti_host_ports_list, args),
+            "host_port_get" => call_granular!(self, defender_ti_host_port_get, args),
+            "host_trackers_list" => call_granular!(self, defender_ti_host_trackers_list, args),
+            "host_tracker_get" => call_granular!(self, defender_ti_host_tracker_get, args),
+            "host_subdomains_list" => call_granular!(self, defender_ti_host_subdomains_list, args),
+            "host_ssl_certs_list" => call_granular!(self, defender_ti_host_ssl_certs_list, args),
+            "host_whois_get" => call_granular!(self, defender_ti_host_whois_get, args),
+            "host_whois_history_list" => {
+                call_granular!(self, defender_ti_host_whois_history_list, args)
+            }
+            "host_pairs_list" => call_granular!(self, defender_ti_host_pairs_list, args),
+            "host_pair_get" => call_granular!(self, defender_ti_host_pair_get, args),
+            "host_child_pairs_list" => {
+                call_granular!(self, defender_ti_host_child_pairs_list, args)
+            }
+            "host_parent_pairs_list" => {
+                call_granular!(self, defender_ti_host_parent_pairs_list, args)
+            }
+            "host_passive_dns_list" => {
+                call_granular!(self, defender_ti_host_passive_dns_list, args)
+            }
+            "host_passive_dns_reverse_list" => {
+                call_granular!(self, defender_ti_host_passive_dns_reverse_list, args)
+            }
+            "ssl_certs_list" => call_granular!(self, defender_ti_ssl_certs_list, args),
+            "ssl_cert_get" => call_granular!(self, defender_ti_ssl_cert_get, args),
+            "ssl_cert_related_hosts_list" => {
+                call_granular!(self, defender_ti_ssl_cert_related_hosts_list, args)
+            }
+            "whois_records_list" => call_granular!(self, defender_ti_whois_records_list, args),
+            "whois_record_get" => call_granular!(self, defender_ti_whois_record_get, args),
+            "passive_dns_get" => call_granular!(self, defender_ti_passive_dns_get, args),
+            "vulnerability_get" => call_granular!(self, defender_ti_vulnerability_get, args),
+            "vulnerability_components_list" => {
+                call_granular!(self, defender_ti_vulnerability_components_list, args)
+            }
+            "vulnerability_component_get" => {
+                call_granular!(self, defender_ti_vulnerability_component_get, args)
+            }
+            _ => Err(crate::error::unknown_action_error(
+                "defender_ti",
+                action,
+                TI_ACTIONS,
+            )),
+        }
+    }
+
+    /// Consolidated incident and alert dispatcher.
+    #[tool(
+        name = "defender_incidents_alerts",
+        description = "Defender XDR incidents/alerts and Defender for Endpoint alerts (read-only). Actions: \
+                       xdr_alert_list, xdr_alert_get, xdr_incident_list, xdr_incident_get, endpoint_alert_list, \
+                       endpoint_alert_get, ip_related_alerts, domain_related_alerts, file_related_alerts, \
+                       user_related_alerts. *_get actions take id; *_related_alerts take id as the IP, domain, \
+                       SHA-1, or username (not UPN/SID). XDR lists accept top (max 1000), skip, filter, select, \
+                       expand, search, count (count=true sends $count=true); endpoint_alert_list accepts \
+                       filter, top (max 10000), skip; xdr_incident_get accepts expand. Requires \
+                       SecurityAlert.Read.All / SecurityIncident.Read.All (XDR) or Alert.Read.All (endpoint; \
+                       file_related_alerts needs Alert.ReadWrite.All).",
+        annotations(
+            title = "Defender Incidents & Alerts",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub async fn defender_incidents_alerts(
+        &self,
+        Parameters(input): Parameters<IncidentsAlertsInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let action = input.action.as_str();
+        let mut args = granular_args(&input);
+        match action {
+            "xdr_alert_list" => call_granular!(self, defender_xdr_alert_list, args),
+            "xdr_alert_get" => call_granular!(self, defender_xdr_alert_get, args),
+            "xdr_incident_list" => call_granular!(self, defender_xdr_incident_list, args),
+            "xdr_incident_get" => call_granular!(self, defender_xdr_incident_get, args),
+            "endpoint_alert_list" => call_granular!(self, defender_endpoint_alert_list, args),
+            "endpoint_alert_get" => call_granular!(self, defender_endpoint_alert_get, args),
+            "ip_related_alerts" => {
+                rename_arg(&mut args, "id", "ip_address");
+                call_granular!(self, defender_endpoint_ip_related_alerts, args)
+            }
+            "domain_related_alerts" => {
+                rename_arg(&mut args, "id", "domain_name");
+                call_granular!(self, defender_endpoint_domain_related_alerts, args)
+            }
+            "file_related_alerts" => {
+                rename_arg(&mut args, "id", "file_sha1");
+                call_granular!(self, defender_endpoint_file_related_alerts, args)
+            }
+            "user_related_alerts" => {
+                rename_arg(&mut args, "id", "user_id");
+                call_granular!(self, defender_endpoint_user_related_alerts, args)
+            }
+            _ => Err(crate::error::unknown_action_error(
+                "defender_incidents_alerts",
+                action,
+                INCIDENTS_ALERTS_ACTIONS,
+            )),
+        }
+    }
+
+    /// Consolidated device inventory and indicator-correlation dispatcher.
+    #[tool(
+        name = "defender_machines",
+        description = "Defender for Endpoint device inventory and indicator correlation (read-only). Actions: \
+                       machine_list, machine_get, logged_on_users, find_by_tag, installed_software, \
+                       security_recommendations, ip_statistics, domain_statistics, domain_related_machines, \
+                       file_get, file_statistics, file_related_machines, user_related_machines. Device actions \
+                       take machine_id (40-hex Defender machine ID, not an Entra device ID). Indicator actions \
+                       take id: IP (ip_statistics), domain (domain_*), MD5/SHA-1/SHA-256 (file_get), SHA-1 \
+                       (file_statistics, file_related_machines), username (user_related_machines). find_by_tag \
+                       takes tag_name (or id) and use_starts_with. *_statistics accept look_back_hours (1-720). \
+                       machine_list accepts filter, top (max 10000), skip. Requires Machine.Read.All (related \
+                       machines need Machine.ReadWrite.All), Software.Read.All, SecurityRecommendation.Read.All, \
+                       Ip.Read.All, Url.Read.All, File.Read.All as applicable.",
+        annotations(
+            title = "Defender Machines",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub async fn defender_machines(
+        &self,
+        Parameters(input): Parameters<MachinesInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let action = input.action.as_str();
+        let mut args = granular_args(&input);
+        match action {
+            "machine_list" => call_granular!(self, defender_endpoint_machine_list, args),
+            "machine_get" => call_granular!(self, defender_endpoint_machine_get, args),
+            "logged_on_users" => {
+                call_granular!(self, defender_endpoint_machine_logged_on_users, args)
+            }
+            "find_by_tag" => {
+                rename_arg(&mut args, "id", "tag_name");
+                call_granular!(self, defender_endpoint_machine_find_by_tag, args)
+            }
+            "installed_software" => {
+                call_granular!(self, defender_endpoint_machine_list_software, args)
+            }
+            "security_recommendations" => {
+                call_granular!(
+                    self,
+                    defender_endpoint_machine_security_recommendations,
+                    args
+                )
+            }
+            "ip_statistics" => {
+                rename_arg(&mut args, "id", "ip_address");
+                call_granular!(self, defender_endpoint_ip_statistics, args)
+            }
+            "domain_statistics" => {
+                rename_arg(&mut args, "id", "domain_name");
+                call_granular!(self, defender_endpoint_domain_statistics, args)
+            }
+            "domain_related_machines" => {
+                rename_arg(&mut args, "id", "domain_name");
+                call_granular!(self, defender_endpoint_domain_related_machines, args)
+            }
+            "file_get" => {
+                rename_arg(&mut args, "id", "file_id");
+                call_granular!(self, defender_endpoint_file_get, args)
+            }
+            "file_statistics" => {
+                rename_arg(&mut args, "id", "file_sha1");
+                call_granular!(self, defender_endpoint_file_statistics, args)
+            }
+            "file_related_machines" => {
+                rename_arg(&mut args, "id", "file_sha1");
+                call_granular!(self, defender_endpoint_file_related_machines, args)
+            }
+            "user_related_machines" => {
+                rename_arg(&mut args, "id", "user_id");
+                call_granular!(self, defender_endpoint_user_related_machines, args)
+            }
+            _ => Err(crate::error::unknown_action_error(
+                "defender_machines",
+                action,
+                MACHINES_ACTIONS,
+            )),
+        }
+    }
+
+    /// Consolidated vulnerability-management dispatcher.
+    #[tool(
+        name = "defender_vulnerabilities",
+        description = "Defender Vulnerability Management (read-only). Actions: software_list, software_get, \
+                       software_machines, software_vulnerabilities, software_missing_kbs, software_distribution, \
+                       vulnerability_list, vulnerability_get_by_cve, vulnerability_get_machines, \
+                       vulnerability_get_by_machine_software, recommendation_list, recommendation_get, \
+                       recommendation_machines, recommendation_vulnerabilities, recommendation_by_software, \
+                       remediation_list, remediation_get, remediation_exposed_devices, exposure_score, \
+                       exposure_score_by_machine_groups. software_* take id or software_id; vulnerability_* take \
+                       id or cve_id; recommendation_*/remediation_* take id. Lists accept filter, top (max \
+                       10000), skip. Requires Software.Read.All, Vulnerability.Read.All, \
+                       SecurityRecommendation.Read.All, RemediationTasks.Read.All, or Score.Read.All as \
+                       applicable.",
+        annotations(
+            title = "Defender Vulnerabilities",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub async fn defender_vulnerabilities(
+        &self,
+        Parameters(input): Parameters<VulnerabilitiesInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let action = input.action.as_str();
+        let mut args = granular_args(&input);
+        if action.starts_with("software_") {
+            rename_arg(&mut args, "id", "software_id");
+        }
+        if action.starts_with("vulnerability_get") {
+            rename_arg(&mut args, "id", "cve_id");
+        }
+        match action {
+            "software_list" => call_granular!(self, defender_endpoint_software_list, args),
+            "software_get" => call_granular!(self, defender_endpoint_software_get, args),
+            "software_machines" => call_granular!(self, defender_endpoint_software_machines, args),
+            "software_vulnerabilities" => {
+                call_granular!(self, defender_endpoint_software_vulnerabilities, args)
+            }
+            "software_missing_kbs" => {
+                call_granular!(self, defender_endpoint_software_missing_kbs, args)
+            }
+            "software_distribution" => {
+                call_granular!(self, defender_endpoint_software_distribution, args)
+            }
+            "vulnerability_list" => {
+                call_granular!(self, defender_endpoint_vulnerability_list, args)
+            }
+            "vulnerability_get_by_cve" => {
+                call_granular!(self, defender_endpoint_vulnerability_get_by_cve, args)
+            }
+            "vulnerability_get_machines" => {
+                call_granular!(self, defender_endpoint_vulnerability_get_machines, args)
+            }
+            "vulnerability_get_by_machine_software" => {
+                call_granular!(
+                    self,
+                    defender_endpoint_vulnerability_get_by_machine_software,
+                    args
+                )
+            }
+            "recommendation_list" => {
+                call_granular!(self, defender_endpoint_recommendation_list, args)
+            }
+            "recommendation_get" => {
+                call_granular!(self, defender_endpoint_recommendation_get, args)
+            }
+            "recommendation_machines" => {
+                call_granular!(self, defender_endpoint_recommendation_machines, args)
+            }
+            "recommendation_vulnerabilities" => {
+                call_granular!(self, defender_endpoint_recommendation_vulnerabilities, args)
+            }
+            "recommendation_by_software" => {
+                call_granular!(self, defender_endpoint_recommendation_by_software, args)
+            }
+            "remediation_list" => call_granular!(self, defender_endpoint_remediation_list, args),
+            "remediation_get" => call_granular!(self, defender_endpoint_remediation_get, args),
+            "remediation_exposed_devices" => {
+                call_granular!(self, defender_endpoint_remediation_exposed_devices, args)
+            }
+            "exposure_score" | "exposure_score_by_machine_groups" => {
+                if !args.is_empty() {
+                    return Err(crate::error::invalid_params(format!(
+                        "action '{action}' takes no parameters"
+                    )));
+                }
+                if action == "exposure_score" {
+                    self.defender_endpoint_exposure_score().await
+                } else {
+                    self.defender_endpoint_exposure_score_by_machine_groups()
+                        .await
+                }
+            }
+            _ => Err(crate::error::unknown_action_error(
+                "defender_vulnerabilities",
+                action,
+                VULNERABILITIES_ACTIONS,
+            )),
+        }
+    }
+
+    /// Consolidated forensic retrieval dispatcher.
+    #[tool(
+        name = "defender_forensics",
+        description = "Forensic artifact inspection and retrieval; never changes endpoint or tenant state. \
+                       Actions: machine_action_list (filter, top, skip), machine_action_get_status (action_id), \
+                       get_investigation_package_sas_url (action_id; short-lived SAS URL), \
+                       download_investigation_package (action_id), download_quarantined_file (action_id of a \
+                       completed Live Response GetFile action, command_index default 0, optional sha1 used to \
+                       name the archive), live_response_get_result (action_id, command_index; requires Live \
+                       Response enabled). Download actions stream the archive into the server's quarantine \
+                       directory (or a relative destination_dir inside it) with 0600 file permissions and \
+                       return file_path, file_size_bytes, and sha256; files are never executed. If a package \
+                       is not ready, the current action status is returned; retry once it is Succeeded. \
+                       getPackageUri is limited to 2 calls/minute. Requires Machine.Read.All for action \
+                       status/listing and Machine.ReadWrite.All for package and Live Response result links.",
+        annotations(
+            title = "Defender Forensics",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub async fn defender_forensics(
+        &self,
+        Parameters(input): Parameters<ForensicsInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let action = input.action.as_str();
+        match action {
+            "machine_action_list" => {
+                call_granular!(
+                    self,
+                    defender_endpoint_machine_action_list,
+                    granular_args(&input)
+                )
+            }
+            "machine_action_get_status" => {
+                call_granular!(
+                    self,
+                    defender_endpoint_machine_action_get_status,
+                    granular_args(&input)
+                )
+            }
+            "live_response_get_result" => {
+                call_granular!(
+                    self,
+                    defender_endpoint_live_response_get_result,
+                    granular_args(&input)
+                )
+            }
+            "get_investigation_package_sas_url" => {
+                let action_id = validation::validate_action_id(required(
+                    &input.action_id,
+                    "action_id",
+                    action,
+                )?)?;
+                Ok(match self.investigation_package_url(action_id).await {
+                    Ok(url) => CallToolResult::structured(json!({
+                        "action_id": action_id,
+                        "value": url,
+                    })),
+                    Err(e) => e,
+                })
+            }
+            "download_investigation_package" => {
+                let action_id = validation::validate_action_id(required(
+                    &input.action_id,
+                    "action_id",
+                    action,
+                )?)?;
+                let dir = self.staging_dir(input.destination_dir.as_deref())?;
+                let url = match self.investigation_package_url(action_id).await {
+                    Ok(url) => url,
+                    Err(e) => return Ok(e),
+                };
+                let file_name = format!("investigation_package_{action_id}.zip");
+                Ok(self
+                    .stage_artifact(&url, &dir, &file_name, action_id, None)
+                    .await)
+            }
+            "download_quarantined_file" => {
+                let action_id = validation::validate_action_id(required(
+                    &input.action_id,
+                    "action_id",
+                    action,
+                )?)?;
+                let index = input.command_index.unwrap_or(0);
+                if index < 0 {
+                    return Err(crate::error::invalid_params(format!(
+                        "command_index must be zero or greater, got {index}"
+                    )));
+                }
+                let sha1 = input
+                    .sha1
+                    .as_deref()
+                    .map(validation::validate_sha1)
+                    .transpose()?
+                    .map(str::to_ascii_lowercase);
+                let dir = self.staging_dir(input.destination_dir.as_deref())?;
+                let link = match self
+                    .endpoint
+                    .endpoint_get(
+                        &format!(
+                            "/api/machineactions/{}/GetLiveResponseResultDownloadLink(index={index})",
+                            validation::encode_path_segment(action_id)
+                        ),
+                        &[],
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => return Ok(e),
+                };
+                let url = match sas_url(&link) {
+                    Ok(url) => url,
+                    Err(e) => return Ok(e),
+                };
+                let file_name = match &sha1 {
+                    Some(sha1) => format!("quarantine_{sha1}.zip"),
+                    None => format!("quarantine_{action_id}_{index}.zip"),
+                };
+                Ok(self
+                    .stage_artifact(&url, &dir, &file_name, action_id, sha1.as_deref())
+                    .await)
+            }
+            _ => Err(crate::error::unknown_action_error(
+                "defender_forensics",
+                action,
+                FORENSICS_ACTIONS,
+            )),
+        }
+    }
+
+    /// Consolidated mutating response dispatcher (gated).
+    #[tool(
+        name = "defender_response",
+        description = "Mutating endpoint response actions; obtain explicit human approval before calling. \
+                       Disabled unless the server starts with --enable-live-response \
+                       (DEFENDER_ENABLE_LIVE_RESPONSE=true); omitted and rejected under --read-only. Actions: \
+                       collect_investigation_package (machine_id, comment), stop_and_quarantine_file \
+                       (machine_id, sha1, comment), live_response_run (machine_id, commands of type \
+                       PutFile/RunScript/GetFile with params, comment; subject to --allowed-commands), \
+                       upload_library_file (file_name, file_content, description, optional \
+                       parameters_description, override_if_exists). machine_id is the 40-hex Defender machine \
+                       ID; comment needs at least 10 characters and is recorded in the audit trail. Returns \
+                       the upstream MachineAction; poll it with defender_forensics machine_action_get_status. \
+                       Requires Machine.CollectForensics, Machine.StopAndQuarantine, Machine.LiveResponse, or \
+                       Library.Manage as applicable.",
+        annotations(
+            title = "Defender Response",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    pub async fn defender_response(
+        &self,
+        Parameters(input): Parameters<ResponseInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(blocked) = self.read_only_barrier("defender_response") {
+            return Ok(blocked);
+        }
+        let action = input.action.as_str();
+        if !RESPONSE_ACTIONS.contains(&action) {
+            return Err(crate::error::unknown_action_error(
+                "defender_response",
+                action,
+                RESPONSE_ACTIONS,
+            ));
+        }
+        if !self.config.live_response_enabled {
+            return Ok(crate::error::tool_error(
+                "Response actions are disabled. Start the server with --enable-live-response \
+                 (DEFENDER_ENABLE_LIVE_RESPONSE=true) to enable.",
+            ));
+        }
+        match action {
+            "collect_investigation_package" | "stop_and_quarantine_file" => {
+                let machine_id = validation::validate_machine_id(required(
+                    &input.machine_id,
+                    "machine_id",
+                    action,
+                )?)?;
+                let comment = validation::validate_comment(
+                    required(&input.comment, "comment", action)?,
+                    "comment",
+                )?;
+                let machine = validation::encode_path_segment(machine_id);
+                if action == "collect_investigation_package" {
+                    tracing::info!(machine_id = %machine_id, comment = %comment, "Investigation package collection initiated");
+                    Ok(self
+                        .ep_post(
+                            &format!("/api/machines/{machine}/collectInvestigationPackage"),
+                            &json!({ "Comment": comment }),
+                        )
+                        .await)
+                } else {
+                    let sha1 = validation::validate_sha1(required(&input.sha1, "sha1", action)?)?;
+                    tracing::info!(machine_id = %machine_id, sha1 = %sha1, comment = %comment, "Stop and quarantine initiated");
+                    Ok(self
+                        .ep_post(
+                            &format!("/api/machines/{machine}/StopAndQuarantineFile"),
+                            &json!({ "Comment": comment, "Sha1": sha1 }),
+                        )
+                        .await)
+                }
+            }
+            "live_response_run" => {
+                call_granular!(
+                    self,
+                    defender_endpoint_live_response_run,
+                    granular_args(&input)
+                )
+            }
+            _ => call_granular!(self, defender_library_file_upload, granular_args(&input)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Server handler
 // ---------------------------------------------------------------------------
 
 #[tool_handler(
+    router = self.router,
     name = "microsoft-defender-mcp",
     version = "0.2.0",
     instructions = "Investigate Microsoft Defender through Microsoft Graph Security and Defender for Endpoint APIs. \
-                    86 tools are read-only. defender_library_file_upload and defender_endpoint_live_response_run \
-                    can change cloud library files or endpoint state: clients must obtain explicit human approval \
-                    before invoking them. All three Live Response tools require DEFENDER_ENABLE_LIVE_RESPONSE=true \
-                    at startup. DEFENDER_LIVE_RESPONSE_ALLOWED_COMMANDS restricts commands in live_response_run \
-                    only; it does not restrict library uploads or result-link retrieval. Tool results preserve \
-                    upstream JSON; OData collections are objects with a value array and optional metadata, not \
-                    flattened arrays. Pagination is not followed automatically. Grant only the application \
-                    permissions documented for the chosen tool; some read-only APIs require legacy write-named \
-                    scopes. HTTP transport has no bundled client authentication: use an authenticated, trusted \
-                    boundary for remote access."
+                    Granular mode (default) exposes 88 tools: 86 read-only plus defender_library_file_upload and \
+                    defender_endpoint_live_response_run. Consolidated mode (--tool-mode consolidated) exposes 7 \
+                    action-based tools: defender_hunting, defender_ti, defender_incidents_alerts, defender_machines, \
+                    defender_vulnerabilities, defender_forensics (read-only; downloads forensic archives to the \
+                    local quarantine directory), and defender_response (mutating). Mutating tools change cloud \
+                    library files or endpoint state: clients must obtain explicit human approval before invoking \
+                    them; they require --enable-live-response and are hidden and rejected under --read-only. \
+                    --allowed-commands restricts Live Response command types only. Tool results preserve upstream \
+                    JSON; OData collections are objects with a value array and optional metadata, not flattened \
+                    arrays. Pagination is not followed automatically. Grant only the application permissions \
+                    documented for the chosen tool; some read-only APIs require legacy write-named scopes. HTTP \
+                    transport has no bundled client authentication: use an authenticated, trusted boundary for \
+                    remote access."
 )]
-impl ServerHandler for DefenderServer {}
+impl ServerHandler for DefenderServer {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        // Defense in depth: a hidden mutating tool invoked by name is rejected with a structured
+        // read-only violation before routing, so no upstream request is ever issued.
+        if MUTATING_TOOLS.contains(&request.name.as_ref())
+            && let Some(blocked) = self.read_only_barrier(&request.name)
+        {
+            return Ok(blocked.into());
+        }
+        let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.router.call(context).await
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3799,11 +4972,16 @@ mod tests {
         let tm = TokenManager::for_test(http);
         let graph = GraphClient::for_test(tm.clone(), base_url.to_string());
         let endpoint = EndpointClient::for_test(tm, base_url.to_string());
-        DefenderServer {
-            client: graph,
-            endpoint,
+        let config = crate::cli::ServerConfig {
+            transport: crate::cli::TransportMode::Stdio,
+            bind_address: "127.0.0.1:8000".to_string(),
+            tool_mode: crate::cli::ToolMode::Granular,
+            read_only: false,
             live_response_enabled,
-        }
+            live_response_allowed_commands: None,
+            quarantine_dir: std::path::PathBuf::from("./quarantine_artifacts"),
+        };
+        DefenderServer::new_with_config(graph, endpoint, config)
     }
 
     #[tokio::test]

@@ -53,6 +53,27 @@ pub const CHARACTER_LIMIT: usize = 50_000;
 /// Transport selection environment variable.
 pub const ENV_TRANSPORT: &str = "TRANSPORT";
 
+/// Default local staging directory for downloaded forensic artifacts.
+pub const DEFAULT_QUARANTINE_DIR: &str = "./quarantine_artifacts";
+
+/// Default socket address for streamable HTTP transport.
+pub const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8000";
+
+/// Default tool catalog mode.
+pub const DEFAULT_TOOL_MODE: &str = "granular";
+
+/// Environment variable for tool mode.
+pub const ENV_TOOL_MODE: &str = "DEFENDER_TOOL_MODE";
+
+/// Environment variable for read-only mode.
+pub const ENV_READ_ONLY: &str = "DEFENDER_READ_ONLY";
+
+/// Environment variable for HTTP bind address.
+pub const ENV_BIND_ADDRESS: &str = "BIND_ADDRESS";
+
+/// Environment variable for quarantine directory.
+pub const ENV_QUARANTINE_DIR: &str = "DEFENDER_QUARANTINE_DIR";
+
 /// Gate for Live Response tools.
 pub const ENV_LIVE_RESPONSE_ENABLED: &str = "DEFENDER_ENABLE_LIVE_RESPONSE";
 

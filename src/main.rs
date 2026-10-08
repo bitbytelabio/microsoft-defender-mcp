@@ -1,9 +1,10 @@
 //! Microsoft Defender MCP Server
 //!
 //! An MCP server providing access to Microsoft Defender APIs via Microsoft Graph
-//! Security and Defender for Endpoint APIs. The vast majority of tools are read-only
-//! inspection, search, and threat intelligence operations; live response remediation
-//! and file library upload provide gated mutation capabilities.
+//! Security and Defender for Endpoint APIs. `--tool-mode granular` (default) exposes 88
+//! tools (86 read-only); `--tool-mode consolidated` exposes 7 action-based tools including
+//! forensic artifact retrieval. Mutating tools are gated by `--enable-live-response` and
+//! hidden/rejected under `--read-only`. See `--help` and [`cli`](microsoft_defender_mcp_server::cli).
 //!
 //! ## Prerequisites
 //!
@@ -14,46 +15,51 @@
 //!     `SecurityAlert.Read.All`, `SecurityIncident.Read.All`
 //!   - Defender for Endpoint: e.g., `Machine.Read.All`, `Vulnerability.Read.All`,
 //!     `Software.Read.All`, `Score.Read.All`, `Alert.Read.All`
-//!   - Live Response remediation & library management: `Machine.LiveResponse`, `Library.Manage`
+//!   - Response & library management: `Machine.LiveResponse`, `Library.Manage`,
+//!     `Machine.CollectForensics`, `Machine.StopAndQuarantine`
 //!   - Note: Upstream Defender for Endpoint APIs require write-named scopes for a few specific
 //!     read-only queries (e.g., domain/file/user related machines require `Machine.ReadWrite.All`,
 //!     and file-related alerts require `Alert.ReadWrite.All`).
 //! - Active Microsoft Defender Threat Intelligence Portal license and API add-on
 //!   license for the tenant (if using TI tools).
 //! - Environment variables: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`,
-//!   `AZURE_CLIENT_SECRET`.
-//! - Optional Live Response gating variables: `DEFENDER_ENABLE_LIVE_RESPONSE`,
-//!   `DEFENDER_LIVE_RESPONSE_ALLOWED_COMMANDS`.
+//!   `AZURE_CLIENT_SECRET`. Server options are CLI flags with environment fallbacks
+//!   (e.g. `--read-only` / `DEFENDER_READ_ONLY`).
 //!
 //! ## Transport
 //!
 //! Defaults to stdio transport (for local MCP client integration).
-//! Set `TRANSPORT=http` for streamable HTTP (on `BIND_ADDRESS`, default `127.0.0.1:8000`).
+//! `--transport http` serves streamable HTTP on `--bind-address` (default `127.0.0.1:8000`).
 //!
 //! ### Security Notice for Remote HTTP Deployments
 //!
 //! The streamable HTTP transport does not provide built-in authentication or encryption.
 //! When binding beyond localhost (`127.0.0.1`), the HTTP endpoint MUST be protected
 //! behind an authenticated reverse proxy, VPN, or equivalent network security boundary.
-mod auth;
-mod client;
-mod constants;
-mod error;
-mod server;
-mod validation;
 
 use std::time::Duration;
 
+use clap::Parser;
 use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
-use crate::auth::TokenManager;
-use crate::client::{EndpointClient, GraphClient};
-use crate::constants::{ENV_TRANSPORT, REQUEST_TIMEOUT_SECS};
-use crate::server::DefenderServer;
+use microsoft_defender_mcp_server::auth::TokenManager;
+use microsoft_defender_mcp_server::cli::{Cli, ServerConfig, TransportMode, warn_if_non_loopback};
+use microsoft_defender_mcp_server::client::{EndpointClient, GraphClient};
+use microsoft_defender_mcp_server::constants::REQUEST_TIMEOUT_SECS;
+use microsoft_defender_mcp_server::server::DefenderServer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Parse CLI arguments (handles --help and --version immediately before auth or network init).
+    let cli = Cli::parse();
+    let config = ServerConfig::from_cli(cli);
+
+    // If running in HTTP mode, validate loopback and print security notice to stderr if needed.
+    if config.transport == TransportMode::Http {
+        warn_if_non_loopback(&config.bind_address);
+    }
+
     // Log to stderr — stdout is reserved for the MCP stdio protocol.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -73,9 +79,9 @@ async fn main() -> anyhow::Result<()> {
     let graph_client = GraphClient::new(token_manager.clone());
     let endpoint_client = EndpointClient::new(token_manager);
 
-    match std::env::var(ENV_TRANSPORT).as_deref() {
-        Ok("http") => run_http(graph_client, endpoint_client).await,
-        _ => run_stdio(graph_client, endpoint_client).await,
+    match config.transport {
+        TransportMode::Http => run_http(graph_client, endpoint_client, config).await,
+        TransportMode::Stdio => run_stdio(graph_client, endpoint_client, config).await,
     }
 }
 
@@ -83,8 +89,9 @@ async fn main() -> anyhow::Result<()> {
 async fn run_stdio(
     graph_client: GraphClient,
     endpoint_client: EndpointClient,
+    config: ServerConfig,
 ) -> anyhow::Result<()> {
-    let service = DefenderServer::new(graph_client, endpoint_client)
+    let service = DefenderServer::new_with_config(graph_client, endpoint_client, config)
         .serve(rmcp::transport::io::stdio())
         .await?;
     tracing::info!("Defender MCP server running on stdio");
@@ -96,19 +103,21 @@ async fn run_stdio(
 async fn run_http(
     graph_client: GraphClient,
     endpoint_client: EndpointClient,
+    config: ServerConfig,
 ) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
 
-    let bind_addr = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1:8000".to_string());
+    let bind_addr = config.bind_address.clone();
     let ct = tokio_util::sync::CancellationToken::new();
 
     let service = StreamableHttpService::new(
         move || {
             let g = graph_client.clone();
             let e = endpoint_client.clone();
-            Ok(DefenderServer::new(g, e))
+            let c = config.clone();
+            Ok(DefenderServer::new_with_config(g, e, c))
         },
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
