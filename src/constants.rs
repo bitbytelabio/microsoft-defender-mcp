@@ -12,10 +12,6 @@ pub const ENDPOINT_BASE_URL: &str = "https://api.securitycenter.microsoft.com";
 /// Override environment variable for the Endpoint base URL (testing).
 pub const ENV_ENDPOINT_BASE_URL: &str = "DEFENDER_ENDPOINT_BASE_URL";
 
-/// Default OAuth2 token endpoint template.
-/// `{tenant}` will be replaced at runtime.
-pub const TOKEN_ENDPOINT: &str = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token";
-
 /// OAuth2 scope for Microsoft Graph.
 pub const GRAPH_SCOPE: &str = "https://graph.microsoft.com/.default";
 
@@ -55,12 +51,6 @@ pub const DEFAULT_QUARANTINE_DIR: &str = "./quarantine_artifacts";
 /// Default socket address for streamable HTTP transport.
 pub const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8000";
 
-/// Default tool catalog mode.
-pub const DEFAULT_TOOL_MODE: &str = "granular";
-
-/// Environment variable for tool mode.
-pub const ENV_TOOL_MODE: &str = "DEFENDER_TOOL_MODE";
-
 /// Environment variable for read-only mode.
 pub const ENV_READ_ONLY: &str = "DEFENDER_READ_ONLY";
 
@@ -76,6 +66,55 @@ pub const ENV_LIVE_RESPONSE_ENABLED: &str = "DEFENDER_ENABLE_LIVE_RESPONSE";
 /// Optional allowlist of Live Response command types (comma-separated).
 pub const ENV_LIVE_RESPONSE_ALLOWED_COMMANDS: &str = "DEFENDER_LIVE_RESPONSE_ALLOWED_COMMANDS";
 
+/// Gate for device containment and lifecycle actions (`defender_device_response`).
+pub const ENV_DEVICE_RESPONSE_ENABLED: &str = "DEFENDER_ENABLE_DEVICE_RESPONSE";
+
+/// Gate for the irreversible `offboard` action; requires device response.
+pub const ENV_OFFBOARDING_ENABLED: &str = "DEFENDER_ENABLE_OFFBOARDING";
+
+/// Gate for tenant-wide custom indicators (`defender_indicators`).
+pub const ENV_INDICATORS_ENABLED: &str = "DEFENDER_ENABLE_INDICATORS";
+
+/// Gate for alert and incident triage write-back (`defender_triage`).
+pub const ENV_TRIAGE_ENABLED: &str = "DEFENDER_ENABLE_TRIAGE";
+
+/// Turns off the human-confirmation prompt for destructive actions.
+pub const ENV_DISABLE_HUMAN_CONFIRMATION: &str = "DEFENDER_DISABLE_HUMAN_CONFIRMATION";
+
+/// Path of the append-only JSON Lines audit log.
+pub const ENV_AUDIT_LOG: &str = "DEFENDER_AUDIT_LOG";
+
+/// Authentication mode (`app` or `user`).
+pub const ENV_AUTH_MODE: &str = "DEFENDER_AUTH_MODE";
+
+/// Interactive sign-in flow for `--auth-mode user`.
+pub const ENV_SIGN_IN_FLOW: &str = "DEFENDER_SIGN_IN_FLOW";
+
+/// Override for the Entra ID authority base URL (testing).
+pub const ENV_AUTHORITY_BASE_URL: &str = "DEFENDER_AUTHORITY_BASE_URL";
+
+/// Removed in 1.0.0; checked only to fail startup with a migration message.
+pub const ENV_REMOVED_TOOL_MODE: &str = "DEFENDER_TOOL_MODE";
+
+/// Default Entra ID authority base URL.
+pub const AUTHORITY_BASE_URL: &str = "https://login.microsoftonline.com";
+
+/// Maximum indicator IDs per `batch_delete` request (documented upstream).
+pub const MAX_INDICATOR_BATCH: usize = 500;
+
+/// Maximum alert IDs per endpoint alert batch update. Server policy: the upstream limit is
+/// undocumented.
+pub const MAX_ALERT_BATCH: usize = 500;
+
+/// Maximum age in days of the `find_by_ip` timestamp.
+pub const FIND_BY_IP_MAX_AGE_DAYS: i64 = 30;
+
+/// Seconds to wait for the user to answer a confirmation prompt.
+pub const ELICITATION_TIMEOUT_SECS: u64 = 300;
+
+/// Seconds to wait for the browser sign-in redirect.
+pub const BROWSER_SIGN_IN_TIMEOUT_SECS: u64 = 300;
+
 /// Default look-back hours for IP/domain/file statistics.
 pub const DEFAULT_LOOK_BACK_HOURS: i32 = 720;
 
@@ -85,8 +124,8 @@ pub const MAX_LOOK_BACK_HOURS: i32 = 720;
 /// Maximum Live Response commands array size.
 pub const MAX_LIVE_RESPONSE_COMMANDS: usize = 20;
 
-/// Minimum Live Response comment length.
-pub const MIN_LIVE_RESPONSE_COMMENT_LEN: usize = 10;
+/// Minimum justification length for every mutating action.
+pub const MIN_JUSTIFICATION_LEN: usize = 10;
 
 /// Maximum library file upload size in bytes (20 MB).
 pub const MAX_LIBRARY_FILE_SIZE: usize = 20 * 1024 * 1024;

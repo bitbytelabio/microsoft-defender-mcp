@@ -12,6 +12,12 @@ release/
 .idea/
 *.log
 .env*
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+.vscode/
+microsoft-defender-mcp-audit.jsonl
 # Created by https://www.toptal.com/developers/gitignore/api/rust
 # Edit at https://www.toptal.com/developers/gitignore?templates=rust
 

@@ -6,9 +6,15 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::client::{EndpointClient, GraphClient, ODataParams};
+use crate::audit::{
+    AuditPhase, AuditRecord, AuditResult, AuditSink, AuditTarget, ConfirmationOutcome,
+    RejectReason, new_attempt_id,
+};
+use crate::auth::{IdentitySnapshot, PermissionCategory};
+use crate::cli::MutatingTool;
+use crate::client::{EndpointClient, GraphClient, MutationResponse, ODataParams};
 use crate::constants::DEFAULT_TOP;
 use crate::validation;
 
@@ -705,9 +711,10 @@ pub struct LiveResponseLibraryUploadInput {
 /// Tools (granular or consolidated) that can change endpoint or tenant state. They are omitted
 /// from discovery and rejected before any network call when the server runs `--read-only`.
 pub const MUTATING_TOOLS: &[&str] = &[
-    "defender_library_file_upload",
-    "defender_endpoint_live_response_run",
     "defender_response",
+    "defender_device_response",
+    "defender_indicators",
+    "defender_triage",
 ];
 
 pub const HUNTING_ACTIONS: &[&str] = &["run"];
@@ -752,6 +759,7 @@ pub const TI_ACTIONS: &[&str] = &[
     "vulnerability_get",
     "vulnerability_components_list",
     "vulnerability_component_get",
+    "custom_indicator_list",
 ];
 
 pub const INCIDENTS_ALERTS_ACTIONS: &[&str] = &[
@@ -781,6 +789,10 @@ pub const MACHINES_ACTIONS: &[&str] = &[
     "file_statistics",
     "file_related_machines",
     "user_related_machines",
+    "find_by_ip",
+    "machine_alerts",
+    "machine_vulnerabilities",
+    "machine_missing_kbs",
 ];
 
 pub const VULNERABILITIES_ACTIONS: &[&str] = &[
@@ -813,6 +825,9 @@ pub const FORENSICS_ACTIONS: &[&str] = &[
     "download_investigation_package",
     "download_quarantined_file",
     "live_response_get_result",
+    "investigation_list",
+    "investigation_get",
+    "library_file_list",
 ];
 
 pub const RESPONSE_ACTIONS: &[&str] = &[
@@ -820,7 +835,489 @@ pub const RESPONSE_ACTIONS: &[&str] = &[
     "live_response_run",
     "upload_library_file",
     "stop_and_quarantine_file",
+    "library_file_delete",
 ];
+
+pub const DEVICE_RESPONSE_ACTIONS: &[&str] = &[
+    "isolate",
+    "unisolate",
+    "restrict_app_execution",
+    "unrestrict_app_execution",
+    "run_av_scan",
+    "start_investigation",
+    "cancel_machine_action",
+    "tag_add",
+    "tag_remove",
+    "set_device_value",
+    "offboard",
+];
+
+pub const DEVICE_RESPONSE_ACTIONS_WITHOUT_OFFBOARD: &[&str] = &[
+    "isolate",
+    "unisolate",
+    "restrict_app_execution",
+    "unrestrict_app_execution",
+    "run_av_scan",
+    "start_investigation",
+    "cancel_machine_action",
+    "tag_add",
+    "tag_remove",
+    "set_device_value",
+];
+
+pub const INDICATORS_ACTIONS: &[&str] = &["submit", "delete", "batch_delete"];
+
+pub const TRIAGE_ACTIONS: &[&str] = &[
+    "endpoint_alert_update",
+    "endpoint_alert_batch_update",
+    "endpoint_alert_comment",
+    "xdr_alert_update",
+    "xdr_alert_comment",
+    "xdr_incident_update",
+    "xdr_incident_comment",
+];
+
+pub const DEVICE_RESPONSE_DESCRIPTION_WITH_OFFBOARD: &str = "\
+Device containment, remediation, and lifecycle actions on managed endpoints. Actions: \
+isolate (machine_id, isolation_type: Full|Selective|UnManagedDevice default Full, comment), \
+unisolate (machine_id, comment), restrict_app_execution (machine_id, comment), \
+unrestrict_app_execution (machine_id, comment), run_av_scan (machine_id, scan_type: Quick|Full, comment), \
+start_investigation (machine_id, comment), cancel_machine_action (action_id, comment), \
+tag_add (machine_id, tag, comment), tag_remove (machine_id, tag, comment), \
+set_device_value (machine_id, device_value: Low|Normal|High, comment), \
+offboard (machine_id, comment; irreversible). comment is mandatory (minimum 10 characters) \
+for audit trail compliance. Gated mutating operation: requires human confirmation unless disabled.";
+
+pub const DEVICE_RESPONSE_DESCRIPTION_WITHOUT_OFFBOARD: &str = "\
+Device containment, remediation, and lifecycle actions on managed endpoints. Actions: \
+isolate (machine_id, isolation_type: Full|Selective|UnManagedDevice default Full, comment), \
+unisolate (machine_id, comment), restrict_app_execution (machine_id, comment), \
+unrestrict_app_execution (machine_id, comment), run_av_scan (machine_id, scan_type: Quick|Full, comment), \
+start_investigation (machine_id, comment), cancel_machine_action (action_id, comment), \
+tag_add (machine_id, tag, comment), tag_remove (machine_id, tag, comment), \
+set_device_value (machine_id, device_value: Low|Normal|High, comment). \
+comment is mandatory (minimum 10 characters) for audit trail compliance. \
+Gated mutating operation: requires human confirmation unless disabled.";
+
+pub const INDICATORS_DESCRIPTION: &str = "\
+Manage tenant-wide custom indicators of compromise (IoCs) to block, allow, or audit artifacts. \
+Actions: submit (indicator_value, indicator_type: FileSha1|FileSha256|FileMd5|CertificateThumbprint|IpAddress|DomainName|Url, \
+indicator_action: Allowed|Audit|Warn|Block|BlockAndRemediate, title, description, comment, \
+severity: Informational|Low|Medium|High, expiration_time: RFC3339, rbac_group_names, recommended_actions, \
+generate_alert), delete (indicator_id, comment), batch_delete (indicator_ids: 1-500 IDs, comment). \
+comment is mandatory (minimum 10 characters) for audit trail compliance. Listing is available on \
+defender_ti custom_indicator_list. Gated mutating operation: requires human confirmation unless disabled.";
+
+pub const TRIAGE_DESCRIPTION: &str = "\
+Triage and update alerts and incidents across Microsoft Defender Endpoint and Defender XDR. \
+Actions: endpoint_alert_update (id, justification, status: new|inProgress|resolved, assigned_to, \
+classification: truePositive|informationalExpectedActivity|falsePositive, determination, comment), \
+endpoint_alert_batch_update (ids: 1-500 IDs, justification, status, assigned_to, classification, \
+determination, comment), endpoint_alert_comment (id, comment, justification), \
+xdr_alert_update (id, justification, status: new|inProgress|resolved, assigned_to, classification, determination), \
+xdr_alert_comment (id, comment, justification), \
+xdr_incident_update (id, justification, status: active|inProgress|resolved|redirected, assigned_to, \
+classification, determination, tags: customTags), xdr_incident_comment (id, comment, justification). \
+justification is mandatory (minimum 10 characters) for the audit log and is never sent upstream. \
+Non-destructive: no human confirmation prompt.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum IsolationType {
+    Full,
+    Selective,
+    UnManagedDevice,
+}
+
+impl IsolationType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Full => "Full",
+            Self::Selective => "Selective",
+            Self::UnManagedDevice => "UnManagedDevice",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ScanType {
+    Quick,
+    Full,
+}
+
+impl ScanType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Quick => "Quick",
+            Self::Full => "Full",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum DeviceValue {
+    Low,
+    Normal,
+    High,
+}
+
+impl DeviceValue {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Normal => "Normal",
+            Self::High => "High",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceResponseInput {
+    pub action: String,
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    #[serde(default)]
+    pub action_id: Option<String>,
+    #[serde(default)]
+    pub comment: Option<String>,
+    #[serde(default)]
+    pub isolation_type: Option<IsolationType>,
+    #[serde(default)]
+    pub scan_type: Option<ScanType>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub device_value: Option<DeviceValue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum IndicatorType {
+    FileSha1,
+    FileSha256,
+    FileMd5,
+    CertificateThumbprint,
+    IpAddress,
+    DomainName,
+    Url,
+}
+
+impl IndicatorType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FileSha1 => "FileSha1",
+            Self::FileSha256 => "FileSha256",
+            Self::FileMd5 => "FileMd5",
+            Self::CertificateThumbprint => "CertificateThumbprint",
+            Self::IpAddress => "IpAddress",
+            Self::DomainName => "DomainName",
+            Self::Url => "Url",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+pub enum IndicatorAction {
+    Allowed,
+    Audit,
+    Warn,
+    Block,
+    BlockAndRemediate,
+}
+
+impl IndicatorAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allowed => "Allowed",
+            Self::Audit => "Audit",
+            Self::Warn => "Warn",
+            Self::Block => "Block",
+            Self::BlockAndRemediate => "BlockAndRemediate",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for IndicatorAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "Allowed" => Ok(Self::Allowed),
+            "Audit" => Ok(Self::Audit),
+            "Warn" => Ok(Self::Warn),
+            "Block" => Ok(Self::Block),
+            "BlockAndRemediate" => Ok(Self::BlockAndRemediate),
+            "Alert" | "AlertAndBlock" => Err(serde::de::Error::custom(
+                format!("Action '{s}' is legacy, unsupported since January 2022")
+            )),
+            _ => Err(serde::de::Error::custom(format!(
+                "Unknown indicator action '{s}'"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum IndicatorSeverity {
+    Informational,
+    Low,
+    Medium,
+    High,
+}
+
+impl IndicatorSeverity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Informational => "Informational",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IndicatorsInput {
+    pub action: String,
+    #[serde(default)]
+    pub comment: Option<String>,
+    #[serde(default)]
+    pub indicator_value: Option<String>,
+    #[serde(default)]
+    pub indicator_type: Option<IndicatorType>,
+    #[serde(default)]
+    pub indicator_action: Option<IndicatorAction>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub severity: Option<IndicatorSeverity>,
+    #[serde(default)]
+    pub expiration_time: Option<String>,
+    #[serde(default)]
+    pub rbac_group_names: Option<Vec<String>>,
+    #[serde(default)]
+    pub recommended_actions: Option<String>,
+    #[serde(default)]
+    pub generate_alert: Option<bool>,
+    #[serde(default)]
+    pub indicator_id: Option<String>,
+    #[serde(default)]
+    pub indicator_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriageTarget {
+    MdeAlertPatch,
+    MdeAlertBatch,
+    XdrAlert,
+    XdrIncident,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum TriageStatus {
+    New,
+    InProgress,
+    Resolved,
+    Active,
+    Redirected,
+}
+
+impl TriageStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::InProgress => "inProgress",
+            Self::Resolved => "resolved",
+            Self::Active => "active",
+            Self::Redirected => "redirected",
+        }
+    }
+
+    pub fn wire(&self, target: TriageTarget) -> Result<&'static str, rmcp::ErrorData> {
+        match target {
+            TriageTarget::MdeAlertPatch | TriageTarget::MdeAlertBatch => match self {
+                Self::New => Ok("New"),
+                Self::InProgress => Ok("InProgress"),
+                Self::Resolved => Ok("Resolved"),
+                Self::Active | Self::Redirected => Err(crate::error::invalid_params(format!(
+                    "status '{}' is not supported for endpoint alerts; valid: new, inProgress, resolved",
+                    self.as_str()
+                ))),
+            },
+            TriageTarget::XdrAlert => match self {
+                Self::New => Ok("new"),
+                Self::InProgress => Ok("inProgress"),
+                Self::Resolved => Ok("resolved"),
+                Self::Active | Self::Redirected => Err(crate::error::invalid_params(format!(
+                    "status '{}' is not supported for XDR alerts; valid: new, inProgress, resolved",
+                    self.as_str()
+                ))),
+            },
+            TriageTarget::XdrIncident => match self {
+                Self::Active => Ok("active"),
+                Self::InProgress => Ok("inProgress"),
+                Self::Resolved => Ok("resolved"),
+                Self::Redirected => Ok("redirected"),
+                Self::New => Err(crate::error::invalid_params(
+                    "status 'new' is not supported for XDR incidents; valid: active, inProgress, resolved, redirected"
+                )),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum Classification {
+    TruePositive,
+    InformationalExpectedActivity,
+    FalsePositive,
+}
+
+impl Classification {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TruePositive => "truePositive",
+            Self::InformationalExpectedActivity => "informationalExpectedActivity",
+            Self::FalsePositive => "falsePositive",
+        }
+    }
+
+    pub fn wire(&self, target: TriageTarget) -> &'static str {
+        match target {
+            TriageTarget::MdeAlertPatch | TriageTarget::MdeAlertBatch => match self {
+                Self::TruePositive => "TruePositive",
+                Self::InformationalExpectedActivity => "InformationalExpectedActivity",
+                Self::FalsePositive => "FalsePositive",
+            },
+            TriageTarget::XdrAlert | TriageTarget::XdrIncident => self.as_str(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum Determination {
+    MultiStagedAttack,
+    MaliciousUserActivity,
+    CompromisedAccount,
+    Malware,
+    Phishing,
+    UnwantedSoftware,
+    SecurityTesting,
+    LineOfBusinessApplication,
+    ConfirmedActivity,
+    NotMalicious,
+    NotEnoughDataToValidate,
+    Other,
+}
+
+impl Determination {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MultiStagedAttack => "multiStagedAttack",
+            Self::MaliciousUserActivity => "maliciousUserActivity",
+            Self::CompromisedAccount => "compromisedAccount",
+            Self::Malware => "malware",
+            Self::Phishing => "phishing",
+            Self::UnwantedSoftware => "unwantedSoftware",
+            Self::SecurityTesting => "securityTesting",
+            Self::LineOfBusinessApplication => "lineOfBusinessApplication",
+            Self::ConfirmedActivity => "confirmedActivity",
+            Self::NotMalicious => "notMalicious",
+            Self::NotEnoughDataToValidate => "notEnoughDataToValidate",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn allowed_for(classification: Classification) -> &'static [Determination] {
+        match classification {
+            Classification::TruePositive => &[
+                Self::MultiStagedAttack,
+                Self::MaliciousUserActivity,
+                Self::CompromisedAccount,
+                Self::Malware,
+                Self::Phishing,
+                Self::UnwantedSoftware,
+                Self::Other,
+            ],
+            Classification::InformationalExpectedActivity => &[
+                Self::SecurityTesting,
+                Self::LineOfBusinessApplication,
+                Self::ConfirmedActivity,
+                Self::Other,
+            ],
+            Classification::FalsePositive => &[
+                Self::NotMalicious,
+                Self::NotEnoughDataToValidate,
+                Self::Other,
+            ],
+        }
+    }
+
+    pub fn wire(&self, target: TriageTarget) -> &'static str {
+        match target {
+            TriageTarget::MdeAlertPatch => match self {
+                Self::MultiStagedAttack => "MultiStagedAttack",
+                Self::MaliciousUserActivity => "MaliciousUserActivity",
+                Self::CompromisedAccount => "CompromisedUser",
+                Self::Malware => "Malware",
+                Self::Phishing => "Phishing",
+                Self::UnwantedSoftware => "UnwantedSoftware",
+                Self::SecurityTesting => "SecurityTesting",
+                Self::LineOfBusinessApplication => "LineOfBusinessApplication",
+                Self::ConfirmedActivity => "ConfirmedActivity",
+                Self::NotMalicious => "NotMalicious",
+                Self::NotEnoughDataToValidate => "InsufficientData",
+                Self::Other => "Other",
+            },
+            TriageTarget::MdeAlertBatch => match self {
+                Self::MultiStagedAttack => "MultiStagedAttack",
+                Self::MaliciousUserActivity => "MaliciousUserActivity",
+                Self::CompromisedAccount => "CompromisedUser",
+                Self::Malware => "Malware",
+                Self::Phishing => "Phishing",
+                Self::UnwantedSoftware => "UnwantedSoftware",
+                Self::SecurityTesting => "SecurityTesting",
+                Self::LineOfBusinessApplication => "LineOfBusinessApplication",
+                Self::ConfirmedActivity => "ConfirmedUserActivity",
+                Self::NotMalicious => "Clean",
+                Self::NotEnoughDataToValidate => "InsufficientData",
+                Self::Other => "Other",
+            },
+            TriageTarget::XdrAlert | TriageTarget::XdrIncident => self.as_str(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TriageInput {
+    pub action: String,
+    #[serde(default)]
+    pub justification: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub status: Option<TriageStatus>,
+    #[serde(default)]
+    pub assigned_to: Option<String>,
+    #[serde(default)]
+    pub classification: Option<Classification>,
+    #[serde(default)]
+    pub determination: Option<Determination>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
 
 fn default_hunting_action() -> String {
     "run".to_string()
@@ -943,6 +1440,9 @@ pub struct MachinesInput {
     /// OData `$filter` expression.
     #[serde(default)]
     pub filter: Option<String>,
+    /// Timestamp for `find_by_ip` (RFC 3339, within 30 days).
+    #[serde(default)]
+    pub timestamp: Option<String>,
 }
 
 /// Input for `defender_vulnerabilities`.
@@ -998,6 +1498,9 @@ pub struct ForensicsInput {
     /// OData `$filter` expression.
     #[serde(default)]
     pub filter: Option<String>,
+    /// Investigation ID for `investigation_get`.
+    #[serde(default)]
+    pub investigation_id: Option<String>,
 }
 
 /// Input for `defender_response` (mutating, gated).
@@ -1036,7 +1539,7 @@ pub struct ResponseInput {
 }
 
 /// Serialize a dispatcher input into granular-tool arguments: drop `action` and absent fields.
-fn granular_args<T: Serialize>(input: &T) -> serde_json::Map<String, serde_json::Value> {
+fn action_args<T: Serialize>(input: &T) -> serde_json::Map<String, serde_json::Value> {
     let mut args = match serde_json::to_value(input) {
         Ok(serde_json::Value::Object(map)) => map,
         _ => serde_json::Map::new(),
@@ -1086,6 +1589,7 @@ pub struct DefenderServer {
     client: GraphClient,
     endpoint: EndpointClient,
     config: crate::cli::ServerConfig,
+    audit_sink: Option<std::sync::Arc<AuditSink>>,
     /// Tool catalog for the configured mode, with mutating tools removed under `--read-only`.
     router: std::sync::Arc<Router>,
 }
@@ -1095,22 +1599,38 @@ impl DefenderServer {
         client: GraphClient,
         endpoint: EndpointClient,
         config: crate::cli::ServerConfig,
+        audit_sink: Option<std::sync::Arc<AuditSink>>,
     ) -> Self {
-        let mut router = match config.tool_mode {
-            crate::cli::ToolMode::Granular => Self::tool_router(),
-            crate::cli::ToolMode::Consolidated => Self::consolidated_tool_router(),
-        };
-        if config.read_only {
-            for name in MUTATING_TOOLS {
-                router.remove_route(name);
+        let mut router = Self::consolidated_tool_router();
+        for tool in [
+            MutatingTool::Response,
+            MutatingTool::DeviceResponse,
+            MutatingTool::Indicators,
+            MutatingTool::Triage,
+        ] {
+            if !config.categories.tool_enabled(tool) {
+                router.remove_route(tool.name());
+            }
+        }
+        if let Some(route) = router.map.get_mut("defender_device_response") {
+            if config.categories.offboarding {
+                route.attr.description = Some(std::borrow::Cow::Borrowed(DEVICE_RESPONSE_DESCRIPTION_WITH_OFFBOARD));
+            } else {
+                route.attr.description = Some(std::borrow::Cow::Borrowed(DEVICE_RESPONSE_DESCRIPTION_WITHOUT_OFFBOARD));
             }
         }
         Self {
             client,
             endpoint,
             config,
+            audit_sink,
             router: std::sync::Arc::new(router),
         }
+    }
+
+    /// Return the active identity snapshot.
+    pub fn identity(&self) -> IdentitySnapshot {
+        self.endpoint.identity()
     }
 
     /// Tools exposed by `tools/list` for the active configuration.
@@ -1119,6 +1639,7 @@ impl DefenderServer {
     }
 
     /// Pre-network barrier for mutating tools: `Some(error)` when `--read-only` is active.
+    #[allow(dead_code)]
     fn read_only_barrier(&self, tool: &str) -> Option<CallToolResult> {
         self.config
             .read_only
@@ -1238,6 +1759,55 @@ impl DefenderServer {
         ))
     }
 
+    async fn ep_simple_get_as(
+        &self,
+        path: &str,
+        category: PermissionCategory,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(tool_result(
+            self.endpoint.endpoint_get_as(path, &[], category).await,
+        ))
+    }
+
+    async fn ep_odata_get_as(
+        &self,
+        path: &str,
+        odata: &ODataParams<'_>,
+        category: PermissionCategory,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(tool_result(
+            self.endpoint.endpoint_get_with_odata_as(path, odata, category).await,
+        ))
+    }
+
+    /// Check whether the action is a write-named read that was not requested under delegated --read-only.
+    fn check_scope_not_requested(&self, action: &str) -> Option<CallToolResult> {
+        if matches!(self.config.auth, crate::cli::AuthConfig::User { .. }) && self.config.read_only {
+            let scope = match action {
+                "domain_related_machines"
+                | "file_related_machines"
+                | "user_related_machines"
+                | "find_by_ip"
+                | "download_quarantined_file"
+                | "download_live_response_result"
+                | "live_response_get_result" => Some("Machine.ReadWrite"),
+                "file_related_alerts"
+                | "machine_alerts"
+                | "get_investigation_package_sas_url"
+                | "download_investigation_package"
+                | "investigation_list"
+                | "investigation_get" => Some("Alert.ReadWrite"),
+                "custom_indicator_list" => Some("Ti.ReadWrite"),
+                "library_file_list" => Some("Library.Manage"),
+                _ => None,
+            };
+            if let Some(s) = scope {
+                return Some(crate::error::scope_not_requested(action, s));
+            }
+        }
+        None
+    }
+
     /// Build ODataParams with endpoint max top.
     fn ep_odata(filter: Option<&str>, top: i32, skip: i32) -> ODataParams<'_> {
         ODataParams {
@@ -1253,7 +1823,6 @@ impl DefenderServer {
 // Tool implementations
 // ---------------------------------------------------------------------------
 
-#[tool_router]
 impl DefenderServer {
     // ============================================================
     // 3.1 Advanced Hunting
@@ -1265,24 +1834,9 @@ impl DefenderServer {
     /// Microsoft Graph remains the query-language authority. The upstream service limits
     /// results to 100,000 rows and 50 MB with an approximately three-minute timeout.
     /// `P30D` is the default timespan; available history depends on tenant retention.
-    #[tool(
-        name = "defender_advanced_hunting_run",
-        description = "Execute a read-only KQL query across Microsoft Defender XDR advanced hunting event \
-                       tables (DeviceProcessEvents, DeviceNetworkEvents, EmailEvents, IdentityLogonEvents, \
-                       etc.). Returns matching event rows and column schema. Timespan defaults to P30D (last \
-                       30 days) and accepts all ISO 8601 duration/interval formats (e.g., P7D, P90D, or \
-                       explicit start/end timestamps); available history depends on upstream data and \
-                       workspace retention policies. Execution is limited to 100,000 rows, 50 MB response \
-                       payload, and approximately 3-minute timeout per query, subject to tenant-dependent \
-                       rate and CPU resource quotas. Requires ThreatHunting.Read.All application permission.",
-        annotations(
-            title = "Advanced Hunting Run",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_advanced_hunting_run`.
+    ///
+    /// Execute a read-only KQL query across Microsoft Defender XDR advanced hunting event tables (DeviceProcessEvents, DeviceNetworkEvents, EmailEvents, IdentityLogonEvents, etc.). Returns matching event rows and column schema. Timespan defaults to P30D (last 30 days) and accepts all ISO 8601 duration/interval formats (e.g., P7D, P90D, or explicit start/end timestamps); available history depends on upstream data and workspace retention policies. Execution is limited to 100,000 rows, 50 MB response payload, and approximately 3-minute timeout per query, subject to tenant-dependent rate and CPU resource quotas. Requires ThreatHunting.Read.All application permission.
     async fn defender_advanced_hunting_run(
         &self,
         Parameters(params): Parameters<HuntingQueryInput>,
@@ -1306,24 +1860,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List all threat intelligence intel profiles (actor profiles).
-    #[tool(
-        name = "defender_ti_intel_profiles_list",
-        description = "List threat actor intelligence profiles from Microsoft Defender Threat Intelligence, \
-                       including nation-state groups, cybercrime syndicates, and tracked activity groups. \
-                       Returns an OData collection of actor profiles with names, aliases, targets, and \
-                       description summaries. Supports OData query parameters: $top (default 50, max 1000), \
-                       $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw \
-                       @odata.nextLink is preserved for subsequent queries. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "List Intel Profiles",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_intel_profiles_list`.
+    ///
+    /// List threat actor intelligence profiles from Microsoft Defender Threat Intelligence, including nation-state groups, cybercrime syndicates, and tracked activity groups. Returns an OData collection of actor profiles with names, aliases, targets, and description summaries. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_intel_profiles_list(
         &self,
         Parameters(params): Parameters<ODataListInput>,
@@ -1335,22 +1874,9 @@ impl DefenderServer {
     }
 
     /// Get details of a specific intel profile by ID.
-    #[tool(
-        name = "defender_ti_intel_profile_get",
-        description = "Retrieve detailed information for a specific threat actor profile by its unique \
-                       identifier. Returns full profile metadata including known aliases, active targets, \
-                       targeted industries and geographic regions, threat descriptions, and first/last seen \
-                       dates. Pass the opaque intel_profile_id copied directly from profile listing or query \
-                       results; do not manually base64-encode. Requires ThreatIntelligence.Read.All \
-                       application permission and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "Get Intel Profile",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_intel_profile_get`.
+    ///
+    /// Retrieve detailed information for a specific threat actor profile by its unique identifier. Returns full profile metadata including known aliases, active targets, targeted industries and geographic regions, threat descriptions, and first/last seen dates. Pass the opaque intel_profile_id copied directly from profile listing or query results; do not manually base64-encode. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_intel_profile_get(
         &self,
         Parameters(params): Parameters<IntelProfileIdInput>,
@@ -1365,24 +1891,9 @@ impl DefenderServer {
     }
 
     /// List indicators of compromise (IoCs) associated with a specific intel profile.
-    #[tool(
-        name = "defender_ti_intel_profile_indicators_list",
-        description = "List indicators of compromise (IoCs) associated with a specific threat actor \
-                       profile, such as command-and-control IP addresses, malicious domains, and file \
-                       hashes. Returns an OData collection of indicator entities. Pass the opaque \
-                       intel_profile_id. Supports OData query parameters: $top (default 50, max 1000), $skip \
-                       for offset pagination, $filter, $select, and $expand. Single page returned; raw \
-                       @odata.nextLink is preserved for subsequent queries. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "List Intel Profile Indicators",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_intel_profile_indicators_list`.
+    ///
+    /// List indicators of compromise (IoCs) associated with a specific threat actor profile, such as command-and-control IP addresses, malicious domains, and file hashes. Returns an OData collection of indicator entities. Pass the opaque intel_profile_id. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_intel_profile_indicators_list(
         &self,
         Parameters(params): Parameters<IntelProfileIdODataInput>,
@@ -1402,22 +1913,9 @@ impl DefenderServer {
     }
 
     /// Get a specific intel profile indicator by its own ID.
-    #[tool(
-        name = "defender_ti_intel_profile_indicator_get",
-        description = "Retrieve details for a specific threat actor profile indicator by its indicator \
-                       identifier. Returns indicator type, observed value, confidence level, first/last seen \
-                       timestamps, and associated threat context. Pass the opaque indicator_id copied \
-                       verbatim from indicator listing; do not manually base64-encode. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "Get Intel Profile Indicator",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_intel_profile_indicator_get`.
+    ///
+    /// Retrieve details for a specific threat actor profile indicator by its indicator identifier. Returns indicator type, observed value, confidence level, first/last seen timestamps, and associated threat context. Pass the opaque indicator_id copied verbatim from indicator listing; do not manually base64-encode. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_intel_profile_indicator_get(
         &self,
         Parameters(params): Parameters<IntelProfileIndicatorIdInput>,
@@ -1431,22 +1929,9 @@ impl DefenderServer {
     }
 
     /// List all intel profile indicators globally across all profiles.
-    #[tool(
-        name = "defender_ti_intel_profile_indicators_global_list",
-        description = "List threat intelligence indicators across all actor profiles globally. Returns an \
-                       OData collection of threat indicators aggregated across tracked adversaries. Supports \
-                       OData query parameters: $top (default 50, max 1000), $skip for offset pagination, \
-                       $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved \
-                       for subsequent queries. Requires ThreatIntelligence.Read.All application permission \
-                       and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "List Global Intel Profile Indicators",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_intel_profile_indicators_global_list`.
+    ///
+    /// List threat intelligence indicators across all actor profiles globally. Returns an OData collection of threat indicators aggregated across tracked adversaries. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_intel_profile_indicators_global_list(
         &self,
         Parameters(params): Parameters<ODataListInput>,
@@ -1465,23 +1950,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List threat intelligence articles (narrative reports about threats, actors, vulnerabilities).
-    #[tool(
-        name = "defender_ti_articles_list",
-        description = "List threat intelligence articles and research reports published by Microsoft \
-                       security researchers covering emerging threats, campaigns, and vulnerabilities. \
-                       Returns an OData collection of article summaries. Supports OData query parameters: \
-                       $top (default 50, max 1000), $skip for offset pagination, $filter, $select, $expand, \
-                       and $search for full-text keyword querying. Single page returned; raw @odata.nextLink \
-                       is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application \
-                       permission and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "List TI Articles",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_articles_list`.
+    ///
+    /// List threat intelligence articles and research reports published by Microsoft security researchers covering emerging threats, campaigns, and vulnerabilities. Returns an OData collection of article summaries. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, $expand, and $search for full-text keyword querying. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_articles_list(
         &self,
         Parameters(params): Parameters<ODataListInput>,
@@ -1493,21 +1964,9 @@ impl DefenderServer {
     }
 
     /// Get a specific article by ID.
-    #[tool(
-        name = "defender_ti_article_get",
-        description = "Retrieve the full content of a specific threat intelligence article by its article \
-                       identifier. Returns comprehensive narrative report details, executive summary, threat \
-                       analysis, and publication metadata. Pass the article_id (e.g., a272d5ab) copied \
-                       verbatim from article listing. Requires ThreatIntelligence.Read.All application \
-                       permission and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "Get TI Article",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_article_get`.
+    ///
+    /// Retrieve the full content of a specific threat intelligence article by its article identifier. Returns comprehensive narrative report details, executive summary, threat analysis, and publication metadata. Pass the article_id (e.g., a272d5ab) copied verbatim from article listing. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_article_get(
         &self,
         Parameters(params): Parameters<ArticleIdInput>,
@@ -1521,23 +1980,9 @@ impl DefenderServer {
     }
 
     /// List IoCs associated with a specific article.
-    #[tool(
-        name = "defender_ti_article_indicators_list",
-        description = "List indicators of compromise (IoCs) published within a specific threat intelligence \
-                       article. Returns an OData collection of indicator entities associated with the \
-                       research report. Pass the article_id. Supports OData query parameters: $top (default \
-                       50, max 1000), $skip for offset pagination, and $select. Single page returned; raw \
-                       @odata.nextLink is preserved for subsequent queries. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "List Article Indicators",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_article_indicators_list`.
+    ///
+    /// List indicators of compromise (IoCs) published within a specific threat intelligence article. Returns an OData collection of indicator entities associated with the research report. Pass the article_id. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, and $select. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_article_indicators_list(
         &self,
         Parameters(params): Parameters<ArticleIdODataInput>,
@@ -1556,21 +2001,9 @@ impl DefenderServer {
     }
 
     /// Get a specific article indicator by its own ID.
-    #[tool(
-        name = "defender_ti_article_indicator_get",
-        description = "Retrieve details of a specific article indicator by its indicator identifier. \
-                       Returns indicator attributes, observed values, and threat context published in the \
-                       parent research report. Pass the opaque indicator_id copied verbatim from listing \
-                       results; do not manually base64-encode. Requires ThreatIntelligence.Read.All \
-                       application permission and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "Get Article Indicator",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_article_indicator_get`.
+    ///
+    /// Retrieve details of a specific article indicator by its indicator identifier. Returns indicator attributes, observed values, and threat context published in the parent research report. Pass the opaque indicator_id copied verbatim from listing results; do not manually base64-encode. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_article_indicator_get(
         &self,
         Parameters(params): Parameters<ArticleIndicatorIdInput>,
@@ -1584,23 +2017,9 @@ impl DefenderServer {
     }
 
     /// List all article indicators globally across all articles.
-    #[tool(
-        name = "defender_ti_article_indicators_global_list",
-        description = "List indicators of compromise published across all threat intelligence articles \
-                       globally. Returns an OData collection of indicators aggregated from all research \
-                       reports. Supports OData query parameters: $top (default 50, max 1000), $skip for \
-                       offset pagination, $filter, $select, and $expand. Single page returned; raw \
-                       @odata.nextLink is preserved for subsequent queries. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "List Global Article Indicators",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_article_indicators_global_list`.
+    ///
+    /// List indicators of compromise published across all threat intelligence articles globally. Returns an OData collection of indicators aggregated from all research reports. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_article_indicators_global_list(
         &self,
         Parameters(params): Parameters<ODataListInput>,
@@ -1616,22 +2035,9 @@ impl DefenderServer {
     // ============================================================
 
     /// Get information about an internet host (domain or IP address).
-    #[tool(
-        name = "defender_ti_host_get",
-        description = "Retrieve telemetry and infrastructure metadata for an internet host (domain name or \
-                       IP address literal). Returns first and last observed timestamps, hosting provider \
-                       details, autonomous system information, and network attributes. Input hostname must \
-                       be a plain domain or IP; do not pass full URLs with protocols or paths. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "Get Host",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_get`.
+    ///
+    /// Retrieve telemetry and infrastructure metadata for an internet host (domain name or IP address literal). Returns first and last observed timestamps, hosting provider details, autonomous system information, and network attributes. Input hostname must be a plain domain or IP; do not pass full URLs with protocols or paths. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_get(
         &self,
         Parameters(params): Parameters<HostnameInput>,
@@ -1645,22 +2051,9 @@ impl DefenderServer {
     }
 
     /// Get reputation scoring for a host (classification, score, rules).
-    #[tool(
-        name = "defender_ti_host_reputation_get",
-        description = "Retrieve reputation scoring and risk classification for an internet host (domain \
-                       name or IP address literal). Returns classification status (malicious, suspicious, \
-                       neutral, or unknown), computed numeric score (0-100), and triggering heuristic \
-                       detection rules. Input hostname must be a plain domain or IP literal. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "Get Host Reputation",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_reputation_get`.
+    ///
+    /// Retrieve reputation scoring and risk classification for an internet host (domain name or IP address literal). Returns classification status (malicious, suspicious, neutral, or unknown), computed numeric score (0-100), and triggering heuristic detection rules. Input hostname must be a plain domain or IP literal. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_reputation_get(
         &self,
         Parameters(params): Parameters<HostnameInput>,
@@ -1678,23 +2071,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List web components observed on a host (frameworks, CMS, server software).
-    #[tool(
-        name = "defender_ti_host_components_list",
-        description = "List web components, application frameworks, content management systems, and server \
-                       software observed running on an internet host. Returns an OData collection of \
-                       component records. Input hostname must be a plain domain or IP literal. Supports \
-                       OData query parameters: $top (default 50, max 1000), $skip for offset pagination, \
-                       $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved \
-                       for subsequent queries. Requires ThreatIntelligence.Read.All application permission \
-                       and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "List Host Components",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_components_list`.
+    ///
+    /// List web components, application frameworks, content management systems, and server software observed running on an internet host. Returns an OData collection of component records. Input hostname must be a plain domain or IP literal. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_components_list(
         &self,
         Parameters(params): Parameters<HostnameODataInput>,
@@ -1713,22 +2092,9 @@ impl DefenderServer {
     }
 
     /// Get details of a specific host component by its ID.
-    #[tool(
-        name = "defender_ti_host_component_get",
-        description = "Retrieve details for a specific host web component by its unique component \
-                       identifier. Returns component category, detected product name, version details, and \
-                       observation timestamps. Pass the opaque component_id copied verbatim from host \
-                       component listing; do not manually base64-encode. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "Get Host Component",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_component_get`.
+    ///
+    /// Retrieve details for a specific host web component by its unique component identifier. Returns component category, detected product name, version details, and observation timestamps. Pass the opaque component_id copied verbatim from host component listing; do not manually base64-encode. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_component_get(
         &self,
         Parameters(params): Parameters<HostComponentIdInput>,
@@ -1746,24 +2112,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List cookies observed on a host.
-    #[tool(
-        name = "defender_ti_host_cookies_list",
-        description = "List HTTP cookies observed on an internet host during web crawling and \
-                       infrastructure scanning. Returns an OData collection of cookie records including \
-                       cookie names, domains, and observation timestamps. Input hostname must be a plain \
-                       domain or IP literal. Supports OData query parameters: $top (default 50, max 1000), \
-                       $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw \
-                       @odata.nextLink is preserved for subsequent queries. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "List Host Cookies",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_cookies_list`.
+    ///
+    /// List HTTP cookies observed on an internet host during web crawling and infrastructure scanning. Returns an OData collection of cookie records including cookie names, domains, and observation timestamps. Input hostname must be a plain domain or IP literal. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_cookies_list(
         &self,
         Parameters(params): Parameters<HostnameODataInput>,
@@ -1782,21 +2133,9 @@ impl DefenderServer {
     }
 
     /// Get details of a specific host cookie by its ID.
-    #[tool(
-        name = "defender_ti_host_cookie_get",
-        description = "Retrieve details for a specific host HTTP cookie record by its unique cookie \
-                       identifier. Returns cookie name, domain attribute, first and last seen timestamps, \
-                       and associated host context. Pass the opaque cookie_id copied verbatim from host \
-                       cookie listing; do not manually base64-encode. Requires ThreatIntelligence.Read.All \
-                       application permission and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "Get Host Cookie",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_cookie_get`.
+    ///
+    /// Retrieve details for a specific host HTTP cookie record by its unique cookie identifier. Returns cookie name, domain attribute, first and last seen timestamps, and associated host context. Pass the opaque cookie_id copied verbatim from host cookie listing; do not manually base64-encode. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_cookie_get(
         &self,
         Parameters(params): Parameters<HostCookieIdInput>,
@@ -1814,24 +2153,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List open ports observed on a host.
-    #[tool(
-        name = "defender_ti_host_ports_list",
-        description = "List open network ports and running services observed on an internet host. Returns \
-                       an OData collection of port records including port numbers, transport protocols, \
-                       service banners, and scan timestamps. Input hostname must be a plain domain or IP \
-                       literal. Supports OData query parameters: $top (default 50, max 1000), $skip for \
-                       offset pagination, $filter, $select, and $expand. Single page returned; raw \
-                       @odata.nextLink is preserved for subsequent queries. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "List Host Ports",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_ports_list`.
+    ///
+    /// List open network ports and running services observed on an internet host. Returns an OData collection of port records including port numbers, transport protocols, service banners, and scan timestamps. Input hostname must be a plain domain or IP literal. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_ports_list(
         &self,
         Parameters(params): Parameters<HostnameODataInput>,
@@ -1850,21 +2174,9 @@ impl DefenderServer {
     }
 
     /// Get details of a specific host port by its ID.
-    #[tool(
-        name = "defender_ti_host_port_get",
-        description = "Retrieve details for a specific open port observation on a host by its unique port \
-                       identifier. Returns port number, protocol, service banner strings, and detection \
-                       timestamps. Pass the opaque port_id copied verbatim from host port listing; do not \
-                       manually base64-encode. Requires ThreatIntelligence.Read.All application permission \
-                       and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "Get Host Port",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_port_get`.
+    ///
+    /// Retrieve details for a specific open port observation on a host by its unique port identifier. Returns port number, protocol, service banner strings, and detection timestamps. Pass the opaque port_id copied verbatim from host port listing; do not manually base64-encode. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_port_get(
         &self,
         Parameters(params): Parameters<HostPortIdInput>,
@@ -1882,24 +2194,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List tracking codes/scripts observed on a host (analytics, ad trackers).
-    #[tool(
-        name = "defender_ti_host_trackers_list",
-        description = "List web tracking identifiers, ad codes, and analytics scripts (e.g., Google \
-                       Analytics IDs, New Relic tags, social widgets) observed on an internet host. Returns \
-                       an OData collection of tracker records useful for infrastructure correlation. Input \
-                       hostname must be a plain domain or IP literal. Supports OData query parameters: $top \
-                       (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. \
-                       Single page returned; raw @odata.nextLink is preserved for subsequent queries. \
-                       Requires ThreatIntelligence.Read.All application permission and an active Microsoft \
-                       Defender Threat Intelligence license.",
-        annotations(
-            title = "List Host Trackers",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_trackers_list`.
+    ///
+    /// List web tracking identifiers, ad codes, and analytics scripts (e.g., Google Analytics IDs, New Relic tags, social widgets) observed on an internet host. Returns an OData collection of tracker records useful for infrastructure correlation. Input hostname must be a plain domain or IP literal. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_trackers_list(
         &self,
         Parameters(params): Parameters<HostnameODataInput>,
@@ -1918,21 +2215,9 @@ impl DefenderServer {
     }
 
     /// Get details of a specific host tracker by its ID.
-    #[tool(
-        name = "defender_ti_host_tracker_get",
-        description = "Retrieve details for a specific web tracker observation on a host by its unique \
-                       tracker identifier. Returns tracker type, tracking identifier value, and observation \
-                       window. Pass the opaque tracker_id copied verbatim from host tracker listing; do not \
-                       manually base64-encode. Requires ThreatIntelligence.Read.All application permission \
-                       and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "Get Host Tracker",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_tracker_get`.
+    ///
+    /// Retrieve details for a specific web tracker observation on a host by its unique tracker identifier. Returns tracker type, tracking identifier value, and observation window. Pass the opaque tracker_id copied verbatim from host tracker listing; do not manually base64-encode. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_tracker_get(
         &self,
         Parameters(params): Parameters<HostTrackerIdInput>,
@@ -1950,23 +2235,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List subdomains observed for a host.
-    #[tool(
-        name = "defender_ti_host_subdomains_list",
-        description = "List known subdomains observed for a specific domain name. Returns an OData \
-                       collection of subdomain host records discovered across passive DNS and web crawling. \
-                       Input hostname must be a valid domain name (e.g., contoso.com). Supports OData query \
-                       parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, \
-                       $select, and $expand. Single page returned; raw @odata.nextLink is preserved for \
-                       subsequent queries. Requires ThreatIntelligence.Read.All application permission and \
-                       an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "List Host Subdomains",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_subdomains_list`.
+    ///
+    /// List known subdomains observed for a specific domain name. Returns an OData collection of subdomain host records discovered across passive DNS and web crawling. Input hostname must be a valid domain name (e.g., contoso.com). Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_subdomains_list(
         &self,
         Parameters(params): Parameters<HostnameODataInput>,
@@ -1989,24 +2260,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List SSL certificates observed on a host.
-    #[tool(
-        name = "defender_ti_host_ssl_certs_list",
-        description = "List X.509 SSL/TLS certificates observed on an internet host. Returns an OData \
-                       collection of certificate records with thumbprints, subject alternative names, \
-                       validity dates, and issuer details. Input hostname must be a plain domain or IP \
-                       literal. Supports OData query parameters: $top (default 50, max 1000), $skip for \
-                       offset pagination, $filter, $select, $expand, and $count. Single page returned; raw \
-                       @odata.nextLink is preserved for subsequent queries. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "List Host SSL Certificates",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_ssl_certs_list`.
+    ///
+    /// List X.509 SSL/TLS certificates observed on an internet host. Returns an OData collection of certificate records with thumbprints, subject alternative names, validity dates, and issuer details. Input hostname must be a plain domain or IP literal. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, $expand, and $count. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_ssl_certs_list(
         &self,
         Parameters(params): Parameters<HostnameODataInput>,
@@ -2029,21 +2285,9 @@ impl DefenderServer {
     // ============================================================
 
     /// Get the current WHOIS record for a host.
-    #[tool(
-        name = "defender_ti_host_whois_get",
-        description = "Retrieve the current active WHOIS domain registration record for a specific host. \
-                       Returns registrar name, registrant contact details, administrative contacts, \
-                       authoritative name servers, and expiration dates. Input hostname must be a plain \
-                       domain name (e.g., contoso.com). Requires ThreatIntelligence.Read.All application \
-                       permission and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "Get Host Whois",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_whois_get`.
+    ///
+    /// Retrieve the current active WHOIS domain registration record for a specific host. Returns registrar name, registrant contact details, administrative contacts, authoritative name servers, and expiration dates. Input hostname must be a plain domain name (e.g., contoso.com). Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_whois_get(
         &self,
         Parameters(params): Parameters<HostnameInput>,
@@ -2057,23 +2301,9 @@ impl DefenderServer {
     }
 
     /// List historical WHOIS records for a host.
-    #[tool(
-        name = "defender_ti_host_whois_history_list",
-        description = "List historical WHOIS registration snapshots for an internet domain host. Returns an \
-                       OData collection of historical WHOIS records reflecting past ownership, contact \
-                       changes, and registrar transfers. Input hostname must be a plain domain name. \
-                       Supports OData query parameters: $top (default 50, max 1000), $skip for offset \
-                       pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink \
-                       is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application \
-                       permission and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "List Host Whois History",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_whois_history_list`.
+    ///
+    /// List historical WHOIS registration snapshots for an internet domain host. Returns an OData collection of historical WHOIS records reflecting past ownership, contact changes, and registrar transfers. Input hostname must be a plain domain name. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_whois_history_list(
         &self,
         Parameters(params): Parameters<HostnameODataInput>,
@@ -2096,24 +2326,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List host pairs (connections) where this host is either parent or child.
-    #[tool(
-        name = "defender_ti_host_pairs_list",
-        description = "List host pairing relationships where the specified host acts as either the parent \
-                       (initiating connection/referral) or child (target resource) in web infrastructure \
-                       mappings. Returns an OData collection of host pair entities. Input hostname must be a \
-                       plain domain or IP literal. Supports OData query parameters: $top (default 50, max \
-                       1000), $skip for offset pagination, $filter, $select, and $expand. Single page \
-                       returned; raw @odata.nextLink is preserved for subsequent queries. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "List Host Pairs",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_pairs_list`.
+    ///
+    /// List host pairing relationships where the specified host acts as either the parent (initiating connection/referral) or child (target resource) in web infrastructure mappings. Returns an OData collection of host pair entities. Input hostname must be a plain domain or IP literal. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_pairs_list(
         &self,
         Parameters(params): Parameters<HostnameODataInput>,
@@ -2132,21 +2347,9 @@ impl DefenderServer {
     }
 
     /// Get a specific host pair relationship by its ID.
-    #[tool(
-        name = "defender_ti_host_pair_get",
-        description = "Retrieve details of a specific host pair connection by its unique relationship \
-                       identifier. Returns parent host, child host, link type (e.g., script, link, iframe), \
-                       and observation timestamps. Pass the opaque pair_id copied verbatim from host pair \
-                       listing; do not manually base64-encode. Requires ThreatIntelligence.Read.All \
-                       application permission and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "Get Host Pair",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_pair_get`.
+    ///
+    /// Retrieve details of a specific host pair connection by its unique relationship identifier. Returns parent host, child host, link type (e.g., script, link, iframe), and observation timestamps. Pass the opaque pair_id copied verbatim from host pair listing; do not manually base64-encode. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_pair_get(
         &self,
         Parameters(params): Parameters<HostPairIdInput>,
@@ -2160,23 +2363,9 @@ impl DefenderServer {
     }
 
     /// List host pairs where this host is the parent.
-    #[tool(
-        name = "defender_ti_host_child_pairs_list",
-        description = "List child host connections where the specified host is the parent initiating or \
-                       referencing external resources. Returns an OData collection of child host pair \
-                       records. Input hostname must be a plain domain or IP literal. Supports OData query \
-                       parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, \
-                       $select, and $expand. Single page returned; raw @odata.nextLink is preserved for \
-                       subsequent queries. Requires ThreatIntelligence.Read.All application permission and \
-                       an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "List Child Host Pairs",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_child_pairs_list`.
+    ///
+    /// List child host connections where the specified host is the parent initiating or referencing external resources. Returns an OData collection of child host pair records. Input hostname must be a plain domain or IP literal. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_child_pairs_list(
         &self,
         Parameters(params): Parameters<HostnameODataInput>,
@@ -2195,23 +2384,9 @@ impl DefenderServer {
     }
 
     /// List host pairs where this host is the child.
-    #[tool(
-        name = "defender_ti_host_parent_pairs_list",
-        description = "List parent host connections where the specified host is referenced or targeted by \
-                       external parent resources. Returns an OData collection of parent host pair records. \
-                       Input hostname must be a plain domain or IP literal. Supports OData query parameters: \
-                       $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and \
-                       $expand. Single page returned; raw @odata.nextLink is preserved for subsequent \
-                       queries. Requires ThreatIntelligence.Read.All application permission and an active \
-                       Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "List Parent Host Pairs",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_parent_pairs_list`.
+    ///
+    /// List parent host connections where the specified host is referenced or targeted by external parent resources. Returns an OData collection of parent host pair records. Input hostname must be a plain domain or IP literal. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_parent_pairs_list(
         &self,
         Parameters(params): Parameters<HostnameODataInput>,
@@ -2234,24 +2409,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List passive DNS records for a host (forward lookup).
-    #[tool(
-        name = "defender_ti_host_passive_dns_list",
-        description = "List forward passive DNS resolution history for a domain host, mapping the domain to \
-                       observed IP addresses over time. Returns an OData collection of resolution records \
-                       with first/last seen timestamps and record types (A, AAAA, CNAME). Input hostname \
-                       must be a valid domain name. Supports OData query parameters: $top (default 50, max \
-                       1000), $skip for offset pagination, $filter, $select, and $expand. Single page \
-                       returned; raw @odata.nextLink is preserved for subsequent queries. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "List Host Passive DNS",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_passive_dns_list`.
+    ///
+    /// List forward passive DNS resolution history for a domain host, mapping the domain to observed IP addresses over time. Returns an OData collection of resolution records with first/last seen timestamps and record types (A, AAAA, CNAME). Input hostname must be a valid domain name. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_passive_dns_list(
         &self,
         Parameters(params): Parameters<HostnameODataInput>,
@@ -2270,23 +2430,9 @@ impl DefenderServer {
     }
 
     /// List reverse passive DNS records for a host (IP-to-domain mapping).
-    #[tool(
-        name = "defender_ti_host_passive_dns_reverse_list",
-        description = "List reverse passive DNS resolution history for an IP address host, mapping the IP \
-                       address to domains historically resolved to it. Returns an OData collection of \
-                       resolution records. Input hostname must be a valid IP address literal. Supports OData \
-                       query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, \
-                       $select, and $expand. Single page returned; raw @odata.nextLink is preserved for \
-                       subsequent queries. Requires ThreatIntelligence.Read.All application permission and \
-                       an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "List Host Reverse Passive DNS",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_host_passive_dns_reverse_list`.
+    ///
+    /// List reverse passive DNS resolution history for an IP address host, mapping the IP address to domains historically resolved to it. Returns an OData collection of resolution records. Input hostname must be a valid IP address literal. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_host_passive_dns_reverse_list(
         &self,
         Parameters(params): Parameters<HostnameODataInput>,
@@ -2309,24 +2455,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List SSL certificates in the threat intelligence database.
-    #[tool(
-        name = "defender_ti_ssl_certs_list",
-        description = "List SSL/TLS certificates cataloged in the Microsoft Defender Threat Intelligence \
-                       database. Returns an OData collection of certificate metadata objects including \
-                       serial numbers, SHA1/SHA256 thumbprints, subject/issuer distinguished names, and \
-                       validity dates. Supports OData query parameters: $top (default 50, max 1000), $skip \
-                       for offset pagination, $filter, $select, and $expand. Single page returned; raw \
-                       @odata.nextLink is preserved for subsequent queries. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "List SSL Certificates",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_ssl_certs_list`.
+    ///
+    /// List SSL/TLS certificates cataloged in the Microsoft Defender Threat Intelligence database. Returns an OData collection of certificate metadata objects including serial numbers, SHA1/SHA256 thumbprints, subject/issuer distinguished names, and validity dates. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_ssl_certs_list(
         &self,
         Parameters(params): Parameters<ODataListInput>,
@@ -2338,22 +2469,9 @@ impl DefenderServer {
     }
 
     /// Get a specific SSL certificate by its ID.
-    #[tool(
-        name = "defender_ti_ssl_cert_get",
-        description = "Retrieve full details of a specific SSL/TLS certificate by its certificate \
-                       identifier. Returns complete X.509 certificate attributes, public key algorithms, \
-                       subject alternative names, and certificate transparency metadata. Pass the \
-                       certificate_id (opaque base64 string, e.g., MDJjODMz...) copied verbatim from \
-                       certificate listing; do not decode or re-encode. Requires ThreatIntelligence.Read.All \
-                       application permission and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "Get SSL Certificate",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_ssl_cert_get`.
+    ///
+    /// Retrieve full details of a specific SSL/TLS certificate by its certificate identifier. Returns complete X.509 certificate attributes, public key algorithms, subject alternative names, and certificate transparency metadata. Pass the certificate_id (opaque base64 string, e.g., MDJjODMz...) copied verbatim from certificate listing; do not decode or re-encode. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_ssl_cert_get(
         &self,
         Parameters(params): Parameters<SslCertIdInput>,
@@ -2368,23 +2486,9 @@ impl DefenderServer {
     }
 
     /// List hosts associated with a given SSL certificate.
-    #[tool(
-        name = "defender_ti_ssl_cert_related_hosts_list",
-        description = "List internet hosts and domains observed presenting a specific SSL/TLS certificate. \
-                       Returns an OData collection of related host entities. Pass the certificate_id (opaque \
-                       base64 string copied verbatim). Supports OData query parameters: $top (default 50, \
-                       max 1000), $skip for offset pagination, and $count. Single page returned; raw \
-                       @odata.nextLink is preserved for subsequent queries. Requires \
-                       ThreatIntelligence.Read.All application permission and an active Microsoft Defender \
-                       Threat Intelligence license.",
-        annotations(
-            title = "List SSL Certificate Related Hosts",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_ssl_cert_related_hosts_list`.
+    ///
+    /// List internet hosts and domains observed presenting a specific SSL/TLS certificate. Returns an OData collection of related host entities. Pass the certificate_id (opaque base64 string copied verbatim). Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, and $count. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_ssl_cert_related_hosts_list(
         &self,
         Parameters(params): Parameters<CertRelatedHostsInput>,
@@ -2408,22 +2512,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List WHOIS records in the threat intelligence database.
-    #[tool(
-        name = "defender_ti_whois_records_list",
-        description = "List domain WHOIS registration records cataloged across Microsoft Defender Threat \
-                       Intelligence. Returns an OData collection of WHOIS record summaries. Supports OData \
-                       query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, \
-                       $select, and $expand. Single page returned; raw @odata.nextLink is preserved for \
-                       subsequent queries. Requires ThreatIntelligence.Read.All application permission and \
-                       an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "List Whois Records",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_whois_records_list`.
+    ///
+    /// List domain WHOIS registration records cataloged across Microsoft Defender Threat Intelligence. Returns an OData collection of WHOIS record summaries. Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, $filter, $select, and $expand. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_whois_records_list(
         &self,
         Parameters(params): Parameters<ODataListInput>,
@@ -2435,22 +2526,9 @@ impl DefenderServer {
     }
 
     /// Get a specific WHOIS record by its ID.
-    #[tool(
-        name = "defender_ti_whois_record_get",
-        description = "Retrieve a specific domain WHOIS registration record by its record identifier. \
-                       Returns comprehensive registration details, contact blocks, raw registrar responses, \
-                       and nameservers. Pass the opaque record_id (typically a base64 string copied verbatim \
-                       from listing results); do not decode or re-encode. For active domain lookups by \
-                       hostname, use defender_ti_host_whois_get. Requires ThreatIntelligence.Read.All \
-                       application permission and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "Get Whois Record",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_whois_record_get`.
+    ///
+    /// Retrieve a specific domain WHOIS registration record by its record identifier. Returns comprehensive registration details, contact blocks, raw registrar responses, and nameservers. Pass the opaque record_id (typically a base64 string copied verbatim from listing results); do not decode or re-encode. For active domain lookups by hostname, use defender_ti_host_whois_get. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_whois_record_get(
         &self,
         Parameters(params): Parameters<WhoisRecordIdInput>,
@@ -2468,22 +2546,9 @@ impl DefenderServer {
     // ============================================================
 
     /// Get a specific passive DNS record by its ID.
-    #[tool(
-        name = "defender_ti_passive_dns_get",
-        description = "Retrieve a specific passive DNS record by its unique record identifier. Returns \
-                       domain, IP address mapping, record type, and first/last observed resolution \
-                       timestamps. Pass the opaque record_id copied verbatim from listing results; do not \
-                       manually base64-encode. For host-based resolution queries, use \
-                       defender_ti_host_passive_dns_list. Requires ThreatIntelligence.Read.All application \
-                       permission and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "Get Passive DNS Record",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_passive_dns_get`.
+    ///
+    /// Retrieve a specific passive DNS record by its unique record identifier. Returns domain, IP address mapping, record type, and first/last observed resolution timestamps. Pass the opaque record_id copied verbatim from listing results; do not manually base64-encode. For host-based resolution queries, use defender_ti_host_passive_dns_list. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_passive_dns_get(
         &self,
         Parameters(params): Parameters<PassiveDnsRecordIdInput>,
@@ -2501,22 +2566,9 @@ impl DefenderServer {
     // ============================================================
 
     /// Get details of a specific vulnerability/CVE.
-    #[tool(
-        name = "defender_ti_vulnerability_get",
-        description = "Retrieve threat intelligence details for a specific Common Vulnerabilities and \
-                       Exposures (CVE) identifier. Returns vulnerability description, CVSS base score, \
-                       severity rating, active exploit status in the wild, remediation guidance, related \
-                       intelligence articles, and dark web discussion chatter. CVE ID must follow standard \
-                       format CVE-YYYY-NNNN+ (e.g., CVE-2021-44228). Requires ThreatIntelligence.Read.All \
-                       application permission and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "Get Vulnerability",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_vulnerability_get`.
+    ///
+    /// Retrieve threat intelligence details for a specific Common Vulnerabilities and Exposures (CVE) identifier. Returns vulnerability description, CVSS base score, severity rating, active exploit status in the wild, remediation guidance, related intelligence articles, and dark web discussion chatter. CVE ID must follow standard format CVE-YYYY-NNNN+ (e.g., CVE-2021-44228). Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_vulnerability_get(
         &self,
         Parameters(params): Parameters<VulnerabilityIdInput>,
@@ -2530,23 +2582,9 @@ impl DefenderServer {
     }
 
     /// List software/hardware components affected by a specific vulnerability/CVE.
-    #[tool(
-        name = "defender_ti_vulnerability_components_list",
-        description = "List software and hardware components affected by a specific CVE identifier \
-                       according to Microsoft Defender Threat Intelligence. Returns an OData collection of \
-                       affected component objects. Pass a valid CVE ID (e.g., CVE-2021-44228). Supports \
-                       OData query parameters: $top (default 50, max 1000), $skip for offset pagination, and \
-                       $select. Single page returned; raw @odata.nextLink is preserved for subsequent \
-                       queries. Requires ThreatIntelligence.Read.All application permission and an active \
-                       Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "List Vulnerability Components",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_vulnerability_components_list`.
+    ///
+    /// List software and hardware components affected by a specific CVE identifier according to Microsoft Defender Threat Intelligence. Returns an OData collection of affected component objects. Pass a valid CVE ID (e.g., CVE-2021-44228). Supports OData query parameters: $top (default 50, max 1000), $skip for offset pagination, and $select. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_vulnerability_components_list(
         &self,
         Parameters(params): Parameters<VulnerabilityODataInput>,
@@ -2570,21 +2608,9 @@ impl DefenderServer {
     }
 
     /// Get a specific vulnerability component by CVE and component ID.
-    #[tool(
-        name = "defender_ti_vulnerability_component_get",
-        description = "Retrieve details for a specific component affected by a CVE vulnerability. Returns \
-                       component identification, vendor, product version ranges, and platform context. Pass \
-                       a valid CVE ID (e.g., CVE-2021-44228) and the opaque component_id copied verbatim \
-                       from component listing. Requires ThreatIntelligence.Read.All application permission \
-                       and an active Microsoft Defender Threat Intelligence license.",
-        annotations(
-            title = "Get Vulnerability Component",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_ti_vulnerability_component_get`.
+    ///
+    /// Retrieve details for a specific component affected by a CVE vulnerability. Returns component identification, vendor, product version ranges, and platform context. Pass a valid CVE ID (e.g., CVE-2021-44228) and the opaque component_id copied verbatim from component listing. Requires ThreatIntelligence.Read.All application permission and an active Microsoft Defender Threat Intelligence license.
     async fn defender_ti_vulnerability_component_get(
         &self,
         Parameters(params): Parameters<VulnComponentGetInput>,
@@ -2604,22 +2630,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List all machines/devices in the organization with OData filtering.
-    #[tool(
-        name = "defender_endpoint_machine_list",
-        description = "List onboarded endpoint machines and devices enrolled in Microsoft Defender for \
-                       Endpoint. Returns an OData collection of machine entities with health status, risk \
-                       levels, OS platforms, IP addresses, and device tags. Supports OData query parameters: \
-                       $filter, $top (default 50, max 10000), and $skip for offset pagination. Single page \
-                       returned; raw @odata.nextLink is preserved for subsequent queries. Requires \
-                       Machine.Read.All application permission.",
-        annotations(
-            title = "List Endpoint Machines",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_machine_list`.
+    ///
+    /// List onboarded endpoint machines and devices enrolled in Microsoft Defender for Endpoint. Returns an OData collection of machine entities with health status, risk levels, OS platforms, IP addresses, and device tags. Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for offset pagination. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires Machine.Read.All application permission.
     async fn defender_endpoint_machine_list(
         &self,
         Parameters(params): Parameters<EndpointODataInput>,
@@ -2630,21 +2643,9 @@ impl DefenderServer {
     }
 
     /// Get detailed information about a specific machine by ID.
-    #[tool(
-        name = "defender_endpoint_machine_get",
-        description = "Retrieve detailed hardware, OS, network, and security configuration for a specific \
-                       device by its Defender machine ID. Returns computer name, domain, OS version, agent \
-                       health, risk score, exposure level, and first/last seen timestamps. Pass the \
-                       machine_id (usually a 40-character hexadecimal Defender device ID; not an Azure AD \
-                       device ID or UUID). Requires Machine.Read.All application permission.",
-        annotations(
-            title = "Get Endpoint Machine",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_machine_get`.
+    ///
+    /// Retrieve detailed hardware, OS, network, and security configuration for a specific device by its Defender machine ID. Returns computer name, domain, OS version, agent health, risk score, exposure level, and first/last seen timestamps. Pass the machine_id (usually a 40-character hexadecimal Defender device ID; not an Azure AD device ID or UUID). Requires Machine.Read.All application permission.
     async fn defender_endpoint_machine_get(
         &self,
         Parameters(params): Parameters<MachineIdInput>,
@@ -2658,20 +2659,9 @@ impl DefenderServer {
     }
 
     /// Get the list of users logged on to a specific machine.
-    #[tool(
-        name = "defender_endpoint_machine_logged_on_users",
-        description = "List user accounts observed logged on to a specific endpoint device. Returns an \
-                       OData object with a value array of user records, including accountName, accountDomain, \
-                       firstSeen, lastSeen, and logonTypes; these are not individual logon sessions. Pass the \
-                       Defender machine_id. Requires User.Read.All application permission.",
-        annotations(
-            title = "Get Machine Logged On Users",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_machine_logged_on_users`.
+    ///
+    /// List user accounts observed logged on to a specific endpoint device. Returns an OData object with a value array of user records, including accountName, accountDomain, firstSeen, lastSeen, and logonTypes; these are not individual logon sessions. Pass the Defender machine_id. Requires User.Read.All application permission.
     async fn defender_endpoint_machine_logged_on_users(
         &self,
         Parameters(params): Parameters<MachineIdInput>,
@@ -2685,21 +2675,9 @@ impl DefenderServer {
     }
 
     /// Find machines by tag name with optional prefix matching.
-    #[tool(
-        name = "defender_endpoint_machine_find_by_tag",
-        description = "Search for endpoint devices by administrative device tag. Returns an OData object \
-                       with a value array of matching machines. Pass the tag_name (case-insensitive string; slashes and \
-                       dots are preserved in the query) and optional use_starts_with boolean (true for \
-                       prefix matching, false for exact match). Requires Machine.Read.All application \
-                       permission.",
-        annotations(
-            title = "Find Endpoint Machines by Tag",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_machine_find_by_tag`.
+    ///
+    /// Search for endpoint devices by administrative device tag. Returns an OData object with a value array of matching machines. Pass the tag_name (case-insensitive string; slashes and dots are preserved in the query) and optional use_starts_with boolean (true for prefix matching, false for exact match). Requires Machine.Read.All application permission.
     async fn defender_endpoint_machine_find_by_tag(
         &self,
         Parameters(params): Parameters<FindByTagInput>,
@@ -2719,20 +2697,9 @@ impl DefenderServer {
     }
 
     /// List all installed software on a specific machine.
-    #[tool(
-        name = "defender_endpoint_machine_list_software",
-        description = "List software applications, versions, and vendors installed on a specific endpoint \
-                       device. Returns an OData object with a value array of installed software entities for vulnerability and \
-                       compliance analysis. Pass the 40-hex Defender machine_id. Requires Software.Read.All \
-                       application permission.",
-        annotations(
-            title = "List Machine Software",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_machine_list_software`.
+    ///
+    /// List software applications, versions, and vendors installed on a specific endpoint device. Returns an OData object with a value array of installed software entities for vulnerability and compliance analysis. Pass the 40-hex Defender machine_id. Requires Software.Read.All application permission.
     async fn defender_endpoint_machine_list_software(
         &self,
         Parameters(params): Parameters<MachineIdInput>,
@@ -2746,20 +2713,9 @@ impl DefenderServer {
     }
 
     /// Get security recommendations for a specific machine.
-    #[tool(
-        name = "defender_endpoint_machine_security_recommendations",
-        description = "List security recommendations and configuration improvement actions applicable to a \
-                       specific endpoint device. Returns an OData object with a value array of recommendations including \
-                       remediation steps, threat context, and risk impact. Pass the 40-hex Defender \
-                       machine_id. Requires SecurityRecommendation.Read.All application permission.",
-        annotations(
-            title = "Get Machine Security Recommendations",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_machine_security_recommendations`.
+    ///
+    /// List security recommendations and configuration improvement actions applicable to a specific endpoint device. Returns an OData object with a value array of recommendations including remediation steps, threat context, and risk impact. Pass the 40-hex Defender machine_id. Requires SecurityRecommendation.Read.All application permission.
     async fn defender_endpoint_machine_security_recommendations(
         &self,
         Parameters(params): Parameters<MachineIdInput>,
@@ -2777,22 +2733,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List all software inventory across the organization.
-    #[tool(
-        name = "defender_endpoint_software_list",
-        description = "List software inventory items discovered across all onboarded devices in the \
-                       organization. Returns an OData collection of software products with vendor names, \
-                       product identifiers, and weakness counts. Supports OData query parameters: $filter, \
-                       $top (default 50, max 10000), and $skip for offset pagination. Single page returned; \
-                       raw @odata.nextLink is preserved for subsequent queries. Requires Software.Read.All \
-                       application permission.",
-        annotations(
-            title = "List Endpoint Software",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_software_list`.
+    ///
+    /// List software inventory items discovered across all onboarded devices in the organization. Returns an OData collection of software products with vendor names, product identifiers, and weakness counts. Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for offset pagination. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires Software.Read.All application permission.
     async fn defender_endpoint_software_list(
         &self,
         Parameters(params): Parameters<EndpointODataInput>,
@@ -2803,20 +2746,9 @@ impl DefenderServer {
     }
 
     /// Get detailed information about a specific software by ID.
-    #[tool(
-        name = "defender_endpoint_software_get",
-        description = "Retrieve detailed inventory and vulnerability summary for a specific software \
-                       product. Returns product name, vendor, installed device count, and overall exposure \
-                       metrics. Pass the software_id (e.g., microsoft-_-internet_explorer). Requires \
-                       Software.Read.All application permission.",
-        annotations(
-            title = "Get Endpoint Software",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_software_get`.
+    ///
+    /// Retrieve detailed inventory and vulnerability summary for a specific software product. Returns product name, vendor, installed device count, and overall exposure metrics. Pass the software_id (e.g., microsoft-_-internet_explorer). Requires Software.Read.All application permission.
     async fn defender_endpoint_software_get(
         &self,
         Parameters(params): Parameters<SoftwareIdInput>,
@@ -2830,22 +2762,9 @@ impl DefenderServer {
     }
 
     /// List all machines that have a specific software installed.
-    #[tool(
-        name = "defender_endpoint_software_machines",
-        description = "List endpoint devices that currently have a specific software product installed. \
-                       Returns an OData collection of machine reference entities. Pass the software_id. \
-                       Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for \
-                       offset pagination. Single page returned; raw @odata.nextLink is preserved for \
-                       subsequent queries. Requires Machine.Read.All or Software.Read.All application \
-                       permission.",
-        annotations(
-            title = "List Software Machines",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_software_machines`.
+    ///
+    /// List endpoint devices that currently have a specific software product installed. Returns an OData collection of machine reference entities. Pass the software_id. Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for offset pagination. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires Machine.Read.All or Software.Read.All application permission.
     async fn defender_endpoint_software_machines(
         &self,
         Parameters(params): Parameters<SoftwareODataInput>,
@@ -2864,20 +2783,9 @@ impl DefenderServer {
     }
 
     /// List all vulnerabilities associated with a specific software.
-    #[tool(
-        name = "defender_endpoint_software_vulnerabilities",
-        description = "List known Common Vulnerabilities and Exposures (CVEs) associated with a specific \
-                       software product across the organization. Returns an OData object with a value array of vulnerability summary \
-                       entities with severity and CVSS scores. Pass the software_id. Requires \
-                       Vulnerability.Read.All application permission.",
-        annotations(
-            title = "List Software Vulnerabilities",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_software_vulnerabilities`.
+    ///
+    /// List known Common Vulnerabilities and Exposures (CVEs) associated with a specific software product across the organization. Returns an OData object with a value array of vulnerability summary entities with severity and CVSS scores. Pass the software_id. Requires Vulnerability.Read.All application permission.
     async fn defender_endpoint_software_vulnerabilities(
         &self,
         Parameters(params): Parameters<SoftwareIdInput>,
@@ -2891,20 +2799,9 @@ impl DefenderServer {
     }
 
     /// List missing security updates (KBs) for a specific software.
-    #[tool(
-        name = "defender_endpoint_software_missing_kbs",
-        description = "List missing Microsoft security updates (KB patches) required for a specific \
-                       software product installed on organizational endpoints. Returns an OData object with a value array of missing \
-                       update entities. Pass the software_id. Requires Software.Read.All application \
-                       permission.",
-        annotations(
-            title = "List Software Missing KBs",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_software_missing_kbs`.
+    ///
+    /// List missing Microsoft security updates (KB patches) required for a specific software product installed on organizational endpoints. Returns an OData object with a value array of missing update entities. Pass the software_id. Requires Software.Read.All application permission.
     async fn defender_endpoint_software_missing_kbs(
         &self,
         Parameters(params): Parameters<SoftwareIdInput>,
@@ -2918,20 +2815,9 @@ impl DefenderServer {
     }
 
     /// Get version distribution statistics for a specific software.
-    #[tool(
-        name = "defender_endpoint_software_distribution",
-        description = "Retrieve version distribution statistics for a specific software product across the \
-                       organizational device fleet. Returns raw JSON containing software version records with \
-                       deployed machine counts. Pass the software_id. Requires Software.Read.All application \
-                       permission.",
-        annotations(
-            title = "Get Software Distribution",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_software_distribution`.
+    ///
+    /// Retrieve version distribution statistics for a specific software product across the organizational device fleet. Returns raw JSON containing software version records with deployed machine counts. Pass the software_id. Requires Software.Read.All application permission.
     async fn defender_endpoint_software_distribution(
         &self,
         Parameters(params): Parameters<SoftwareIdInput>,
@@ -2949,22 +2835,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List all vulnerabilities affecting the organization.
-    #[tool(
-        name = "defender_endpoint_vulnerability_list",
-        description = "List all vulnerabilities affecting software installed across the organization \
-                       according to Defender Vulnerability Management. Returns an OData collection of CVE \
-                       vulnerability entities with CVSS scores, exploitability tags, and severity ratings. \
-                       Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for \
-                       offset pagination. Single page returned; raw @odata.nextLink is preserved for \
-                       subsequent queries. Requires Vulnerability.Read.All application permission.",
-        annotations(
-            title = "List Endpoint Vulnerabilities",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_vulnerability_list`.
+    ///
+    /// List all vulnerabilities affecting software installed across the organization according to Defender Vulnerability Management. Returns an OData collection of CVE vulnerability entities with CVSS scores, exploitability tags, and severity ratings. Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for offset pagination. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires Vulnerability.Read.All application permission.
     async fn defender_endpoint_vulnerability_list(
         &self,
         Parameters(params): Parameters<EndpointODataInput>,
@@ -2975,20 +2848,9 @@ impl DefenderServer {
     }
 
     /// Get a specific vulnerability by CVE identifier.
-    #[tool(
-        name = "defender_endpoint_vulnerability_get_by_cve",
-        description = "Retrieve details for a specific vulnerability in organizational software by its CVE \
-                       identifier. Returns vulnerability severity, CVSS scores, published dates, \
-                       exploitability types, and affected software list. Pass a valid CVE ID (e.g., \
-                       CVE-2021-44228). Requires Vulnerability.Read.All application permission.",
-        annotations(
-            title = "Get Endpoint Vulnerability by CVE",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_vulnerability_get_by_cve`.
+    ///
+    /// Retrieve details for a specific vulnerability in organizational software by its CVE identifier. Returns vulnerability severity, CVSS scores, published dates, exploitability types, and affected software list. Pass a valid CVE ID (e.g., CVE-2021-44228). Requires Vulnerability.Read.All application permission.
     async fn defender_endpoint_vulnerability_get_by_cve(
         &self,
         Parameters(params): Parameters<CveIdInput>,
@@ -3002,22 +2864,9 @@ impl DefenderServer {
     }
 
     /// List all machines exposed to a specific vulnerability.
-    #[tool(
-        name = "defender_endpoint_vulnerability_get_machines",
-        description = "List endpoint devices exposed to a specific CVE vulnerability due to vulnerable \
-                       software installations. Returns an OData collection of machine references. Pass a \
-                       valid CVE ID (e.g., CVE-2021-44228). Supports OData query parameters: $filter, $top \
-                       (default 50, max 10000), and $skip for offset pagination. Single page returned; raw \
-                       @odata.nextLink is preserved for subsequent queries. Requires Machine.Read.All or \
-                       Vulnerability.Read.All application permission.",
-        annotations(
-            title = "List Vulnerability Machines",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_vulnerability_get_machines`.
+    ///
+    /// List endpoint devices exposed to a specific CVE vulnerability due to vulnerable software installations. Returns an OData collection of machine references. Pass a valid CVE ID (e.g., CVE-2021-44228). Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for offset pagination. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires Machine.Read.All or Vulnerability.Read.All application permission.
     async fn defender_endpoint_vulnerability_get_machines(
         &self,
         Parameters(params): Parameters<CveODataInput>,
@@ -3036,22 +2885,9 @@ impl DefenderServer {
     }
 
     /// List all vulnerability-to-machine-to-software mappings.
-    #[tool(
-        name = "defender_endpoint_vulnerability_get_by_machine_software",
-        description = "List all tripartite mappings between vulnerable software, specific CVEs, and exposed \
-                       devices across the organization. Returns an OData collection of \
-                       vulnerability-machine-software association records. Supports OData query parameters: \
-                       $filter, $top (default 50, max 10000), and $skip for offset pagination. Single page \
-                       returned; raw @odata.nextLink is preserved for subsequent queries. Requires \
-                       Vulnerability.Read.All application permission.",
-        annotations(
-            title = "List Vulnerabilities by Machine and Software",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_vulnerability_get_by_machine_software`.
+    ///
+    /// List all tripartite mappings between vulnerable software, specific CVEs, and exposed devices across the organization. Returns an OData collection of vulnerability-machine-software association records. Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for offset pagination. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires Vulnerability.Read.All application permission.
     async fn defender_endpoint_vulnerability_get_by_machine_software(
         &self,
         Parameters(params): Parameters<EndpointODataInput>,
@@ -3067,22 +2903,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List all security recommendations.
-    #[tool(
-        name = "defender_endpoint_recommendation_list",
-        description = "List security recommendations from Microsoft Defender Vulnerability Management \
-                       prioritizing risk reduction across endpoints. Returns an OData collection of security \
-                       recommendation objects with remediation type, threat context, and exposure impact. \
-                       Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for \
-                       offset pagination. Single page returned; raw @odata.nextLink is preserved for \
-                       subsequent queries. Requires SecurityRecommendation.Read.All application permission.",
-        annotations(
-            title = "List Security Recommendations",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_recommendation_list`.
+    ///
+    /// List security recommendations from Microsoft Defender Vulnerability Management prioritizing risk reduction across endpoints. Returns an OData collection of security recommendation objects with remediation type, threat context, and exposure impact. Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for offset pagination. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires SecurityRecommendation.Read.All application permission.
     async fn defender_endpoint_recommendation_list(
         &self,
         Parameters(params): Parameters<EndpointODataInput>,
@@ -3093,21 +2916,9 @@ impl DefenderServer {
     }
 
     /// Get a specific security recommendation by ID.
-    #[tool(
-        name = "defender_endpoint_recommendation_get",
-        description = "Retrieve details of a specific security recommendation by its recommendation \
-                       identifier. Returns full recommendation metadata, remediation instructions, affected \
-                       product information, and risk score impact. Pass the recommendation_id (e.g., \
-                       va-_-google-_-chrome). Requires SecurityRecommendation.Read.All application \
-                       permission.",
-        annotations(
-            title = "Get Security Recommendation",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_recommendation_get`.
+    ///
+    /// Retrieve details of a specific security recommendation by its recommendation identifier. Returns full recommendation metadata, remediation instructions, affected product information, and risk score impact. Pass the recommendation_id (e.g., va-_-google-_-chrome). Requires SecurityRecommendation.Read.All application permission.
     async fn defender_endpoint_recommendation_get(
         &self,
         Parameters(params): Parameters<RecommendationIdInput>,
@@ -3122,20 +2933,9 @@ impl DefenderServer {
     }
 
     /// List all machines associated with a specific security recommendation.
-    #[tool(
-        name = "defender_endpoint_recommendation_machines",
-        description = "List endpoint devices where a specific security recommendation is currently \
-                       applicable and unresolved. Returns an OData object with a value array of machine references. Pass the \
-                       recommendation_id. Requires SecurityRecommendation.Read.All \
-                       application permission.",
-        annotations(
-            title = "List Recommendation Machines",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_recommendation_machines`.
+    ///
+    /// List endpoint devices where a specific security recommendation is currently applicable and unresolved. Returns an OData object with a value array of machine references. Pass the recommendation_id. Requires SecurityRecommendation.Read.All application permission.
     async fn defender_endpoint_recommendation_machines(
         &self,
         Parameters(params): Parameters<RecommendationIdInput>,
@@ -3150,20 +2950,9 @@ impl DefenderServer {
     }
 
     /// List vulnerabilities associated with a specific recommendation.
-    #[tool(
-        name = "defender_endpoint_recommendation_vulnerabilities",
-        description = "List CVE vulnerabilities addressed and remediated by implementing a specific \
-                       security recommendation. Returns an OData object with a value array of related CVE records. Pass the \
-                       recommendation_id. Requires Vulnerability.Read.All \
-                       application permission.",
-        annotations(
-            title = "List Recommendation Vulnerabilities",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_recommendation_vulnerabilities`.
+    ///
+    /// List CVE vulnerabilities addressed and remediated by implementing a specific security recommendation. Returns an OData object with a value array of related CVE records. Pass the recommendation_id. Requires Vulnerability.Read.All application permission.
     async fn defender_endpoint_recommendation_vulnerabilities(
         &self,
         Parameters(params): Parameters<RecommendationIdInput>,
@@ -3178,19 +2967,9 @@ impl DefenderServer {
     }
 
     /// List software inventory entries associated with a specific recommendation.
-    #[tool(
-        name = "defender_endpoint_recommendation_by_software",
-        description = "List software applications associated with a specific security recommendation. \
-                       Returns an OData object with a value array of related software products. Pass the recommendation_id. \
-                       Requires Software.Read.All application permission.",
-        annotations(
-            title = "List Recommendation Software",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_recommendation_by_software`.
+    ///
+    /// List software applications associated with a specific security recommendation. Returns an OData object with a value array of related software products. Pass the recommendation_id. Requires Software.Read.All application permission.
     async fn defender_endpoint_recommendation_by_software(
         &self,
         Parameters(params): Parameters<RecommendationIdInput>,
@@ -3209,22 +2988,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List all remediation tasks (read-only).
-    #[tool(
-        name = "defender_endpoint_remediation_list",
-        description = "List remediation tasks and security mitigation activities created in Defender \
-                       Vulnerability Management or integrated via Microsoft Intune. Returns an OData \
-                       collection of remediation task summaries with status, priority, and progress metrics. \
-                       Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for \
-                       offset pagination. Single page returned; raw @odata.nextLink is preserved for \
-                       subsequent queries. Requires RemediationTasks.Read.All application permission.",
-        annotations(
-            title = "List Remediation Tasks",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_remediation_list`.
+    ///
+    /// List remediation tasks and security mitigation activities created in Defender Vulnerability Management or integrated via Microsoft Intune. Returns an OData collection of remediation task summaries with status, priority, and progress metrics. Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for offset pagination. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires RemediationTasks.Read.All application permission.
     async fn defender_endpoint_remediation_list(
         &self,
         Parameters(params): Parameters<EndpointODataInput>,
@@ -3235,20 +3001,9 @@ impl DefenderServer {
     }
 
     /// Get a specific remediation task by ID.
-    #[tool(
-        name = "defender_endpoint_remediation_get",
-        description = "Retrieve details and execution status for a specific remediation task by its task \
-                       identifier. Returns task title, description, assigned technician/team, target \
-                       completion date, and current lifecycle state. Pass the remediation_id (GUID string). \
-                       Requires RemediationTasks.Read.All application permission.",
-        annotations(
-            title = "Get Remediation Task",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_remediation_get`.
+    ///
+    /// Retrieve details and execution status for a specific remediation task by its task identifier. Returns task title, description, assigned technician/team, target completion date, and current lifecycle state. Pass the remediation_id (GUID string). Requires RemediationTasks.Read.All application permission.
     async fn defender_endpoint_remediation_get(
         &self,
         Parameters(params): Parameters<RemediationIdInput>,
@@ -3263,22 +3018,9 @@ impl DefenderServer {
     }
 
     /// List devices exposed to a specific remediation task.
-    #[tool(
-        name = "defender_endpoint_remediation_exposed_devices",
-        description = "List endpoint devices targeted by or exposed to a specific remediation task. Returns \
-                       an OData collection of machine references. Pass the remediation_id (GUID string). \
-                       Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for \
-                       offset pagination. Single page returned; raw @odata.nextLink is preserved for \
-                       subsequent queries. Requires Machine.Read.All or RemediationTasks.Read.All \
-                       application permission.",
-        annotations(
-            title = "List Remediation Exposed Devices",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_remediation_exposed_devices`.
+    ///
+    /// List endpoint devices targeted by or exposed to a specific remediation task. Returns an OData collection of machine references. Pass the remediation_id (GUID string). Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for offset pagination. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires Machine.Read.All or RemediationTasks.Read.All application permission.
     async fn defender_endpoint_remediation_exposed_devices(
         &self,
         Parameters(params): Parameters<RemediationODataInput>,
@@ -3302,39 +3044,17 @@ impl DefenderServer {
     // ============================================================
 
     /// Get the organization's overall exposure score.
-    #[tool(
-        name = "defender_endpoint_exposure_score",
-        description = "Retrieve the organization's overall device exposure score from Microsoft Defender \
-                       Vulnerability Management. Returns calculated exposure score reflecting cumulative \
-                       organizational risk based on unresolved vulnerabilities, misconfigurations, and \
-                       device criticality. Requires Score.Read.All application permission.",
-        annotations(
-            title = "Get Exposure Score",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_exposure_score`.
+    ///
+    /// Retrieve the organization's overall device exposure score from Microsoft Defender Vulnerability Management. Returns calculated exposure score reflecting cumulative organizational risk based on unresolved vulnerabilities, misconfigurations, and device criticality. Requires Score.Read.All application permission.
     async fn defender_endpoint_exposure_score(&self) -> Result<CallToolResult, McpError> {
         self.ep_simple_get("/api/exposureScore").await
     }
 
     /// Get exposure score broken down by machine group.
-    #[tool(
-        name = "defender_endpoint_exposure_score_by_machine_groups",
-        description = "Retrieve exposure scores broken down across defined device groups (e.g., Tier 0 \
-                       domain controllers, developer workstations, production servers). Returns raw JSON containing \
-                       group exposure objects with group IDs, group names, and individual group exposure \
-                       scores. Requires Score.Read.All application permission.",
-        annotations(
-            title = "Get Exposure Score by Machine Groups",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_exposure_score_by_machine_groups`.
+    ///
+    /// Retrieve exposure scores broken down across defined device groups (e.g., Tier 0 domain controllers, developer workstations, production servers). Returns raw JSON containing group exposure objects with group IDs, group names, and individual group exposure scores. Requires Score.Read.All application permission.
     async fn defender_endpoint_exposure_score_by_machine_groups(
         &self,
     ) -> Result<CallToolResult, McpError> {
@@ -3347,21 +3067,9 @@ impl DefenderServer {
     // ============================================================
 
     /// Get prevalence and first/last seen statistics for an IP address.
-    #[tool(
-        name = "defender_endpoint_ip_statistics",
-        description = "Retrieve organizational prevalence and communication statistics for an external or \
-                       internal IP address across all managed endpoints. Returns first and last observed \
-                       communication timestamps, communicating device counts, and traffic summaries. Pass an \
-                       IPv4 or IPv6 address and optional look_back_hours (default 720, representing 30 days; \
-                       range 1–720). Requires Ip.Read.All application permission.",
-        annotations(
-            title = "Get IP Statistics",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_ip_statistics`.
+    ///
+    /// Retrieve organizational prevalence and communication statistics for an external or internal IP address across all managed endpoints. Returns first and last observed communication timestamps, communicating device counts, and traffic summaries. Pass an IPv4 or IPv6 address and optional look_back_hours (default 720, representing 30 days; range 1–720). Requires Ip.Read.All application permission.
     async fn defender_endpoint_ip_statistics(
         &self,
         Parameters(params): Parameters<IpStatsInput>,
@@ -3386,20 +3094,9 @@ impl DefenderServer {
     }
 
     /// Get alerts related to a specific IP address.
-    #[tool(
-        name = "defender_endpoint_ip_related_alerts",
-        description = "List security alerts associated with network traffic to or from a specific IP \
-                       address across all endpoints. Returns an OData object with a value array of related alerts. Pass an \
-                       IPv4 or IPv6 address literal. Requires Alert.Read.All or Alert.ReadWrite.All \
-                       application permission.",
-        annotations(
-            title = "Get IP Related Alerts",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_ip_related_alerts`.
+    ///
+    /// List security alerts associated with network traffic to or from a specific IP address across all endpoints. Returns an OData object with a value array of related alerts. Pass an IPv4 or IPv6 address literal. Requires Alert.Read.All or Alert.ReadWrite.All application permission.
     async fn defender_endpoint_ip_related_alerts(
         &self,
         Parameters(params): Parameters<IpInput>,
@@ -3417,21 +3114,9 @@ impl DefenderServer {
     // ============================================================
 
     /// Get prevalence and first/last seen statistics for a domain.
-    #[tool(
-        name = "defender_endpoint_domain_statistics",
-        description = "Retrieve organizational prevalence and communication statistics for a domain name \
-                       across all managed endpoints. Returns first and last observed access timestamps and \
-                       accessing device counts. Pass a domain name (e.g., example.com) and optional \
-                       look_back_hours (default 720; range 1–720). Requires URL.Read.All application \
-                       permission.",
-        annotations(
-            title = "Get Domain Statistics",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_domain_statistics`.
+    ///
+    /// Retrieve organizational prevalence and communication statistics for a domain name across all managed endpoints. Returns first and last observed access timestamps and accessing device counts. Pass a domain name (e.g., example.com) and optional look_back_hours (default 720; range 1–720). Requires URL.Read.All application permission.
     async fn defender_endpoint_domain_statistics(
         &self,
         Parameters(params): Parameters<DomainStatsInput>,
@@ -3456,20 +3141,9 @@ impl DefenderServer {
     }
 
     /// List machines that have communicated with a specific domain.
-    #[tool(
-        name = "defender_endpoint_domain_related_machines",
-        description = "List endpoint devices that have communicated with or resolved a specific domain \
-                       name. Returns an OData object with a value array of machines (capped at 500 devices per \
-                       upstream API limits). Pass a domain name. Requires Machine.ReadWrite.All application \
-                       permission.",
-        annotations(
-            title = "Get Domain Related Machines",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_domain_related_machines`.
+    ///
+    /// List endpoint devices that have communicated with or resolved a specific domain name. Returns an OData object with a value array of machines (capped at 500 devices per upstream API limits). Pass a domain name. Requires Machine.ReadWrite.All application permission.
     async fn defender_endpoint_domain_related_machines(
         &self,
         Parameters(params): Parameters<DomainInput>,
@@ -3483,19 +3157,9 @@ impl DefenderServer {
     }
 
     /// Get alerts related to a specific domain.
-    #[tool(
-        name = "defender_endpoint_domain_related_alerts",
-        description = "List security alerts associated with network traffic or browser navigation to a \
-                       specific domain name. Returns an OData object with a value array of related alerts. Pass a domain name. \
-                       Requires Alert.ReadWrite.All application permission.",
-        annotations(
-            title = "Get Domain Related Alerts",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_domain_related_alerts`.
+    ///
+    /// List security alerts associated with network traffic or browser navigation to a specific domain name. Returns an OData object with a value array of related alerts. Pass a domain name. Requires Alert.ReadWrite.All application permission.
     async fn defender_endpoint_domain_related_alerts(
         &self,
         Parameters(params): Parameters<DomainInput>,
@@ -3513,20 +3177,9 @@ impl DefenderServer {
     // ============================================================
 
     /// Get file information by file identifier (SHA1, SHA256, or MD5).
-    #[tool(
-        name = "defender_endpoint_file_get",
-        description = "Retrieve file metadata and global reputation for a specific file hash from Defender \
-                       for Endpoint intelligence. Returns file size, file names, signing details, publisher, \
-                       and global prevalence. Pass a valid MD5 (32 hex), SHA1 (40 hex), or SHA256 (64 hex) \
-                       hash. Requires File.Read.All application permission.",
-        annotations(
-            title = "Get File Information",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_file_get`.
+    ///
+    /// Retrieve file metadata and global reputation for a specific file hash from Defender for Endpoint intelligence. Returns file size, file names, signing details, publisher, and global prevalence. Pass a valid MD5 (32 hex), SHA1 (40 hex), or SHA256 (64 hex) hash. Requires File.Read.All application permission.
     async fn defender_endpoint_file_get(
         &self,
         Parameters(params): Parameters<FileIdInput>,
@@ -3540,21 +3193,9 @@ impl DefenderServer {
     }
 
     /// Get organizational prevalence statistics for a file (by SHA1).
-    #[tool(
-        name = "defender_endpoint_file_statistics",
-        description = "Retrieve organizational prevalence statistics for a file by its SHA1 hash across all \
-                       endpoints. Returns first and last seen timestamps, executing device counts, and file \
-                       open counts. Pass exactly a 40-character hexadecimal SHA1 hash and optional \
-                       look_back_hours (default 720; range 1–720). Requires File.Read.All application \
-                       permission.",
-        annotations(
-            title = "Get File Statistics",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_file_statistics`.
+    ///
+    /// Retrieve organizational prevalence statistics for a file by its SHA1 hash across all endpoints. Returns first and last seen timestamps, executing device counts, and file open counts. Pass exactly a 40-character hexadecimal SHA1 hash and optional look_back_hours (default 720; range 1–720). Requires File.Read.All application permission.
     async fn defender_endpoint_file_statistics(
         &self,
         Parameters(params): Parameters<FileStatsInput>,
@@ -3579,19 +3220,9 @@ impl DefenderServer {
     }
 
     /// List machines where a specific file (by SHA1) has been observed.
-    #[tool(
-        name = "defender_endpoint_file_related_machines",
-        description = "List endpoint devices where a specific file has been observed or executed. Returns \
-                       an OData object with a value array of machine records. Pass exactly a 40-character hexadecimal SHA1 \
-                       hash. Requires Machine.ReadWrite.All application permission.",
-        annotations(
-            title = "Get File Related Machines",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_file_related_machines`.
+    ///
+    /// List endpoint devices where a specific file has been observed or executed. Returns an OData object with a value array of machine records. Pass exactly a 40-character hexadecimal SHA1 hash. Requires Machine.ReadWrite.All application permission.
     async fn defender_endpoint_file_related_machines(
         &self,
         Parameters(params): Parameters<FileSha1Input>,
@@ -3605,19 +3236,9 @@ impl DefenderServer {
     }
 
     /// Get alerts related to a specific file (by SHA1).
-    #[tool(
-        name = "defender_endpoint_file_related_alerts",
-        description = "List security alerts triggered by or involving a specific file across the \
-                       organization. Returns an OData object with a value array of related alerts. Pass exactly a 40-character \
-                       hexadecimal SHA1 hash. Requires Alert.ReadWrite.All application permission.",
-        annotations(
-            title = "Get File Related Alerts",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_file_related_alerts`.
+    ///
+    /// List security alerts triggered by or involving a specific file across the organization. Returns an OData object with a value array of related alerts. Pass exactly a 40-character hexadecimal SHA1 hash. Requires Alert.ReadWrite.All application permission.
     async fn defender_endpoint_file_related_alerts(
         &self,
         Parameters(params): Parameters<FileSha1Input>,
@@ -3635,20 +3256,9 @@ impl DefenderServer {
     // ============================================================
 
     /// Get alerts related to a specific user.
-    #[tool(
-        name = "defender_endpoint_user_related_alerts",
-        description = "List security alerts involving a specific user account on endpoint devices. Returns \
-                       an OData object with a value array of related alerts. Pass the account username recognized by Defender \
-                       for Endpoint (e.g., user1; do not pass a full UPN like user1@contoso.com, SID, or AAD \
-                       GUID). Requires Alert.Read.All or Alert.ReadWrite.All application permission.",
-        annotations(
-            title = "Get User Related Alerts",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_user_related_alerts`.
+    ///
+    /// List security alerts involving a specific user account on endpoint devices. Returns an OData object with a value array of related alerts. Pass the account username recognized by Defender for Endpoint (e.g., user1; do not pass a full UPN like user1@contoso.com, SID, or AAD GUID). Requires Alert.Read.All or Alert.ReadWrite.All application permission.
     async fn defender_endpoint_user_related_alerts(
         &self,
         Parameters(params): Parameters<UserIdInput>,
@@ -3662,19 +3272,9 @@ impl DefenderServer {
     }
 
     /// List machines associated with a specific user.
-    #[tool(
-        name = "defender_endpoint_user_related_machines",
-        description = "List endpoint devices where a specific user account has logged on. Returns an OData \
-                       object with a value array of machines. Pass the account username (e.g., user1). Requires \
-                       Machine.ReadWrite.All application permission.",
-        annotations(
-            title = "Get User Related Machines",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_user_related_machines`.
+    ///
+    /// List endpoint devices where a specific user account has logged on. Returns an OData object with a value array of machines. Pass the account username (e.g., user1). Requires Machine.ReadWrite.All application permission.
     async fn defender_endpoint_user_related_machines(
         &self,
         Parameters(params): Parameters<UserIdInput>,
@@ -3692,22 +3292,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List alerts from Defender for Endpoint.
-    #[tool(
-        name = "defender_endpoint_alert_list",
-        description = "List security alerts generated by Defender for Endpoint detection engines (process \
-                       injection, ransomware behavior, credential dumping, etc.). Returns an OData \
-                       collection of alert entities with title, severity, category, status, and affected \
-                       machine ID. Supports OData query parameters: $filter, $top (default 50, max 10000), \
-                       and $skip for offset pagination. Single page returned; raw @odata.nextLink is \
-                       preserved for subsequent queries. Requires Alert.Read.All application permission.",
-        annotations(
-            title = "List Endpoint Alerts",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_alert_list`.
+    ///
+    /// List security alerts generated by Defender for Endpoint detection engines (process injection, ransomware behavior, credential dumping, etc.). Returns an OData collection of alert entities with title, severity, category, status, and affected machine ID. Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for offset pagination. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires Alert.Read.All application permission.
     async fn defender_endpoint_alert_list(
         &self,
         Parameters(params): Parameters<EndpointODataInput>,
@@ -3718,20 +3305,9 @@ impl DefenderServer {
     }
 
     /// Get a specific endpoint alert by ID.
-    #[tool(
-        name = "defender_endpoint_alert_get",
-        description = "Retrieve full details of a specific Defender for Endpoint alert by its alert \
-                       identifier. Returns comprehensive alert properties, process execution trees, related \
-                       file hashes, network connections, and remediation history. Pass the alert_id. \
-                       Requires Alert.Read.All application permission.",
-        annotations(
-            title = "Get Endpoint Alert",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_alert_get`.
+    ///
+    /// Retrieve full details of a specific Defender for Endpoint alert by its alert identifier. Returns comprehensive alert properties, process execution trees, related file hashes, network connections, and remediation history. Pass the alert_id. Requires Alert.Read.All application permission.
     async fn defender_endpoint_alert_get(
         &self,
         Parameters(params): Parameters<AlertIdInput>,
@@ -3749,22 +3325,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List all machine actions (read-only status view).
-    #[tool(
-        name = "defender_endpoint_machine_action_list",
-        description = "List remote response actions executed on endpoint machines (e.g., isolate machine, \
-                       collect investigation package, run antivirus scan, initiate live response). Returns \
-                       an OData collection of machine action status entities. Supports OData query \
-                       parameters: $filter, $top (default 50, max 10000), and $skip for offset pagination. \
-                       Single page returned; raw @odata.nextLink is preserved for subsequent queries. \
-                       Requires Machine.Read.All application permission.",
-        annotations(
-            title = "List Machine Actions",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_machine_action_list`.
+    ///
+    /// List remote response actions executed on endpoint machines (e.g., isolate machine, collect investigation package, run antivirus scan, initiate live response). Returns an OData collection of machine action status entities. Supports OData query parameters: $filter, $top (default 50, max 10000), and $skip for offset pagination. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires Machine.Read.All application permission.
     async fn defender_endpoint_machine_action_list(
         &self,
         Parameters(params): Parameters<EndpointODataInput>,
@@ -3775,20 +3338,9 @@ impl DefenderServer {
     }
 
     /// Get the status of a specific machine action by ID.
-    #[tool(
-        name = "defender_endpoint_machine_action_get_status",
-        description = "Retrieve the current execution status and result metadata for a specific remote \
-                       machine action. Returns action status (Pending, InProgress, Succeeded, Failed, \
-                       Cancelled), creation time, completion time, and error codes if applicable. Pass the \
-                       action_id (GUID string). Requires Machine.Read.All application permission.",
-        annotations(
-            title = "Get Machine Action Status",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_machine_action_get_status`.
+    ///
+    /// Retrieve the current execution status and result metadata for a specific remote machine action. Returns action status (Pending, InProgress, Succeeded, Failed, Cancelled), creation time, completion time, and error codes if applicable. Pass the action_id (GUID string). Requires Machine.Read.All application permission.
     async fn defender_endpoint_machine_action_get_status(
         &self,
         Parameters(params): Parameters<ActionIdInput>,
@@ -3806,23 +3358,9 @@ impl DefenderServer {
     // ============================================================
 
     /// List cross-product security alerts from Microsoft 365 Defender via Graph.
-    #[tool(
-        name = "defender_xdr_alert_list",
-        description = "List cross-workload security alerts from Microsoft Defender XDR via Microsoft Graph \
-                       API (/security/alerts_v2), aggregating signals across Endpoint, Office 365, Identity, \
-                       and Cloud Apps. Returns an OData collection of Alert v2 objects with provider \
-                       detection source, MITRE ATT&CK techniques, and evidence entities. Supports OData \
-                       query parameters: $filter, $top (default 50, max 1000), $skip for offset pagination, \
-                       and $count. Single page returned; raw @odata.nextLink is preserved for subsequent \
-                       queries. Requires SecurityAlert.Read.All application permission.",
-        annotations(
-            title = "List XDR Alerts",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_xdr_alert_list`.
+    ///
+    /// List cross-workload security alerts from Microsoft Defender XDR via Microsoft Graph API (/security/alerts_v2), aggregating signals across Endpoint, Office 365, Identity, and Cloud Apps. Returns an OData collection of Alert v2 objects with provider detection source, MITRE ATT&CK techniques, and evidence entities. Supports OData query parameters: $filter, $top (default 50, max 1000), $skip for offset pagination, and $count. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires SecurityAlert.Read.All application permission.
     async fn defender_xdr_alert_list(
         &self,
         Parameters(params): Parameters<ODataListInput>,
@@ -3833,21 +3371,9 @@ impl DefenderServer {
     }
 
     /// Get a specific XDR alert by ID.
-    #[tool(
-        name = "defender_xdr_alert_get",
-        description = "Retrieve full details of a specific Microsoft Defender XDR Alert v2 by its alert \
-                       identifier. Returns comprehensive multi-stage detection details, involved user \
-                       accounts, affected devices, cloud assets, and full evidence arrays. Pass the alert_id \
-                       (e.g., da637578995287051192_756343937). Requires SecurityAlert.Read.All application \
-                       permission.",
-        annotations(
-            title = "Get XDR Alert",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_xdr_alert_get`.
+    ///
+    /// Retrieve full details of a specific Microsoft Defender XDR Alert v2 by its alert identifier. Returns comprehensive multi-stage detection details, involved user accounts, affected devices, cloud assets, and full evidence arrays. Pass the alert_id (e.g., da637578995287051192_756343937). Requires SecurityAlert.Read.All application permission.
     async fn defender_xdr_alert_get(
         &self,
         Parameters(params): Parameters<XdrAlertIdInput>,
@@ -3861,24 +3387,9 @@ impl DefenderServer {
     }
 
     /// List security incidents from Microsoft 365 Defender via Graph.
-    #[tool(
-        name = "defender_xdr_incident_list",
-        description = "List consolidated security incidents from Microsoft Defender XDR via Microsoft Graph \
-                       API (/security/incidents), correlating related alerts and evidence across attack \
-                       chains. Returns an OData collection of incident objects with incident names, \
-                       severity, classification, assigned owners, and summary metrics. Supports OData query \
-                       parameters: $filter, $top (default 50, max 1000), $skip for offset pagination, \
-                       $expand (e.g., $expand=alerts), and $count. Single page returned; raw @odata.nextLink \
-                       is preserved for subsequent queries. Requires SecurityIncident.Read.All application \
-                       permission.",
-        annotations(
-            title = "List XDR Incidents",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_xdr_incident_list`.
+    ///
+    /// List consolidated security incidents from Microsoft Defender XDR via Microsoft Graph API (/security/incidents), correlating related alerts and evidence across attack chains. Returns an OData collection of incident objects with incident names, severity, classification, assigned owners, and summary metrics. Supports OData query parameters: $filter, $top (default 50, max 1000), $skip for offset pagination, $expand (e.g., $expand=alerts), and $count. Single page returned; raw @odata.nextLink is preserved for subsequent queries. Requires SecurityIncident.Read.All application permission.
     async fn defender_xdr_incident_list(
         &self,
         Parameters(params): Parameters<ODataListInput>,
@@ -3889,21 +3400,9 @@ impl DefenderServer {
     }
 
     /// Get a specific XDR incident by ID.
-    #[tool(
-        name = "defender_xdr_incident_get",
-        description = "Retrieve full details of a specific Microsoft Defender XDR incident by its incident \
-                       identifier. Returns full incident timeline, affected assets, determinations, tags, \
-                       and optional expanded relationships. Pass the incident_id and optional expand \
-                       parameter (e.g., expand='alerts' to include member alert objects). Requires \
-                       SecurityIncident.Read.All application permission.",
-        annotations(
-            title = "Get XDR Incident",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_xdr_incident_get`.
+    ///
+    /// Retrieve full details of a specific Microsoft Defender XDR incident by its incident identifier. Returns full incident timeline, affected assets, determinations, tags, and optional expanded relationships. Pass the incident_id and optional expand parameter (e.g., expand='alerts' to include member alert objects). Requires SecurityIncident.Read.All application permission.
     async fn defender_xdr_incident_get(
         &self,
         Parameters(params): Parameters<XdrIncidentIdInput>,
@@ -3927,165 +3426,15 @@ impl DefenderServer {
     // 6.x Live Response (3 tools) — Gated
     // ============================================================
 
-    /// Upload a file to the live response library.
-    /// **Gated:** requires DEFENDER_ENABLE_LIVE_RESPONSE=true at server startup.
-    #[tool(
-        name = "defender_library_file_upload",
-        description = "Upload a remediation script or binary tool to the Defender for Endpoint Live \
-                       Response library via multipart/form-data. Uploaded files can subsequently be copied \
-                       to or executed on live managed endpoints. Supports PowerShell (.ps1) on Windows and \
-                       Shell (.sh) scripts on Linux/macOS. File content must be non-empty UTF-8 text up to \
-                       20 MB (20,971,520 bytes). Setting override_if_exists=true is an irreversible \
-                       destructive mutation that overwrites any existing file with the same name. Gated \
-                       operation: requires server configuration DEFENDER_ENABLE_LIVE_RESPONSE=true and \
-                       explicit human authorization. Requires Library.Manage application permission.",
-        annotations(
-            title = "Upload Live Response Library File",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn defender_library_file_upload(
-        &self,
-        Parameters(params): Parameters<LiveResponseLibraryUploadInput>,
-    ) -> Result<CallToolResult, McpError> {
-        if let Some(blocked) = self.read_only_barrier("defender_library_file_upload") {
-            return Ok(blocked);
-        }
-        if !self.config.live_response_enabled {
-            return Ok(crate::error::tool_error(
-                "Live Response is disabled. Set DEFENDER_ENABLE_LIVE_RESPONSE=true to enable.",
-            ));
-        }
-
-        let file_name = validation::validate_file_name(&params.file_name)?;
-        let description = validation::validate_description(&params.description)?;
-
-        let content = params.file_content.into_bytes();
-        if content.is_empty() {
-            return Ok(crate::error::tool_error("file_content cannot be empty"));
-        }
-        if content.len() > crate::constants::MAX_LIBRARY_FILE_SIZE {
-            return Ok(crate::error::tool_error(format!(
-                "File size {} bytes exceeds maximum of {} bytes (20 MB)",
-                content.len(),
-                crate::constants::MAX_LIBRARY_FILE_SIZE
-            )));
-        }
-
-        tracing::info!(
-            file_name = %file_name,
-            size = content.len(),
-            "Library file upload initiated"
-        );
-
-        Ok(tool_result(
-            self.endpoint
-                .endpoint_multipart_upload(
-                    crate::constants::LIBRARY_FILES_PATH,
-                    file_name,
-                    content,
-                    description,
-                    params.parameters_description.as_deref(),
-                    params.override_if_exists,
-                )
-                .await,
-        ))
-    }
-
-    /// Run a sequence of live response commands on a specific machine.
-    /// **Gated:** requires DEFENDER_ENABLE_LIVE_RESPONSE=true at server startup.
-    #[tool(
-        name = "defender_endpoint_live_response_run",
-        description = "Initiate and execute a sequence of Live Response commands directly on a live managed \
-                       endpoint device. Supported command types: PutFile (copies a library file to the \
-                       device), RunScript (executes a library script with arguments), and GetFile (retrieves \
-                       a file from the device). Up to 20 commands per session. comment is mandatory (minimum \
-                       10 non-whitespace characters) for audit trail compliance. If the target machine is \
-                       offline, the action will queue for up to 2 hours. Gated mutating operation: directly \
-                       affects running systems; requires server configuration \
-                       DEFENDER_ENABLE_LIVE_RESPONSE=true, optional DEFENDER_LIVE_RESPONSE_ALLOWED_COMMANDS \
-                       restriction, and explicit human authorization. Requires Machine.LiveResponse \
-                       application permission.",
-        annotations(
-            title = "Run Live Response Session",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn defender_endpoint_live_response_run(
-        &self,
-        Parameters(params): Parameters<LiveResponseRunInput>,
-    ) -> Result<CallToolResult, McpError> {
-        if let Some(blocked) = self.read_only_barrier("defender_endpoint_live_response_run") {
-            return Ok(blocked);
-        }
-        if !self.config.live_response_enabled {
-            return Ok(crate::error::tool_error(
-                "Live Response is disabled. Set DEFENDER_ENABLE_LIVE_RESPONSE=true to enable.",
-            ));
-        }
-
-        let machine_id = validation::validate_required_id(&params.machine_id, "machine_id")?;
-        let comment = validation::validate_comment(&params.comment, "comment")?;
-        validation::validate_live_response_commands(
-            &params.commands,
-            self.config.live_response_allowed_commands.as_deref(),
-        )?;
-
-        tracing::info!(
-            machine_id = %machine_id,
-            comment = %comment,
-            command_count = params.commands.len(),
-            "Live Response run initiated"
-        );
-
-        let body = json!({
-            "Commands": params.commands,
-            "Comment": comment,
-        });
-
-        Ok(tool_result(
-            self.endpoint
-                .endpoint_post(
-                    &format!(
-                        "/api/machines/{}/runliveresponse",
-                        validation::encode_path_segment(machine_id)
-                    ),
-                    &body,
-                )
-                .await,
-        ))
-    }
-
     /// Retrieve the downloadable result link for a specific live response command.
-    #[tool(
-        name = "defender_endpoint_live_response_get_result",
-        description = "Retrieve the temporary Shared Access Signature (SAS) download URL for the output or \
-                       retrieved file generated by a specific Live Response command. Applicable to RunScript \
-                       output logs and GetFile payload downloads (PutFile does not produce a download \
-                       result). Pass the action_id returned from defender_endpoint_live_response_run and the \
-                       zero-based command_index within the original session commands array (must be >= 0; \
-                       negative indices are rejected locally). Gated operation: requires \
-                       DEFENDER_ENABLE_LIVE_RESPONSE=true. Requires Machine.ReadWrite.All or \
-                       Machine.LiveResponse application permission.",
-        annotations(
-            title = "Live Response Get Result",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
+    /// Former tool `defender_endpoint_live_response_get_result`.
+    ///
+    /// Retrieve the temporary Shared Access Signature (SAS) download URL for the output or retrieved file generated by a specific Live Response command. Applicable to RunScript output logs and GetFile payload downloads (PutFile does not produce a download result). Pass the action_id returned from defender_endpoint_live_response_run and the zero-based command_index within the original session commands array (must be >= 0; negative indices are rejected locally). Gated operation: requires DEFENDER_ENABLE_LIVE_RESPONSE=true. Requires Machine.ReadWrite.All or Machine.LiveResponse application permission.
     async fn defender_endpoint_live_response_get_result(
         &self,
         Parameters(params): Parameters<LiveResponseResultInput>,
     ) -> Result<CallToolResult, McpError> {
-        if !self.config.live_response_enabled {
+        if !self.config.categories.live_response {
             return Ok(crate::error::tool_error(
                 "Live Response is disabled. Set DEFENDER_ENABLE_LIVE_RESPONSE=true to enable.",
             ));
@@ -4114,7 +3463,7 @@ impl DefenderServer {
 
 /// Deserialize dispatcher arguments into the granular tool's typed input and invoke it, so the
 /// consolidated surface reuses every granular validation rule and endpoint mapping unchanged.
-macro_rules! call_granular {
+macro_rules! call_action {
     ($self:ident, $method:ident, $args:expr) => {{
         let params = serde_json::from_value(serde_json::Value::Object($args)).map_err(|e| {
             crate::error::invalid_params(format!("invalid arguments for this action: {e}"))
@@ -4201,9 +3550,278 @@ impl DefenderServer {
             Err(e) => e,
         }
     }
+    fn wrap_machine_action(resp: MutationResponse, warning: Option<&str>) -> MutationResponse {
+        let action_id = resp.body.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let mut map = serde_json::Map::new();
+        map.insert("machineAction".to_string(), resp.body);
+        map.insert("poll_with".to_string(), json!({
+            "tool": "defender_forensics",
+            "action": "machine_action_get_status",
+            "action_id": action_id
+        }));
+        if let Some(w) = warning {
+            map.insert("warning".to_string(), json!(w));
+        }
+        MutationResponse {
+            http_status: resp.http_status,
+            body: Value::Object(map),
+        }
+    }
 
-    async fn ep_post(&self, path: &str, body: &serde_json::Value) -> CallToolResult {
-        tool_result(self.endpoint.endpoint_post(path, body).await)
+    fn wrap_investigation(resp: MutationResponse) -> MutationResponse {
+        let inv_id = resp.body.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let mut map = serde_json::Map::new();
+        map.insert("investigation".to_string(), resp.body);
+        map.insert("poll_with".to_string(), json!({
+            "tool": "defender_forensics",
+            "action": "investigation_get",
+            "investigation_id": inv_id
+        }));
+        MutationResponse {
+            http_status: resp.http_status,
+            body: Value::Object(map),
+        }
+    }
+
+}
+
+
+/// Parameters for executing a mutating tool action through the shared mutation pipeline.
+///
+/// Order of execution:
+/// 1. Read-only barrier: rejects if `--read-only` is active.
+/// 2. Category check: verifies tool category (and offboarding if applicable) is enabled.
+/// 3. Validation check: inspects `validation_result` and enforces `justification` >= 10 chars.
+/// 4. Human confirmation: if tool is destructive and confirmation is enabled, prompts human via MCP Form elicitation.
+/// 5. Audit intent record: writes pre-network intent record (fail-closed: on error, fails before network).
+/// 6. Single upstream request: executes the provided upstream closure exactly once (no retries).
+/// 7. Audit outcome record: writes post-network outcome record.
+pub struct MutationRequest<'a, F, Fut, T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<MutationResponse, CallToolResult>>,
+    T: FnOnce(&MutationResponse) -> (Option<String>, Option<String>),
+{
+    pub tool: MutatingTool,
+    pub action: &'a str,
+    pub category: PermissionCategory,
+    pub targets: Vec<AuditTarget>,
+    pub parameters: serde_json::Map<String, Value>,
+    pub justification: Option<&'a str>,
+    pub validation_result: Result<(), CallToolResult>,
+    pub context: &'a rmcp::service::RequestContext<rmcp::RoleServer>,
+    pub extract_tracking: T,
+    pub upstream: F,
+}
+
+impl DefenderServer {
+    /// Executes a mutating action through the shared 7-stage mutation pipeline.
+    pub async fn execute_mutation<F, Fut, T>(
+        &self,
+        req: MutationRequest<'_, F, Fut, T>,
+    ) -> Result<CallToolResult, McpError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<MutationResponse, CallToolResult>>,
+        T: FnOnce(&MutationResponse) -> (Option<String>, Option<String>),
+    {
+        let attempt_id = new_attempt_id();
+        let identity = self.identity();
+
+        let record_final = |reason: RejectReason, confirmation: ConfirmationOutcome| {
+            AuditRecord {
+                ts: chrono::Utc::now(),
+                attempt_id: attempt_id.clone(),
+                phase: AuditPhase::Final,
+                tool: req.tool.name().to_string(),
+                action: req.action.to_string(),
+                targets: req.targets.clone(),
+                parameters: req.parameters.clone(),
+                justification: req.justification.map(str::to_owned),
+                identity: identity.clone(),
+                confirmation,
+                result: AuditResult::Rejected { reason },
+            }
+        };
+
+        // 1. Read-only check
+        if self.config.read_only {
+            let rec = record_final(RejectReason::ReadOnly, ConfirmationOutcome::NotApplicable);
+            self.write_audit_record_best_effort(&rec).await;
+            return Ok(crate::error::read_only_violation(req.tool.name()));
+        }
+
+        // 2. Category check (including offboarding)
+        let tool_enabled = self.config.categories.tool_enabled(req.tool);
+        let offboarding_disabled = req.action == "offboard" && !self.config.categories.offboarding;
+        if !tool_enabled || offboarding_disabled {
+            let flag = if offboarding_disabled {
+                "--enable-offboarding"
+            } else {
+                req.tool.enable_flag()
+            };
+            let rec = record_final(RejectReason::CategoryDisabled, ConfirmationOutcome::NotApplicable);
+            self.write_audit_record_best_effort(&rec).await;
+            return Ok(crate::error::category_disabled(flag));
+        }
+
+        // 3. Validation check
+        if let Err(val_err) = req.validation_result {
+            let rec = record_final(RejectReason::Validation, ConfirmationOutcome::NotApplicable);
+            self.write_audit_record_best_effort(&rec).await;
+            return Ok(val_err);
+        }
+
+        let justification = match req.justification.map(str::trim) {
+            Some(j) if j.chars().count() >= crate::constants::MIN_JUSTIFICATION_LEN => j,
+            _ => {
+                let rec = record_final(RejectReason::Validation, ConfirmationOutcome::NotApplicable);
+                self.write_audit_record_best_effort(&rec).await;
+                let field_name = if req.tool == MutatingTool::Triage { "justification" } else { "comment" };
+                return Ok(crate::error::tool_error(format!(
+                    "{field_name} must be at least {} characters describing the purpose",
+                    crate::constants::MIN_JUSTIFICATION_LEN
+                )));
+            }
+        };
+
+        // 4. Confirmation
+        let confirmation_outcome = if req.tool.destructive() && self.config.confirm_destructive {
+            let outcome = crate::confirm::request_confirmation(
+                &req.context.peer,
+                req.tool.name(),
+                req.action,
+                &req.parameters,
+                &req.targets,
+                justification,
+                &identity,
+            ).await;
+
+            match outcome {
+                ConfirmationOutcome::Accepted => ConfirmationOutcome::Accepted,
+                ConfirmationOutcome::Unavailable => {
+                    let rec = record_final(RejectReason::ConfirmationUnavailable, ConfirmationOutcome::Unavailable);
+                    self.write_audit_record_best_effort(&rec).await;
+                    return Ok(crate::error::confirmation_unavailable());
+                }
+                _ => {
+                    let rec = AuditRecord {
+                        ts: chrono::Utc::now(),
+                        attempt_id: attempt_id.clone(),
+                        phase: AuditPhase::Final,
+                        tool: req.tool.name().to_string(),
+                        action: req.action.to_string(),
+                        targets: req.targets.clone(),
+                        parameters: req.parameters.clone(),
+                        justification: Some(justification.to_string()),
+                        identity: identity.clone(),
+                        confirmation: ConfirmationOutcome::Declined,
+                        result: AuditResult::Declined,
+                    };
+                    self.write_audit_record_best_effort(&rec).await;
+                    return Ok(crate::error::not_confirmed());
+                }
+            }
+        } else if req.tool.destructive() {
+            ConfirmationOutcome::TurnedOff
+        } else {
+            ConfirmationOutcome::NotApplicable
+        };
+
+        // 5. Intent record
+        let intent_record = AuditRecord {
+            ts: chrono::Utc::now(),
+            attempt_id: attempt_id.clone(),
+            phase: AuditPhase::Intent,
+            tool: req.tool.name().to_string(),
+            action: req.action.to_string(),
+            targets: req.targets.clone(),
+            parameters: req.parameters.clone(),
+            justification: Some(justification.to_string()),
+            identity: identity.clone(),
+            confirmation: confirmation_outcome,
+            result: AuditResult::Pending,
+        };
+
+        let Some(sink) = &self.audit_sink else {
+            let rec = record_final(RejectReason::AuditUnavailable, confirmation_outcome);
+            rec.print_stderr_summary();
+            return Ok(crate::error::audit_unavailable());
+        };
+
+        if let Err(e) = sink.append(&intent_record).await {
+            tracing::error!(error = %e, "Failed to write audit intent record");
+            let rec = record_final(RejectReason::AuditUnavailable, confirmation_outcome);
+            self.write_audit_record_best_effort(&rec).await;
+            return Ok(crate::error::audit_unavailable());
+        }
+
+        // 6. Upstream request (exactly once, no retry)
+        let upstream_res = (req.upstream)().await;
+
+        // 7. Outcome record
+        let (audit_result, tool_result) = match upstream_res {
+            Ok(resp) => {
+                let (tracking_id, upstream_status) = (req.extract_tracking)(&resp);
+                let audit_res = AuditResult::Submitted {
+                    http_status: resp.http_status,
+                    tracking_id,
+                    upstream_status,
+                };
+                let tool_res = CallToolResult::structured(resp.body);
+                (audit_res, Ok(tool_res))
+            }
+            Err(err) => {
+                let status_opt = http_status_of(&err);
+                let msg = err.content.first()
+                    .and_then(|c| c.as_text())
+                    .map(|t| t.text.clone())
+                    .unwrap_or_else(|| "upstream error".to_string());
+                let audit_res = match status_opt {
+                    Some(status) => AuditResult::UpstreamError {
+                        http_status: status as u16,
+                        message: msg,
+                    },
+                    None => AuditResult::TransportError {
+                        message: msg,
+                    },
+                };
+                (audit_res, Ok(err))
+            }
+        };
+
+        let outcome_record = AuditRecord {
+            ts: chrono::Utc::now(),
+            attempt_id: attempt_id.clone(),
+            phase: AuditPhase::Outcome,
+            tool: req.tool.name().to_string(),
+            action: req.action.to_string(),
+            targets: req.targets,
+            parameters: req.parameters,
+            justification: Some(justification.to_string()),
+            identity: identity.clone(),
+            confirmation: confirmation_outcome,
+            result: audit_result,
+        };
+
+        if let Some(sink) = &self.audit_sink {
+            if let Err(e) = sink.append(&outcome_record).await {
+                eprintln!(
+                    "AUDIT ERROR: failed to write outcome audit record for attempt {attempt_id}: {e}"
+                );
+            }
+        }
+
+        tool_result
+    }
+
+    /// Best effort write of an audit record to the sink if present; logs to stderr if failed.
+    async fn write_audit_record_best_effort(&self, record: &AuditRecord) {
+        if let Some(sink) = &self.audit_sink {
+            if let Err(e) = sink.append(record).await {
+                eprintln!("AUDIT ERROR: failed to append audit record: {e}");
+            }
+        }
     }
 }
 
@@ -4236,7 +3854,7 @@ impl DefenderServer {
                 HUNTING_ACTIONS,
             ));
         }
-        call_granular!(self, defender_advanced_hunting_run, granular_args(&input))
+        call_action!(self, defender_advanced_hunting_run, action_args(&input))
     }
 
     /// Consolidated threat-intelligence dispatcher.
@@ -4253,12 +3871,12 @@ impl DefenderServer {
                        host_child_pairs_list, host_parent_pairs_list, host_passive_dns_list, \
                        host_passive_dns_reverse_list, ssl_certs_list, ssl_cert_get, ssl_cert_related_hosts_list, \
                        whois_records_list, whois_record_get, passive_dns_get, vulnerability_get, \
-                       vulnerability_components_list, vulnerability_component_get. host_* list/get-by-host \
+                       vulnerability_components_list, vulnerability_component_get, custom_indicator_list. host_* list/get-by-host \
                        actions take hostname (domain or IP literal); *_get actions take id (opaque IDs copied \
                        verbatim; CVE ID for vulnerability_*); vulnerability_component_get also takes \
-                       component_id. Lists accept top (max 1000), skip, and, where the endpoint supports them, \
+                       component_id. Lists accept top (max 1000; custom_indicator_list max 10000, default 50), skip, and, where the endpoint supports them, \
                        filter, select, expand, search, count. Unsupported fields are rejected. Requires \
-                       ThreatIntelligence.Read.All and a Defender TI license.",
+                       ThreatIntelligence.Read.All and a Defender TI license (custom_indicator_list requires Ti.ReadWrite).",
         annotations(
             title = "Defender Threat Intelligence",
             read_only_hint = true,
@@ -4272,7 +3890,10 @@ impl DefenderServer {
         Parameters(input): Parameters<ThreatIntelInput>,
     ) -> Result<CallToolResult, McpError> {
         let action = input.action.as_str();
-        let mut args = granular_args(&input);
+        if let Some(blocked) = self.check_scope_not_requested(action) {
+            return Ok(blocked);
+        }
+        let mut args = action_args(&input);
         let host_by_name = action.starts_with("host_")
             && !matches!(
                 action,
@@ -4289,72 +3910,84 @@ impl DefenderServer {
             rename_arg(&mut args, "id", "vulnerability_id");
         }
         match action {
-            "intel_profiles_list" => call_granular!(self, defender_ti_intel_profiles_list, args),
-            "intel_profile_get" => call_granular!(self, defender_ti_intel_profile_get, args),
+            "intel_profiles_list" => call_action!(self, defender_ti_intel_profiles_list, args),
+            "intel_profile_get" => call_action!(self, defender_ti_intel_profile_get, args),
             "intel_profile_indicators_list" => {
-                call_granular!(self, defender_ti_intel_profile_indicators_list, args)
+                call_action!(self, defender_ti_intel_profile_indicators_list, args)
             }
             "intel_profile_indicator_get" => {
-                call_granular!(self, defender_ti_intel_profile_indicator_get, args)
+                call_action!(self, defender_ti_intel_profile_indicator_get, args)
             }
             "intel_profile_indicators_global_list" => {
-                call_granular!(self, defender_ti_intel_profile_indicators_global_list, args)
+                call_action!(self, defender_ti_intel_profile_indicators_global_list, args)
             }
-            "articles_list" => call_granular!(self, defender_ti_articles_list, args),
-            "article_get" => call_granular!(self, defender_ti_article_get, args),
+            "articles_list" => call_action!(self, defender_ti_articles_list, args),
+            "article_get" => call_action!(self, defender_ti_article_get, args),
             "article_indicators_list" => {
-                call_granular!(self, defender_ti_article_indicators_list, args)
+                call_action!(self, defender_ti_article_indicators_list, args)
             }
             "article_indicator_get" => {
-                call_granular!(self, defender_ti_article_indicator_get, args)
+                call_action!(self, defender_ti_article_indicator_get, args)
             }
             "article_indicators_global_list" => {
-                call_granular!(self, defender_ti_article_indicators_global_list, args)
+                call_action!(self, defender_ti_article_indicators_global_list, args)
             }
-            "host_get" => call_granular!(self, defender_ti_host_get, args),
-            "host_reputation_get" => call_granular!(self, defender_ti_host_reputation_get, args),
-            "host_components_list" => call_granular!(self, defender_ti_host_components_list, args),
-            "host_component_get" => call_granular!(self, defender_ti_host_component_get, args),
-            "host_cookies_list" => call_granular!(self, defender_ti_host_cookies_list, args),
-            "host_cookie_get" => call_granular!(self, defender_ti_host_cookie_get, args),
-            "host_ports_list" => call_granular!(self, defender_ti_host_ports_list, args),
-            "host_port_get" => call_granular!(self, defender_ti_host_port_get, args),
-            "host_trackers_list" => call_granular!(self, defender_ti_host_trackers_list, args),
-            "host_tracker_get" => call_granular!(self, defender_ti_host_tracker_get, args),
-            "host_subdomains_list" => call_granular!(self, defender_ti_host_subdomains_list, args),
-            "host_ssl_certs_list" => call_granular!(self, defender_ti_host_ssl_certs_list, args),
-            "host_whois_get" => call_granular!(self, defender_ti_host_whois_get, args),
+            "host_get" => call_action!(self, defender_ti_host_get, args),
+            "host_reputation_get" => call_action!(self, defender_ti_host_reputation_get, args),
+            "host_components_list" => call_action!(self, defender_ti_host_components_list, args),
+            "host_component_get" => call_action!(self, defender_ti_host_component_get, args),
+            "host_cookies_list" => call_action!(self, defender_ti_host_cookies_list, args),
+            "host_cookie_get" => call_action!(self, defender_ti_host_cookie_get, args),
+            "host_ports_list" => call_action!(self, defender_ti_host_ports_list, args),
+            "host_port_get" => call_action!(self, defender_ti_host_port_get, args),
+            "host_trackers_list" => call_action!(self, defender_ti_host_trackers_list, args),
+            "host_tracker_get" => call_action!(self, defender_ti_host_tracker_get, args),
+            "host_subdomains_list" => call_action!(self, defender_ti_host_subdomains_list, args),
+            "host_ssl_certs_list" => call_action!(self, defender_ti_host_ssl_certs_list, args),
+            "host_whois_get" => call_action!(self, defender_ti_host_whois_get, args),
             "host_whois_history_list" => {
-                call_granular!(self, defender_ti_host_whois_history_list, args)
+                call_action!(self, defender_ti_host_whois_history_list, args)
             }
-            "host_pairs_list" => call_granular!(self, defender_ti_host_pairs_list, args),
-            "host_pair_get" => call_granular!(self, defender_ti_host_pair_get, args),
+            "host_pairs_list" => call_action!(self, defender_ti_host_pairs_list, args),
+            "host_pair_get" => call_action!(self, defender_ti_host_pair_get, args),
             "host_child_pairs_list" => {
-                call_granular!(self, defender_ti_host_child_pairs_list, args)
+                call_action!(self, defender_ti_host_child_pairs_list, args)
             }
             "host_parent_pairs_list" => {
-                call_granular!(self, defender_ti_host_parent_pairs_list, args)
+                call_action!(self, defender_ti_host_parent_pairs_list, args)
             }
             "host_passive_dns_list" => {
-                call_granular!(self, defender_ti_host_passive_dns_list, args)
+                call_action!(self, defender_ti_host_passive_dns_list, args)
             }
             "host_passive_dns_reverse_list" => {
-                call_granular!(self, defender_ti_host_passive_dns_reverse_list, args)
+                call_action!(self, defender_ti_host_passive_dns_reverse_list, args)
             }
-            "ssl_certs_list" => call_granular!(self, defender_ti_ssl_certs_list, args),
-            "ssl_cert_get" => call_granular!(self, defender_ti_ssl_cert_get, args),
+            "ssl_certs_list" => call_action!(self, defender_ti_ssl_certs_list, args),
+            "ssl_cert_get" => call_action!(self, defender_ti_ssl_cert_get, args),
             "ssl_cert_related_hosts_list" => {
-                call_granular!(self, defender_ti_ssl_cert_related_hosts_list, args)
+                call_action!(self, defender_ti_ssl_cert_related_hosts_list, args)
             }
-            "whois_records_list" => call_granular!(self, defender_ti_whois_records_list, args),
-            "whois_record_get" => call_granular!(self, defender_ti_whois_record_get, args),
-            "passive_dns_get" => call_granular!(self, defender_ti_passive_dns_get, args),
-            "vulnerability_get" => call_granular!(self, defender_ti_vulnerability_get, args),
+            "whois_records_list" => call_action!(self, defender_ti_whois_records_list, args),
+            "whois_record_get" => call_action!(self, defender_ti_whois_record_get, args),
+            "passive_dns_get" => call_action!(self, defender_ti_passive_dns_get, args),
+            "vulnerability_get" => call_action!(self, defender_ti_vulnerability_get, args),
             "vulnerability_components_list" => {
-                call_granular!(self, defender_ti_vulnerability_components_list, args)
+                call_action!(self, defender_ti_vulnerability_components_list, args)
             }
             "vulnerability_component_get" => {
-                call_granular!(self, defender_ti_vulnerability_component_get, args)
+                call_action!(self, defender_ti_vulnerability_component_get, args)
+            }
+            "custom_indicator_list" => {
+                if input.id.is_some() { return Err(crate::error::invalid_params("field 'id' is not used by action 'custom_indicator_list'")); }
+                if input.hostname.is_some() { return Err(crate::error::invalid_params("field 'hostname' is not used by action 'custom_indicator_list'")); }
+                if input.component_id.is_some() { return Err(crate::error::invalid_params("field 'component_id' is not used by action 'custom_indicator_list'")); }
+                if input.select.is_some() { return Err(crate::error::invalid_params("field 'select' is not used by action 'custom_indicator_list'")); }
+                if input.expand.is_some() { return Err(crate::error::invalid_params("field 'expand' is not used by action 'custom_indicator_list'")); }
+                if input.search.is_some() { return Err(crate::error::invalid_params("field 'search' is not used by action 'custom_indicator_list'")); }
+                if input.count.is_some() { return Err(crate::error::invalid_params("field 'count' is not used by action 'custom_indicator_list'")); }
+                validation::validate_endpoint_odata_params(input.top, input.skip)?;
+                let odata = Self::ep_odata(input.filter.as_deref(), input.top.unwrap_or(DEFAULT_TOP), input.skip.unwrap_or(0));
+                self.ep_odata_get_as("/api/indicators", &odata, PermissionCategory::Indicators).await
             }
             _ => Err(crate::error::unknown_action_error(
                 "defender_ti",
@@ -4389,29 +4022,32 @@ impl DefenderServer {
         Parameters(input): Parameters<IncidentsAlertsInput>,
     ) -> Result<CallToolResult, McpError> {
         let action = input.action.as_str();
-        let mut args = granular_args(&input);
+        if let Some(blocked) = self.check_scope_not_requested(action) {
+            return Ok(blocked);
+        }
+        let mut args = action_args(&input);
         match action {
-            "xdr_alert_list" => call_granular!(self, defender_xdr_alert_list, args),
-            "xdr_alert_get" => call_granular!(self, defender_xdr_alert_get, args),
-            "xdr_incident_list" => call_granular!(self, defender_xdr_incident_list, args),
-            "xdr_incident_get" => call_granular!(self, defender_xdr_incident_get, args),
-            "endpoint_alert_list" => call_granular!(self, defender_endpoint_alert_list, args),
-            "endpoint_alert_get" => call_granular!(self, defender_endpoint_alert_get, args),
+            "xdr_alert_list" => call_action!(self, defender_xdr_alert_list, args),
+            "xdr_alert_get" => call_action!(self, defender_xdr_alert_get, args),
+            "xdr_incident_list" => call_action!(self, defender_xdr_incident_list, args),
+            "xdr_incident_get" => call_action!(self, defender_xdr_incident_get, args),
+            "endpoint_alert_list" => call_action!(self, defender_endpoint_alert_list, args),
+            "endpoint_alert_get" => call_action!(self, defender_endpoint_alert_get, args),
             "ip_related_alerts" => {
                 rename_arg(&mut args, "id", "ip_address");
-                call_granular!(self, defender_endpoint_ip_related_alerts, args)
+                call_action!(self, defender_endpoint_ip_related_alerts, args)
             }
             "domain_related_alerts" => {
                 rename_arg(&mut args, "id", "domain_name");
-                call_granular!(self, defender_endpoint_domain_related_alerts, args)
+                call_action!(self, defender_endpoint_domain_related_alerts, args)
             }
             "file_related_alerts" => {
                 rename_arg(&mut args, "id", "file_sha1");
-                call_granular!(self, defender_endpoint_file_related_alerts, args)
+                call_action!(self, defender_endpoint_file_related_alerts, args)
             }
             "user_related_alerts" => {
                 rename_arg(&mut args, "id", "user_id");
-                call_granular!(self, defender_endpoint_user_related_alerts, args)
+                call_action!(self, defender_endpoint_user_related_alerts, args)
             }
             _ => Err(crate::error::unknown_action_error(
                 "defender_incidents_alerts",
@@ -4427,13 +4063,14 @@ impl DefenderServer {
         description = "Defender for Endpoint device inventory and indicator correlation (read-only). Actions: \
                        machine_list, machine_get, logged_on_users, find_by_tag, installed_software, \
                        security_recommendations, ip_statistics, domain_statistics, domain_related_machines, \
-                       file_get, file_statistics, file_related_machines, user_related_machines. Device actions \
+                       file_get, file_statistics, file_related_machines, user_related_machines, \
+                       find_by_ip, machine_alerts, machine_vulnerabilities, machine_missing_kbs. Device actions \
                        take machine_id (40-hex Defender machine ID, not an Entra device ID). Indicator actions \
-                       take id: IP (ip_statistics), domain (domain_*), MD5/SHA-1/SHA-256 (file_get), SHA-1 \
+                       take id: IP (ip_statistics, find_by_ip with timestamp RFC 3339 <= 30 days old), domain (domain_*), MD5/SHA-1/SHA-256 (file_get), SHA-1 \
                        (file_statistics, file_related_machines), username (user_related_machines). find_by_tag \
                        takes tag_name (or id) and use_starts_with. *_statistics accept look_back_hours (1-720). \
-                       machine_list accepts filter, top (max 10000), skip. Requires Machine.Read.All (related \
-                       machines need Machine.ReadWrite.All), Software.Read.All, SecurityRecommendation.Read.All, \
+                       machine_list, machine_alerts, machine_vulnerabilities accept filter, top (max 10000), skip. Requires Machine.Read.All (related \
+                       machines, find_by_ip need Machine.ReadWrite.All; machine_alerts needs Alert.ReadWrite.All), Software.Read.All, SecurityRecommendation.Read.All, \
                        Ip.Read.All, Url.Read.All, File.Read.All as applicable.",
         annotations(
             title = "Defender Machines",
@@ -4448,22 +4085,25 @@ impl DefenderServer {
         Parameters(input): Parameters<MachinesInput>,
     ) -> Result<CallToolResult, McpError> {
         let action = input.action.as_str();
-        let mut args = granular_args(&input);
+        if let Some(blocked) = self.check_scope_not_requested(action) {
+            return Ok(blocked);
+        }
+        let mut args = action_args(&input);
         match action {
-            "machine_list" => call_granular!(self, defender_endpoint_machine_list, args),
-            "machine_get" => call_granular!(self, defender_endpoint_machine_get, args),
+            "machine_list" => call_action!(self, defender_endpoint_machine_list, args),
+            "machine_get" => call_action!(self, defender_endpoint_machine_get, args),
             "logged_on_users" => {
-                call_granular!(self, defender_endpoint_machine_logged_on_users, args)
+                call_action!(self, defender_endpoint_machine_logged_on_users, args)
             }
             "find_by_tag" => {
                 rename_arg(&mut args, "id", "tag_name");
-                call_granular!(self, defender_endpoint_machine_find_by_tag, args)
+                call_action!(self, defender_endpoint_machine_find_by_tag, args)
             }
             "installed_software" => {
-                call_granular!(self, defender_endpoint_machine_list_software, args)
+                call_action!(self, defender_endpoint_machine_list_software, args)
             }
             "security_recommendations" => {
-                call_granular!(
+                call_action!(
                     self,
                     defender_endpoint_machine_security_recommendations,
                     args
@@ -4471,31 +4111,83 @@ impl DefenderServer {
             }
             "ip_statistics" => {
                 rename_arg(&mut args, "id", "ip_address");
-                call_granular!(self, defender_endpoint_ip_statistics, args)
+                call_action!(self, defender_endpoint_ip_statistics, args)
             }
             "domain_statistics" => {
                 rename_arg(&mut args, "id", "domain_name");
-                call_granular!(self, defender_endpoint_domain_statistics, args)
+                call_action!(self, defender_endpoint_domain_statistics, args)
             }
             "domain_related_machines" => {
                 rename_arg(&mut args, "id", "domain_name");
-                call_granular!(self, defender_endpoint_domain_related_machines, args)
+                call_action!(self, defender_endpoint_domain_related_machines, args)
             }
             "file_get" => {
                 rename_arg(&mut args, "id", "file_id");
-                call_granular!(self, defender_endpoint_file_get, args)
+                call_action!(self, defender_endpoint_file_get, args)
             }
             "file_statistics" => {
                 rename_arg(&mut args, "id", "file_sha1");
-                call_granular!(self, defender_endpoint_file_statistics, args)
+                call_action!(self, defender_endpoint_file_statistics, args)
             }
             "file_related_machines" => {
                 rename_arg(&mut args, "id", "file_sha1");
-                call_granular!(self, defender_endpoint_file_related_machines, args)
+                call_action!(self, defender_endpoint_file_related_machines, args)
             }
             "user_related_machines" => {
                 rename_arg(&mut args, "id", "user_id");
-                call_granular!(self, defender_endpoint_user_related_machines, args)
+                call_action!(self, defender_endpoint_user_related_machines, args)
+            }
+            "find_by_ip" => {
+                if input.machine_id.is_some() { return Err(crate::error::invalid_params("field 'machine_id' is not used by action 'find_by_ip'")); }
+                if input.tag_name.is_some() { return Err(crate::error::invalid_params("field 'tag_name' is not used by action 'find_by_ip'")); }
+                if input.use_starts_with.is_some() { return Err(crate::error::invalid_params("field 'use_starts_with' is not used by action 'find_by_ip'")); }
+                if input.look_back_hours.is_some() { return Err(crate::error::invalid_params("field 'look_back_hours' is not used by action 'find_by_ip'")); }
+                if input.top.is_some() { return Err(crate::error::invalid_params("field 'top' is not used by action 'find_by_ip'")); }
+                if input.skip.is_some() { return Err(crate::error::invalid_params("field 'skip' is not used by action 'find_by_ip'")); }
+                if input.filter.is_some() { return Err(crate::error::invalid_params("field 'filter' is not used by action 'find_by_ip'")); }
+                let ip = required(&input.id, "id", action)?;
+                let validated_ip = validation::validate_ip_address(ip)?;
+                let ts = required(&input.timestamp, "timestamp", action)?;
+                let normalized_ts = validation::validate_recent_timestamp(ts, crate::constants::FIND_BY_IP_MAX_AGE_DAYS)?;
+                let path = format!("/api/machines/findbyip(ip='{validated_ip}',timestamp={normalized_ts})");
+                self.ep_simple_get_as(&path, PermissionCategory::ReadWriteNamed).await
+            }
+            "machine_alerts" => {
+                if input.timestamp.is_some() { return Err(crate::error::invalid_params("field 'timestamp' is not used by action 'machine_alerts'")); }
+                if input.tag_name.is_some() { return Err(crate::error::invalid_params("field 'tag_name' is not used by action 'machine_alerts'")); }
+                if input.use_starts_with.is_some() { return Err(crate::error::invalid_params("field 'use_starts_with' is not used by action 'machine_alerts'")); }
+                if input.look_back_hours.is_some() { return Err(crate::error::invalid_params("field 'look_back_hours' is not used by action 'machine_alerts'")); }
+                let m_id = input.machine_id.as_deref().or(input.id.as_deref()).ok_or_else(|| crate::error::invalid_params("action 'machine_alerts' requires 'machine_id'"))?;
+                let validated_m_id = validation::validate_machine_id(m_id)?;
+                validation::validate_endpoint_odata_params(input.top, input.skip)?;
+                let odata = Self::ep_odata(input.filter.as_deref(), input.top.unwrap_or(DEFAULT_TOP), input.skip.unwrap_or(0));
+                let path = format!("/api/machines/{}/alerts", validation::encode_path_segment(validated_m_id));
+                self.ep_odata_get_as(&path, &odata, PermissionCategory::ReadWriteNamed).await
+            }
+            "machine_vulnerabilities" => {
+                if input.timestamp.is_some() { return Err(crate::error::invalid_params("field 'timestamp' is not used by action 'machine_vulnerabilities'")); }
+                if input.tag_name.is_some() { return Err(crate::error::invalid_params("field 'tag_name' is not used by action 'machine_vulnerabilities'")); }
+                if input.use_starts_with.is_some() { return Err(crate::error::invalid_params("field 'use_starts_with' is not used by action 'machine_vulnerabilities'")); }
+                if input.look_back_hours.is_some() { return Err(crate::error::invalid_params("field 'look_back_hours' is not used by action 'machine_vulnerabilities'")); }
+                let m_id = input.machine_id.as_deref().or(input.id.as_deref()).ok_or_else(|| crate::error::invalid_params("action 'machine_vulnerabilities' requires 'machine_id'"))?;
+                let validated_m_id = validation::validate_machine_id(m_id)?;
+                validation::validate_endpoint_odata_params(input.top, input.skip)?;
+                let odata = Self::ep_odata(input.filter.as_deref(), input.top.unwrap_or(DEFAULT_TOP), input.skip.unwrap_or(0));
+                let path = format!("/api/machines/{}/vulnerabilities", validation::encode_path_segment(validated_m_id));
+                self.ep_odata_get_as(&path, &odata, PermissionCategory::ReadEndpoint).await
+            }
+            "machine_missing_kbs" => {
+                if input.timestamp.is_some() { return Err(crate::error::invalid_params("field 'timestamp' is not used by action 'machine_missing_kbs'")); }
+                if input.tag_name.is_some() { return Err(crate::error::invalid_params("field 'tag_name' is not used by action 'machine_missing_kbs'")); }
+                if input.use_starts_with.is_some() { return Err(crate::error::invalid_params("field 'use_starts_with' is not used by action 'machine_missing_kbs'")); }
+                if input.look_back_hours.is_some() { return Err(crate::error::invalid_params("field 'look_back_hours' is not used by action 'machine_missing_kbs'")); }
+                if input.top.is_some() { return Err(crate::error::invalid_params("field 'top' is not used by action 'machine_missing_kbs'")); }
+                if input.skip.is_some() { return Err(crate::error::invalid_params("field 'skip' is not used by action 'machine_missing_kbs'")); }
+                if input.filter.is_some() { return Err(crate::error::invalid_params("field 'filter' is not used by action 'machine_missing_kbs'")); }
+                let m_id = input.machine_id.as_deref().or(input.id.as_deref()).ok_or_else(|| crate::error::invalid_params("action 'machine_missing_kbs' requires 'machine_id'"))?;
+                let validated_m_id = validation::validate_machine_id(m_id)?;
+                let path = format!("/api/machines/{}/getmissingkbs", validation::encode_path_segment(validated_m_id));
+                self.ep_simple_get_as(&path, PermissionCategory::ReadEndpoint).await
             }
             _ => Err(crate::error::unknown_action_error(
                 "defender_machines",
@@ -4532,7 +4224,7 @@ impl DefenderServer {
         Parameters(input): Parameters<VulnerabilitiesInput>,
     ) -> Result<CallToolResult, McpError> {
         let action = input.action.as_str();
-        let mut args = granular_args(&input);
+        let mut args = action_args(&input);
         if action.starts_with("software_") {
             rename_arg(&mut args, "id", "software_id");
         }
@@ -4540,53 +4232,53 @@ impl DefenderServer {
             rename_arg(&mut args, "id", "cve_id");
         }
         match action {
-            "software_list" => call_granular!(self, defender_endpoint_software_list, args),
-            "software_get" => call_granular!(self, defender_endpoint_software_get, args),
-            "software_machines" => call_granular!(self, defender_endpoint_software_machines, args),
+            "software_list" => call_action!(self, defender_endpoint_software_list, args),
+            "software_get" => call_action!(self, defender_endpoint_software_get, args),
+            "software_machines" => call_action!(self, defender_endpoint_software_machines, args),
             "software_vulnerabilities" => {
-                call_granular!(self, defender_endpoint_software_vulnerabilities, args)
+                call_action!(self, defender_endpoint_software_vulnerabilities, args)
             }
             "software_missing_kbs" => {
-                call_granular!(self, defender_endpoint_software_missing_kbs, args)
+                call_action!(self, defender_endpoint_software_missing_kbs, args)
             }
             "software_distribution" => {
-                call_granular!(self, defender_endpoint_software_distribution, args)
+                call_action!(self, defender_endpoint_software_distribution, args)
             }
             "vulnerability_list" => {
-                call_granular!(self, defender_endpoint_vulnerability_list, args)
+                call_action!(self, defender_endpoint_vulnerability_list, args)
             }
             "vulnerability_get_by_cve" => {
-                call_granular!(self, defender_endpoint_vulnerability_get_by_cve, args)
+                call_action!(self, defender_endpoint_vulnerability_get_by_cve, args)
             }
             "vulnerability_get_machines" => {
-                call_granular!(self, defender_endpoint_vulnerability_get_machines, args)
+                call_action!(self, defender_endpoint_vulnerability_get_machines, args)
             }
             "vulnerability_get_by_machine_software" => {
-                call_granular!(
+                call_action!(
                     self,
                     defender_endpoint_vulnerability_get_by_machine_software,
                     args
                 )
             }
             "recommendation_list" => {
-                call_granular!(self, defender_endpoint_recommendation_list, args)
+                call_action!(self, defender_endpoint_recommendation_list, args)
             }
             "recommendation_get" => {
-                call_granular!(self, defender_endpoint_recommendation_get, args)
+                call_action!(self, defender_endpoint_recommendation_get, args)
             }
             "recommendation_machines" => {
-                call_granular!(self, defender_endpoint_recommendation_machines, args)
+                call_action!(self, defender_endpoint_recommendation_machines, args)
             }
             "recommendation_vulnerabilities" => {
-                call_granular!(self, defender_endpoint_recommendation_vulnerabilities, args)
+                call_action!(self, defender_endpoint_recommendation_vulnerabilities, args)
             }
             "recommendation_by_software" => {
-                call_granular!(self, defender_endpoint_recommendation_by_software, args)
+                call_action!(self, defender_endpoint_recommendation_by_software, args)
             }
-            "remediation_list" => call_granular!(self, defender_endpoint_remediation_list, args),
-            "remediation_get" => call_granular!(self, defender_endpoint_remediation_get, args),
+            "remediation_list" => call_action!(self, defender_endpoint_remediation_list, args),
+            "remediation_get" => call_action!(self, defender_endpoint_remediation_get, args),
             "remediation_exposed_devices" => {
-                call_granular!(self, defender_endpoint_remediation_exposed_devices, args)
+                call_action!(self, defender_endpoint_remediation_exposed_devices, args)
             }
             "exposure_score" | "exposure_score_by_machine_groups" => {
                 if !args.is_empty() {
@@ -4618,12 +4310,14 @@ impl DefenderServer {
                        download_investigation_package (action_id), download_quarantined_file (action_id of a \
                        completed Live Response GetFile action, command_index default 0, optional sha1 used to \
                        name the archive), live_response_get_result (action_id, command_index; requires Live \
-                       Response enabled). Download actions stream the archive into the server's quarantine \
+                       Response enabled), investigation_list (filter, top, skip), investigation_get (investigation_id), \
+                       library_file_list. Download actions stream the archive into the server's quarantine \
                        directory (or a relative destination_dir inside it) with 0600 file permissions and \
                        return file_path, file_size_bytes, and sha256; files are never executed. If a package \
                        is not ready, the current action status is returned; retry once it is Succeeded. \
                        getPackageUri is limited to 2 calls/minute. Requires Machine.Read.All for action \
-                       status/listing and Machine.ReadWrite.All for package and Live Response result links.",
+                       status/listing and Machine.ReadWrite.All for package and Live Response result links \
+                       (investigation_* need Alert.ReadWrite, library_file_list needs Library.Manage).",
         annotations(
             title = "Defender Forensics",
             read_only_hint = true,
@@ -4637,26 +4331,29 @@ impl DefenderServer {
         Parameters(input): Parameters<ForensicsInput>,
     ) -> Result<CallToolResult, McpError> {
         let action = input.action.as_str();
+        if let Some(blocked) = self.check_scope_not_requested(action) {
+            return Ok(blocked);
+        }
         match action {
             "machine_action_list" => {
-                call_granular!(
+                call_action!(
                     self,
                     defender_endpoint_machine_action_list,
-                    granular_args(&input)
+                    action_args(&input)
                 )
             }
             "machine_action_get_status" => {
-                call_granular!(
+                call_action!(
                     self,
                     defender_endpoint_machine_action_get_status,
-                    granular_args(&input)
+                    action_args(&input)
                 )
             }
             "live_response_get_result" => {
-                call_granular!(
+                call_action!(
                     self,
                     defender_endpoint_live_response_get_result,
-                    granular_args(&input)
+                    action_args(&input)
                 )
             }
             "get_investigation_package_sas_url" => {
@@ -4734,6 +4431,40 @@ impl DefenderServer {
                     .stage_artifact(&url, &dir, &file_name, action_id, sha1.as_deref())
                     .await)
             }
+            "investigation_list" => {
+                if input.action_id.is_some() { return Err(crate::error::invalid_params("field 'action_id' is not used by action 'investigation_list'")); }
+                if input.sha1.is_some() { return Err(crate::error::invalid_params("field 'sha1' is not used by action 'investigation_list'")); }
+                if input.command_index.is_some() { return Err(crate::error::invalid_params("field 'command_index' is not used by action 'investigation_list'")); }
+                if input.destination_dir.is_some() { return Err(crate::error::invalid_params("field 'destination_dir' is not used by action 'investigation_list'")); }
+                if input.investigation_id.is_some() { return Err(crate::error::invalid_params("field 'investigation_id' is not used by action 'investigation_list'")); }
+                validation::validate_endpoint_odata_params(input.top, input.skip)?;
+                let odata = Self::ep_odata(input.filter.as_deref(), input.top.unwrap_or(DEFAULT_TOP), input.skip.unwrap_or(0));
+                self.ep_odata_get_as("/api/investigations", &odata, PermissionCategory::ReadWriteNamed).await
+            }
+            "investigation_get" => {
+                if input.action_id.is_some() { return Err(crate::error::invalid_params("field 'action_id' is not used by action 'investigation_get'")); }
+                if input.sha1.is_some() { return Err(crate::error::invalid_params("field 'sha1' is not used by action 'investigation_get'")); }
+                if input.command_index.is_some() { return Err(crate::error::invalid_params("field 'command_index' is not used by action 'investigation_get'")); }
+                if input.destination_dir.is_some() { return Err(crate::error::invalid_params("field 'destination_dir' is not used by action 'investigation_get'")); }
+                if input.top.is_some() { return Err(crate::error::invalid_params("field 'top' is not used by action 'investigation_get'")); }
+                if input.skip.is_some() { return Err(crate::error::invalid_params("field 'skip' is not used by action 'investigation_get'")); }
+                if input.filter.is_some() { return Err(crate::error::invalid_params("field 'filter' is not used by action 'investigation_get'")); }
+                let id = required(&input.investigation_id, "investigation_id", action)?;
+                let validated_id = validation::validate_required_id(id, "investigation_id")?;
+                let encoded_id = validation::encode_path_segment(validated_id);
+                self.ep_simple_get_as(&format!("/api/investigations/{encoded_id}"), PermissionCategory::ReadWriteNamed).await
+            }
+            "library_file_list" => {
+                if input.action_id.is_some() { return Err(crate::error::invalid_params("field 'action_id' is not used by action 'library_file_list'")); }
+                if input.sha1.is_some() { return Err(crate::error::invalid_params("field 'sha1' is not used by action 'library_file_list'")); }
+                if input.command_index.is_some() { return Err(crate::error::invalid_params("field 'command_index' is not used by action 'library_file_list'")); }
+                if input.destination_dir.is_some() { return Err(crate::error::invalid_params("field 'destination_dir' is not used by action 'library_file_list'")); }
+                if input.investigation_id.is_some() { return Err(crate::error::invalid_params("field 'investigation_id' is not used by action 'library_file_list'")); }
+                if input.top.is_some() { return Err(crate::error::invalid_params("field 'top' is not used by action 'library_file_list'")); }
+                if input.skip.is_some() { return Err(crate::error::invalid_params("field 'skip' is not used by action 'library_file_list'")); }
+                if input.filter.is_some() { return Err(crate::error::invalid_params("field 'filter' is not used by action 'library_file_list'")); }
+                self.ep_simple_get_as("/api/libraryfiles", PermissionCategory::ReadWriteNamed).await
+            }
             _ => Err(crate::error::unknown_action_error(
                 "defender_forensics",
                 action,
@@ -4752,11 +4483,11 @@ impl DefenderServer {
                        (machine_id, sha1, comment), live_response_run (machine_id, commands of type \
                        PutFile/RunScript/GetFile with params, comment; subject to --allowed-commands), \
                        upload_library_file (file_name, file_content, description, optional \
-                       parameters_description, override_if_exists). machine_id is the 40-hex Defender machine \
-                       ID; comment needs at least 10 characters and is recorded in the audit trail. Returns \
-                       the upstream MachineAction; poll it with defender_forensics machine_action_get_status. \
-                       Requires Machine.CollectForensics, Machine.StopAndQuarantine, Machine.LiveResponse, or \
-                       Library.Manage as applicable.",
+                       parameters_description, override_if_exists), library_file_delete (file_name, comment). \
+                       machine_id is the 40-hex Defender machine ID; comment needs at least 10 characters and \
+                       is recorded in the audit trail. Returns the upstream MachineAction; poll it with \
+                       defender_forensics machine_action_get_status. Requires Machine.CollectForensics, \
+                       Machine.StopAndQuarantine, Machine.LiveResponse, or Library.Manage as applicable.",
         annotations(
             title = "Defender Response",
             read_only_hint = false,
@@ -4765,13 +4496,11 @@ impl DefenderServer {
             open_world_hint = true
         )
     )]
-    pub async fn defender_response(
+            pub async fn defender_response(
         &self,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(input): Parameters<ResponseInput>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(blocked) = self.read_only_barrier("defender_response") {
-            return Ok(blocked);
-        }
         let action = input.action.as_str();
         if !RESPONSE_ACTIONS.contains(&action) {
             return Err(crate::error::unknown_action_error(
@@ -4780,77 +4509,1105 @@ impl DefenderServer {
                 RESPONSE_ACTIONS,
             ));
         }
-        if !self.config.live_response_enabled {
-            return Ok(crate::error::tool_error(
-                "Response actions are disabled. Start the server with --enable-live-response \
-                 (DEFENDER_ENABLE_LIVE_RESPONSE=true) to enable.",
-            ));
-        }
+
         match action {
-            "collect_investigation_package" | "stop_and_quarantine_file" => {
-                let machine_id = validation::validate_machine_id(required(
+            "collect_investigation_package" => {
+                let machine_id_res = validation::validate_machine_id(required(
                     &input.machine_id,
                     "machine_id",
                     action,
-                )?)?;
-                let comment = validation::validate_comment(
-                    required(&input.comment, "comment", action)?,
-                    "comment",
-                )?;
-                let machine = validation::encode_path_segment(machine_id);
-                if action == "collect_investigation_package" {
-                    tracing::info!(machine_id = %machine_id, comment = %comment, "Investigation package collection initiated");
-                    Ok(self
-                        .ep_post(
-                            &format!("/api/machines/{machine}/collectInvestigationPackage"),
-                            &json!({ "Comment": comment }),
-                        )
-                        .await)
+                )?);
+                let comment_val = input.comment.as_deref().unwrap_or("");
+                let machine_id_str = machine_id_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                let machine_enc = validation::encode_path_segment(&machine_id_str).to_string();
+                let comment_str = comment_val.to_string();
+
+                let params = serde_json::Map::new();
+                let targets = if machine_id_res.is_ok() {
+                    vec![crate::audit::AuditTarget::machine_id(&machine_id_str)]
                 } else {
-                    let sha1 = validation::validate_sha1(required(&input.sha1, "sha1", action)?)?;
-                    tracing::info!(machine_id = %machine_id, sha1 = %sha1, comment = %comment, "Stop and quarantine initiated");
-                    Ok(self
-                        .ep_post(
-                            &format!("/api/machines/{machine}/StopAndQuarantineFile"),
-                            &json!({ "Comment": comment, "Sha1": sha1 }),
-                        )
-                        .await)
+                    vec![]
+                };
+
+                let val_res = match machine_id_res {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(crate::error::tool_error(e.message)),
+                };
+
+                self.execute_mutation(MutationRequest {
+                    tool: MutatingTool::Response,
+                    action: "collect_investigation_package",
+                    category: PermissionCategory::LiveResponse,
+                    targets,
+                    parameters: params,
+                    justification: Some(comment_val),
+                    validation_result: val_res,
+                    context: &context,
+                    extract_tracking: |resp: &MutationResponse| (
+                        resp.get("id").and_then(Value::as_str).map(str::to_owned),
+                        resp.get("status").and_then(Value::as_str).map(str::to_owned),
+                    ),
+                    upstream: || async move {
+                        tracing::info!(machine_id = %machine_id_str, comment = %comment_str, "Investigation package collection initiated");
+                        self.endpoint
+                            .endpoint_post_as(
+                                &format!("/api/machines/{machine_enc}/collectInvestigationPackage"),
+                                &json!({ "Comment": comment_str }),
+                                PermissionCategory::LiveResponse,
+                            )
+                            .await
+                    },
+                }).await
+            }
+            "stop_and_quarantine_file" => {
+                let machine_id_res = validation::validate_machine_id(required(
+                    &input.machine_id,
+                    "machine_id",
+                    action,
+                )?);
+                let sha1_res = validation::validate_sha1(required(&input.sha1, "sha1", action)?);
+                let comment_val = input.comment.as_deref().unwrap_or("");
+                let machine_id_str = machine_id_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                let sha1_str = sha1_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                let machine_enc = validation::encode_path_segment(&machine_id_str).to_string();
+                let comment_str = comment_val.to_string();
+
+                let params = serde_json::Map::new();
+                let mut targets = vec![];
+                if machine_id_res.is_ok() {
+                    targets.push(crate::audit::AuditTarget::machine_id(&machine_id_str));
                 }
+                if sha1_res.is_ok() {
+                    targets.push(crate::audit::AuditTarget::sha1(&sha1_str));
+                }
+
+                let val_res = match (machine_id_res, sha1_res) {
+                    (Ok(_), Ok(_)) => Ok(()),
+                    (Err(e), _) => Err(crate::error::tool_error(e.message)),
+                    (_, Err(e)) => Err(crate::error::tool_error(e.message)),
+                };
+
+                self.execute_mutation(MutationRequest {
+                    tool: MutatingTool::Response,
+                    action: "stop_and_quarantine_file",
+                    category: PermissionCategory::LiveResponse,
+                    targets,
+                    parameters: params,
+                    justification: Some(comment_val),
+                    validation_result: val_res,
+                    context: &context,
+                    extract_tracking: |resp: &MutationResponse| (
+                        resp.get("id").and_then(Value::as_str).map(str::to_owned),
+                        resp.get("status").and_then(Value::as_str).map(str::to_owned),
+                    ),
+                    upstream: || async move {
+                        tracing::info!(machine_id = %machine_id_str, sha1 = %sha1_str, comment = %comment_str, "Stop and quarantine initiated");
+                        self.endpoint
+                            .endpoint_post_as(
+                                &format!("/api/machines/{machine_enc}/StopAndQuarantineFile"),
+                                &json!({ "Comment": comment_str, "Sha1": sha1_str }),
+                                PermissionCategory::LiveResponse,
+                            )
+                            .await
+                    },
+                }).await
             }
             "live_response_run" => {
-                call_granular!(
-                    self,
-                    defender_endpoint_live_response_run,
-                    granular_args(&input)
-                )
+                let args = action_args(&input);
+                let p: LiveResponseRunInput = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| crate::error::invalid_params(format!("invalid arguments for this action: {e}")))?;
+
+                let machine_res = validation::validate_required_id(&p.machine_id, "machine_id");
+                let comment_val = p.comment.clone();
+                let commands_res = validation::validate_live_response_commands(
+                    &p.commands,
+                    self.config.live_response_allowed_commands.as_deref(),
+                );
+                let machine_id_str = machine_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                let machine_enc = validation::encode_path_segment(&machine_id_str).to_string();
+
+                let val_res = match (machine_res, commands_res) {
+                    (Ok(_), Ok(_)) => Ok(()),
+                    (Err(e), _) => Err(crate::error::tool_error(e.message)),
+                    (_, Err(e)) => Err(crate::error::tool_error(e.message)),
+                };
+
+                let mut param_map = serde_json::Map::new();
+                let cmd_types: Vec<Value> = p.commands.iter().map(|c| Value::String(c.cmd_type.as_str().to_string())).collect();
+                param_map.insert("commands".to_string(), Value::Array(cmd_types));
+
+                let targets = if val_res.is_ok() {
+                    vec![crate::audit::AuditTarget::machine_id(&machine_id_str)]
+                } else {
+                    vec![]
+                };
+
+                self.execute_mutation(MutationRequest {
+                    tool: MutatingTool::Response,
+                    action: "live_response_run",
+                    category: PermissionCategory::LiveResponse,
+                    targets,
+                    parameters: param_map,
+                    justification: Some(&comment_val),
+                    validation_result: val_res,
+                    context: &context,
+                    extract_tracking: |resp: &MutationResponse| (
+                        resp.get("id").and_then(Value::as_str).map(str::to_owned),
+                        resp.get("status").and_then(Value::as_str).map(str::to_owned),
+                    ),
+                    upstream: || async move {
+                        tracing::info!(
+                            machine_id = %machine_id_str,
+                            comment = %p.comment,
+                            command_count = p.commands.len(),
+                            "Live Response run initiated"
+                        );
+                        let body = json!({
+                            "Commands": p.commands,
+                            "Comment": p.comment,
+                        });
+                        self.endpoint
+                            .endpoint_post_as(
+                                &format!("/api/machines/{machine_enc}/runliveresponse"),
+                                &body,
+                                PermissionCategory::LiveResponse,
+                            )
+                            .await
+                    },
+                }).await
             }
-            _ => call_granular!(self, defender_library_file_upload, granular_args(&input)),
+            "upload_library_file" => {
+                let mut args = action_args(&input);
+                args.remove("comment");
+                let p: LiveResponseLibraryUploadInput = serde_json::from_value(Value::Object(args))
+                    .map_err(|e| crate::error::invalid_params(format!("invalid arguments for this action: {e}")))?;
+
+                let file_name_res = validation::validate_file_name(&p.file_name);
+                let desc_res = validation::validate_description(&p.description);
+                let content = p.file_content.into_bytes();
+                let content_len = content.len();
+                let content_res = if content.is_empty() {
+                    Err(crate::error::tool_error("file_content cannot be empty"))
+                } else if content_len > crate::constants::MAX_LIBRARY_FILE_SIZE {
+                    Err(crate::error::tool_error(format!(
+                        "File size {} bytes exceeds maximum of {} bytes (20 MB)",
+                        content_len,
+                        crate::constants::MAX_LIBRARY_FILE_SIZE
+                    )))
+                } else {
+                    Ok(())
+                };
+
+                let val_res = match (&file_name_res, &desc_res, &content_res) {
+                    (Ok(_), Ok(_), Ok(_)) => Ok(()),
+                    (Err(e), _, _) => Err(crate::error::tool_error(e.message.clone())),
+                    (_, Err(e), _) => Err(crate::error::tool_error(e.message.clone())),
+                    (_, _, Err(e)) => Err(e.clone()),
+                };
+
+                let file_name_str = file_name_res.map(str::to_string).unwrap_or_default();
+                let description_str = desc_res.map(str::to_string).unwrap_or_default();
+
+                let mut param_map = serde_json::Map::new();
+                if let Some(pd) = &p.parameters_description {
+                    param_map.insert("parameters_description".to_string(), Value::String(pd.clone()));
+                }
+                if let Some(ov) = p.override_if_exists {
+                    param_map.insert("override_if_exists".to_string(), Value::Bool(ov));
+                }
+
+                let targets = if val_res.is_ok() {
+                    vec![crate::audit::AuditTarget::file_name(&file_name_str)]
+                } else {
+                    vec![]
+                };
+
+                let upstream_fn = file_name_str.clone();
+                let upstream_desc = description_str.clone();
+
+                self.execute_mutation(MutationRequest {
+                    tool: MutatingTool::Response,
+                    action: "upload_library_file",
+                    category: PermissionCategory::LiveResponse,
+                    targets,
+                    parameters: param_map,
+                    justification: input.comment.as_deref().or(Some(&description_str)),
+                    validation_result: val_res,
+                    context: &context,
+                    extract_tracking: |resp: &MutationResponse| (
+                        resp.get("id").and_then(Value::as_str).map(str::to_owned),
+                        None,
+                    ),
+                    upstream: || async move {
+                        tracing::info!(
+                            file_name = %upstream_fn,
+                            size = content_len,
+                            "Library file upload initiated"
+                        );
+                        self.endpoint
+                            .endpoint_multipart_upload(
+                                crate::constants::LIBRARY_FILES_PATH,
+                                &upstream_fn,
+                                content,
+                                &upstream_desc,
+                                p.parameters_description.as_deref(),
+                                p.override_if_exists,
+                            )
+                            .await
+                    },
+                }).await
+            }
+            "library_file_delete" => {
+                if input.machine_id.is_some() { return Err(crate::error::invalid_params("field 'machine_id' is not used by action 'library_file_delete'")); }
+                if input.sha1.is_some() { return Err(crate::error::invalid_params("field 'sha1' is not used by action 'library_file_delete'")); }
+                if input.commands.is_some() { return Err(crate::error::invalid_params("field 'commands' is not used by action 'library_file_delete'")); }
+                if input.file_content.is_some() { return Err(crate::error::invalid_params("field 'file_content' is not used by action 'library_file_delete'")); }
+                if input.description.is_some() { return Err(crate::error::invalid_params("field 'description' is not used by action 'library_file_delete'")); }
+                if input.parameters_description.is_some() { return Err(crate::error::invalid_params("field 'parameters_description' is not used by action 'library_file_delete'")); }
+                if input.override_if_exists.is_some() { return Err(crate::error::invalid_params("field 'override_if_exists' is not used by action 'library_file_delete'")); }
+
+                let fn_val = required(&input.file_name, "file_name", action)?;
+                let fn_res = validation::validate_file_name(fn_val);
+                let comment_val = input.comment.as_deref().unwrap_or("");
+                let fn_str = fn_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                let fn_enc = validation::encode_path_segment(&fn_str).to_string();
+
+                let val_res = match fn_res {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(crate::error::tool_error(e.message)),
+                };
+
+                let targets = if val_res.is_ok() {
+                    vec![crate::audit::AuditTarget::file_name(&fn_str)]
+                } else {
+                    vec![]
+                };
+
+                self.execute_mutation(MutationRequest {
+                    tool: MutatingTool::Response,
+                    action: "library_file_delete",
+                    category: PermissionCategory::LiveResponse,
+                    targets,
+                    parameters: serde_json::Map::new(),
+                    justification: Some(comment_val),
+                    validation_result: val_res,
+                    context: &context,
+                    extract_tracking: |_| (None, None),
+                    upstream: || async move {
+                        let _ = self.endpoint
+                            .endpoint_delete_as(
+                                &format!("/api/libraryfiles/{fn_enc}"),
+                                PermissionCategory::LiveResponse,
+                            )
+                            .await?;
+                        Ok(MutationResponse {
+                            http_status: 204,
+                            body: json!({ "status": "deleted", "file_name": fn_str }),
+                        })
+                    },
+                }).await
+            }
+            _ => Err(crate::error::unknown_action_error(
+                "defender_response",
+                action,
+                RESPONSE_ACTIONS,
+            )),
+    }
+
+    }
+    /// Consolidated device response and lifecycle actions dispatcher.
+    #[tool(
+        name = "defender_device_response",
+        description = DEVICE_RESPONSE_DESCRIPTION_WITH_OFFBOARD,
+        annotations(
+            title = "Defender Device Response",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    pub async fn defender_device_response(
+        &self,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(input): Parameters<DeviceResponseInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let action = input.action.as_str();
+        let valid_actions = if self.config.categories.offboarding {
+            DEVICE_RESPONSE_ACTIONS
+        } else {
+            DEVICE_RESPONSE_ACTIONS_WITHOUT_OFFBOARD
+        };
+        if !valid_actions.contains(&action) {
+            let mut err = crate::error::unknown_action_error(
+                "defender_device_response",
+                action,
+                valid_actions,
+            );
+            if action == "offboard" && !self.config.categories.offboarding {
+                err.message = format!("{}. offboard requires --enable-offboarding", err.message).into();
+            }
+            return Err(err);
+        }
+
+        let unused_field = match action {
+            "isolate" => {
+                if input.action_id.is_some() { Some("action_id") }
+                else if input.scan_type.is_some() { Some("scan_type") }
+                else if input.tag.is_some() { Some("tag") }
+                else if input.device_value.is_some() { Some("device_value") }
+                else { None }
+            }
+            "unisolate" | "restrict_app_execution" | "unrestrict_app_execution" | "start_investigation" | "offboard" => {
+                if input.action_id.is_some() { Some("action_id") }
+                else if input.isolation_type.is_some() { Some("isolation_type") }
+                else if input.scan_type.is_some() { Some("scan_type") }
+                else if input.tag.is_some() { Some("tag") }
+                else if input.device_value.is_some() { Some("device_value") }
+                else { None }
+            }
+            "run_av_scan" => {
+                if input.action_id.is_some() { Some("action_id") }
+                else if input.isolation_type.is_some() { Some("isolation_type") }
+                else if input.tag.is_some() { Some("tag") }
+                else if input.device_value.is_some() { Some("device_value") }
+                else { None }
+            }
+            "cancel_machine_action" => {
+                if input.machine_id.is_some() { Some("machine_id") }
+                else if input.isolation_type.is_some() { Some("isolation_type") }
+                else if input.scan_type.is_some() { Some("scan_type") }
+                else if input.tag.is_some() { Some("tag") }
+                else if input.device_value.is_some() { Some("device_value") }
+                else { None }
+            }
+            "tag_add" | "tag_remove" => {
+                if input.action_id.is_some() { Some("action_id") }
+                else if input.isolation_type.is_some() { Some("isolation_type") }
+                else if input.scan_type.is_some() { Some("scan_type") }
+                else if input.device_value.is_some() { Some("device_value") }
+                else { None }
+            }
+            "set_device_value" => {
+                if input.action_id.is_some() { Some("action_id") }
+                else if input.isolation_type.is_some() { Some("isolation_type") }
+                else if input.scan_type.is_some() { Some("scan_type") }
+                else if input.tag.is_some() { Some("tag") }
+                else { None }
+            }
+            _ => None,
+        };
+
+        if let Some(f) = unused_field {
+            let val_err = crate::error::tool_error(format!("field '{f}' is not used by action '{action}'"));
+            return self.execute_mutation(MutationRequest {
+                tool: MutatingTool::DeviceResponse,
+                action,
+                category: if action == "offboard" { PermissionCategory::Offboarding } else { PermissionCategory::DeviceResponse },
+                targets: Vec::new(),
+                parameters: serde_json::Map::new(),
+                justification: input.comment.as_deref(),
+                validation_result: Err(val_err),
+                context: &context,
+                extract_tracking: |_| (None, None),
+                upstream: || async { unreachable!() },
+            }).await;
+        }
+
+        let category = if action == "offboard" {
+            PermissionCategory::Offboarding
+        } else {
+            PermissionCategory::DeviceResponse
+        };
+
+        let comment_val = input.comment.as_deref().unwrap_or("");
+        let mut params = serde_json::Map::new();
+
+        let (targets, val_res, upstream_path, upstream_body) = if action == "cancel_machine_action" {
+            let aid_res = validation::validate_action_id(required(&input.action_id, "action_id", action)?);
+            let aid_str = aid_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
+            let enc = validation::encode_path_segment(&aid_str).to_string();
+            let t = if !aid_str.is_empty() { vec![crate::audit::AuditTarget::machine_action_id(&aid_str)] } else { vec![] };
+            let v = aid_res.map(|_| ()).map_err(|e| crate::error::tool_error(e.message));
+            let body = json!({ "Comment": comment_val });
+            (t, v, format!("/api/machineactions/{enc}/cancel"), body)
+        } else {
+            let mid_res = validation::validate_machine_id(required(&input.machine_id, "machine_id", action)?);
+            let mid_str = mid_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
+            let enc = validation::encode_path_segment(&mid_str).to_string();
+            let t = if !mid_str.is_empty() { vec![crate::audit::AuditTarget::machine_id(&mid_str)] } else { vec![] };
+            let v_mid = mid_res.as_ref().map(|_| ()).map_err(|e| crate::error::tool_error(e.message.clone()));
+
+            match action {
+                "isolate" => {
+                    let iso = input.isolation_type.unwrap_or(IsolationType::Full);
+                    params.insert("isolation_type".to_string(), json!(iso.as_str()));
+                    let body = json!({ "Comment": comment_val, "IsolationType": iso.as_str() });
+                    (t, v_mid, format!("/api/machines/{enc}/isolate"), body)
+                }
+                "unisolate" => {
+                    (t, v_mid, format!("/api/machines/{enc}/unisolate"), json!({ "Comment": comment_val }))
+                }
+                "restrict_app_execution" => {
+                    (t, v_mid, format!("/api/machines/{enc}/restrictCodeExecution"), json!({ "Comment": comment_val }))
+                }
+                "unrestrict_app_execution" => {
+                    (t, v_mid, format!("/api/machines/{enc}/unrestrictCodeExecution"), json!({ "Comment": comment_val }))
+                }
+                "run_av_scan" => {
+                    let scan_opt = input.scan_type;
+                    let scan = scan_opt.ok_or_else(|| crate::error::invalid_params("action 'run_av_scan' requires 'scan_type'"))?;
+                    params.insert("scan_type".to_string(), json!(scan.as_str()));
+                    (t, v_mid, format!("/api/machines/{enc}/runAntiVirusScan"), json!({ "Comment": comment_val, "ScanType": scan.as_str() }))
+                }
+                "start_investigation" => {
+                    (t, v_mid, format!("/api/machines/{enc}/startInvestigation"), json!({ "Comment": comment_val }))
+                }
+                "tag_add" | "tag_remove" => {
+                    let tag_val = required(&input.tag, "tag", action)?;
+                    let tag_res = validation::validate_tag(tag_val);
+                    let tag_str = tag_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                    params.insert("tag".to_string(), json!(tag_str));
+                    let act_str = if action == "tag_add" { "Add" } else { "Remove" };
+                    let v = match (&mid_res, &tag_res) {
+                        (Ok(_), Ok(_)) => Ok(()),
+                        (Err(e), _) => Err(crate::error::tool_error(e.message.clone())),
+                        (_, Err(e)) => Err(crate::error::tool_error(e.message.clone())),
+                    };
+                    (t, v, format!("/api/machines/{enc}/tags"), json!({ "Value": tag_str, "Action": act_str }))
+                }
+                "set_device_value" => {
+                    let dv = input.device_value.ok_or_else(|| crate::error::invalid_params("action 'set_device_value' requires 'device_value'"))?;
+                    params.insert("device_value".to_string(), json!(dv.as_str()));
+                    (t, v_mid, format!("/api/machines/{enc}/setDeviceValue"), json!({ "DeviceValue": dv.as_str() }))
+                }
+                "offboard" => {
+                    (t, v_mid, format!("/api/machines/{enc}/offboard"), json!({ "Comment": comment_val }))
+                }
+                _ => unreachable!(),
+            }
+        };
+
+        let action_owned = action.to_string();
+        self.execute_mutation(MutationRequest {
+            tool: MutatingTool::DeviceResponse,
+            action,
+            category,
+            targets,
+            parameters: params,
+            justification: Some(comment_val),
+            validation_result: val_res,
+            context: &context,
+            extract_tracking: |resp: &MutationResponse| {
+                let tracking_id = resp.get("id")
+                    .or_else(|| resp.get("machineAction").and_then(|m| m.get("id")))
+                    .or_else(|| resp.get("investigation").and_then(|i| i.get("id")))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let upstream_status = resp.get("status")
+                    .or_else(|| resp.get("machineAction").and_then(|m| m.get("status")))
+                    .or_else(|| resp.get("investigation").and_then(|i| i.get("state")))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                (tracking_id, upstream_status)
+            },
+            upstream: || async move {
+                let resp = self.endpoint.endpoint_post_as(&upstream_path, &upstream_body, category).await?;
+                match action_owned.as_str() {
+                    "isolate" | "unisolate" | "restrict_app_execution" | "unrestrict_app_execution" | "run_av_scan" | "cancel_machine_action" => {
+                        Ok(Self::wrap_machine_action(resp, None))
+                    }
+                    "start_investigation" => {
+                        Ok(Self::wrap_investigation(resp))
+                    }
+                    "offboard" => {
+                        Ok(Self::wrap_machine_action(resp, Some(
+                            "Offboarding cannot be undone remotely; the device stops reporting until re-onboarded. On Windows the API stops the sensor service but does not remove onboarding registry data."
+                        )))
+                    }
+                    _ => Ok(resp),
+                }
+            },
+        }).await
+    }
+    /// Consolidated custom indicator management dispatcher.
+    #[tool(
+        name = "defender_indicators",
+        description = INDICATORS_DESCRIPTION,
+        annotations(
+            title = "Defender Custom Indicators",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    pub async fn defender_indicators(
+        &self,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(input): Parameters<IndicatorsInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let action = input.action.as_str();
+        if !INDICATORS_ACTIONS.contains(&action) {
+            return Err(crate::error::unknown_action_error(
+                "defender_indicators",
+                action,
+                INDICATORS_ACTIONS,
+            ));
+        }
+
+        let unused_field = match action {
+            "submit" => {
+                if input.indicator_id.is_some() { Some("indicator_id") }
+                else if input.indicator_ids.is_some() { Some("indicator_ids") }
+                else { None }
+            }
+            "delete" => {
+                if input.indicator_value.is_some() { Some("indicator_value") }
+                else if input.indicator_type.is_some() { Some("indicator_type") }
+                else if input.indicator_action.is_some() { Some("indicator_action") }
+                else if input.title.is_some() { Some("title") }
+                else if input.description.is_some() { Some("description") }
+                else if input.severity.is_some() { Some("severity") }
+                else if input.expiration_time.is_some() { Some("expiration_time") }
+                else if input.rbac_group_names.is_some() { Some("rbac_group_names") }
+                else if input.recommended_actions.is_some() { Some("recommended_actions") }
+                else if input.generate_alert.is_some() { Some("generate_alert") }
+                else if input.indicator_ids.is_some() { Some("indicator_ids") }
+                else { None }
+            }
+            "batch_delete" => {
+                if input.indicator_id.is_some() { Some("indicator_id") }
+                else if input.indicator_value.is_some() { Some("indicator_value") }
+                else if input.indicator_type.is_some() { Some("indicator_type") }
+                else if input.indicator_action.is_some() { Some("indicator_action") }
+                else if input.title.is_some() { Some("title") }
+                else if input.description.is_some() { Some("description") }
+                else if input.severity.is_some() { Some("severity") }
+                else if input.expiration_time.is_some() { Some("expiration_time") }
+                else if input.rbac_group_names.is_some() { Some("rbac_group_names") }
+                else if input.recommended_actions.is_some() { Some("recommended_actions") }
+                else if input.generate_alert.is_some() { Some("generate_alert") }
+                else { None }
+            }
+            _ => None,
+        };
+
+        if let Some(f) = unused_field {
+            let val_err = crate::error::tool_error(format!("field '{f}' is not used by action '{action}'"));
+            return self.execute_mutation(MutationRequest {
+                tool: MutatingTool::Indicators,
+                action,
+                category: PermissionCategory::Indicators,
+                targets: Vec::new(),
+                parameters: serde_json::Map::new(),
+                justification: input.comment.as_deref(),
+                validation_result: Err(val_err),
+                context: &context,
+                extract_tracking: |_| (None, None),
+                upstream: || async { unreachable!() },
+            }).await;
+        }
+
+        let comment_val = input.comment.as_deref().unwrap_or("");
+        let mut params = serde_json::Map::new();
+
+        match action {
+            "submit" => {
+                let title = required(&input.title, "title", action)?;
+                let title_res = validation::validate_text(title, 256, "title");
+                let desc = required(&input.description, "description", action)?;
+                let desc_res = validation::validate_description(desc);
+                let val_str = required(&input.indicator_value, "indicator_value", action)?;
+                let itype = input.indicator_type.ok_or_else(|| crate::error::invalid_params("action 'submit' requires 'indicator_type'"))?;
+                let iact = input.indicator_action.ok_or_else(|| crate::error::invalid_params("action 'submit' requires 'indicator_action'"))?;
+
+                let ival_res = validation::validate_indicator_value(itype, val_str);
+                let iact_res = validation::validate_indicator_action(itype, iact, input.generate_alert);
+                let exp_res = input.expiration_time.as_deref().map(|exp| validation::validate_future_rfc3339(exp, "expiration_time")).transpose();
+                let rbac_res: Result<Option<()>, McpError> = input.rbac_group_names.as_ref().map(|groups| {
+                    for g in groups {
+                        validation::validate_text(g, 128, "rbac_group_names")?;
+                    }
+                    Ok(())
+                }).transpose();
+
+                let val_res = match (&title_res, &desc_res, &ival_res, &iact_res, &exp_res, &rbac_res) {
+                    (Ok(_), Ok(_), Ok(_), Ok(_), Ok(_), Ok(_)) => Ok(()),
+                    (Err(e), _, _, _, _, _) => Err(crate::error::tool_error(e.message.clone())),
+                    (_, Err(e), _, _, _, _) => Err(crate::error::tool_error(e.message.clone())),
+                    (_, _, Err(e), _, _, _) => Err(crate::error::tool_error(e.message.clone())),
+                    (_, _, _, Err(e), _, _) => Err(crate::error::tool_error(e.message.clone())),
+                    (_, _, _, _, Err(e), _) => Err(crate::error::tool_error(e.message.clone())),
+                    (_, _, _, _, _, Err(e)) => Err(crate::error::tool_error(e.message.clone())),
+                };
+
+                let targets = if ival_res.is_ok() {
+                    vec![crate::audit::AuditTarget::indicator_value(val_str)]
+                } else {
+                    vec![]
+                };
+
+                params.insert("indicator_type".to_string(), json!(itype.as_str()));
+                params.insert("indicator_action".to_string(), json!(iact.as_str()));
+                if let Some(sev) = input.severity {
+                    params.insert("severity".to_string(), json!(sev.as_str()));
+                }
+
+                let mut body = json!({
+                    "indicatorValue": val_str,
+                    "indicatorType": itype.as_str(),
+                    "action": iact.as_str(),
+                    "title": title,
+                    "description": desc,
+                });
+                if iact == IndicatorAction::Audit {
+                    body["generateAlert"] = json!(true);
+                } else if let Some(ga) = input.generate_alert {
+                    body["generateAlert"] = json!(ga);
+                }
+                if let Some(sev) = input.severity {
+                    body["severity"] = json!(sev.as_str());
+                }
+                if let Some(exp) = &input.expiration_time {
+                    body["expirationTime"] = json!(exp);
+                }
+                if let Some(ra) = &input.recommended_actions {
+                    body["recommendedActions"] = json!(ra);
+                }
+                if let Some(rb) = &input.rbac_group_names {
+                    body["rbacGroupNames"] = json!(rb);
+                }
+
+                self.execute_mutation(MutationRequest {
+                    tool: MutatingTool::Indicators,
+                    action: "submit",
+                    category: PermissionCategory::Indicators,
+                    targets,
+                    parameters: params,
+                    justification: Some(comment_val),
+                    validation_result: val_res,
+                    context: &context,
+                    extract_tracking: |resp: &MutationResponse| (
+                        resp.get("id").and_then(Value::as_str).map(str::to_owned),
+                        None,
+                    ),
+                    upstream: || async move {
+                        self.endpoint
+                            .endpoint_post_as("/api/indicators", &body, PermissionCategory::Indicators)
+                            .await
+                    },
+                }).await
+            }
+            "delete" => {
+                let id = required(&input.indicator_id, "indicator_id", action)?;
+                let id_res = validation::validate_required_id(id, "indicator_id");
+                let id_str = id_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                let enc = validation::encode_path_segment(&id_str).to_string();
+                let targets = if !id_str.is_empty() {
+                    vec![crate::audit::AuditTarget::indicator_id(&id_str)]
+                } else {
+                    vec![]
+                };
+                let val_res = id_res.map(|_| ()).map_err(|e| crate::error::tool_error(e.message));
+
+                self.execute_mutation(MutationRequest {
+                    tool: MutatingTool::Indicators,
+                    action: "delete",
+                    category: PermissionCategory::Indicators,
+                    targets,
+                    parameters: params,
+                    justification: Some(comment_val),
+                    validation_result: val_res,
+                    context: &context,
+                    extract_tracking: |_| (None, None),
+                    upstream: || async move {
+                        let _ = self.endpoint
+                            .endpoint_delete_as(&format!("/api/indicators/{enc}"), PermissionCategory::Indicators)
+                            .await?;
+                        Ok(MutationResponse {
+                            http_status: 204,
+                            body: json!({ "status": "deleted", "indicator_id": id_str }),
+                        })
+                    },
+                }).await
+            }
+            "batch_delete" => {
+                let ids_opt = input.indicator_ids.as_ref();
+                let ids = ids_opt.ok_or_else(|| crate::error::invalid_params("action 'batch_delete' requires 'indicator_ids'"))?;
+                let batch_res = validation::validate_batch(ids, crate::constants::MAX_INDICATOR_BATCH, "indicator_ids");
+                let targets = ids.iter().map(|id| crate::audit::AuditTarget::indicator_id(id)).collect();
+                params.insert("count".to_string(), json!(ids.len()));
+                let val_res = batch_res.map_err(|e| crate::error::tool_error(e.message));
+                let count = ids.len();
+                let body = json!({ "IndicatorIds": ids });
+
+                self.execute_mutation(MutationRequest {
+                    tool: MutatingTool::Indicators,
+                    action: "batch_delete",
+                    category: PermissionCategory::Indicators,
+                    targets,
+                    parameters: params,
+                    justification: Some(comment_val),
+                    validation_result: val_res,
+                    context: &context,
+                    extract_tracking: |_| (None, None),
+                    upstream: || async move {
+                        let _ = self.endpoint
+                            .endpoint_post_as("/api/indicators/BatchDelete", &body, PermissionCategory::Indicators)
+                            .await?;
+                        Ok(MutationResponse {
+                            http_status: 204,
+                            body: json!({ "status": "deleted", "count": count }),
+                        })
+                    },
+                }).await
+            }
+            _ => unreachable!(),
         }
     }
-}
+    /// Consolidated alert and incident triage write-back dispatcher.
+    #[tool(
+        name = "defender_triage",
+        description = TRIAGE_DESCRIPTION,
+        annotations(
+            title = "Defender Triage",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    pub async fn defender_triage(
+        &self,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(input): Parameters<TriageInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let action = input.action.as_str();
+        if !TRIAGE_ACTIONS.contains(&action) {
+            return Err(crate::error::unknown_action_error(
+                "defender_triage",
+                action,
+                TRIAGE_ACTIONS,
+            ));
+        }
 
-// ---------------------------------------------------------------------------
-// Server handler
-// ---------------------------------------------------------------------------
+        let unused_field = match action {
+            "endpoint_alert_batch_update" => {
+                if input.id.is_some() { Some("id") }
+                else if input.tags.is_some() { Some("tags") }
+                else { None }
+            }
+            "endpoint_alert_update" => {
+                if input.ids.is_some() { Some("ids") }
+                else if input.tags.is_some() { Some("tags") }
+                else { None }
+            }
+            "endpoint_alert_comment" => {
+                if input.ids.is_some() { Some("ids") }
+                else if input.status.is_some() { Some("status") }
+                else if input.assigned_to.is_some() { Some("assigned_to") }
+                else if input.classification.is_some() { Some("classification") }
+                else if input.determination.is_some() { Some("determination") }
+                else if input.tags.is_some() { Some("tags") }
+                else { None }
+            }
+            "xdr_alert_update" => {
+                if input.ids.is_some() { Some("ids") }
+                else if input.tags.is_some() { Some("tags") }
+                else if input.comment.is_some() { Some("comment") }
+                else { None }
+            }
+            "xdr_alert_comment" => {
+                if input.ids.is_some() { Some("ids") }
+                else if input.status.is_some() { Some("status") }
+                else if input.assigned_to.is_some() { Some("assigned_to") }
+                else if input.classification.is_some() { Some("classification") }
+                else if input.determination.is_some() { Some("determination") }
+                else if input.tags.is_some() { Some("tags") }
+                else { None }
+            }
+            "xdr_incident_update" => {
+                if input.ids.is_some() { Some("ids") }
+                else if input.comment.is_some() { Some("comment") }
+                else { None }
+            }
+            "xdr_incident_comment" => {
+                if input.ids.is_some() { Some("ids") }
+                else if input.status.is_some() { Some("status") }
+                else if input.assigned_to.is_some() { Some("assigned_to") }
+                else if input.classification.is_some() { Some("classification") }
+                else if input.determination.is_some() { Some("determination") }
+                else if input.tags.is_some() { Some("tags") }
+                else { None }
+            }
+            _ => None,
+        };
+
+        if let Some(f) = unused_field {
+            let val_err = crate::error::tool_error(format!("field '{f}' is not used by action '{action}'"));
+            return self.execute_mutation(MutationRequest {
+                tool: MutatingTool::Triage,
+                action,
+                category: PermissionCategory::Triage,
+                targets: Vec::new(),
+                parameters: serde_json::Map::new(),
+                justification: input.justification.as_deref(),
+                validation_result: Err(val_err),
+                context: &context,
+                extract_tracking: |_| (None, None),
+                upstream: || async { unreachable!() },
+            }).await;
+        }
+
+        // Enforce update actions have at least one change
+        let has_change = match action {
+            "endpoint_alert_update" | "endpoint_alert_batch_update" => {
+                input.status.is_some() || input.assigned_to.is_some() || input.classification.is_some() || input.comment.is_some()
+            }
+            "xdr_alert_update" => {
+                input.status.is_some() || input.assigned_to.is_some() || input.classification.is_some()
+            }
+            "xdr_incident_update" => {
+                input.status.is_some() || input.assigned_to.is_some() || input.classification.is_some() || input.tags.is_some()
+            }
+            _ => true,
+        };
+        if !has_change {
+            let val_err = crate::error::tool_error("at least one update field must be specified");
+            return self.execute_mutation(MutationRequest {
+                tool: MutatingTool::Triage,
+                action,
+                category: PermissionCategory::Triage,
+                targets: Vec::new(),
+                parameters: serde_json::Map::new(),
+                justification: input.justification.as_deref(),
+                validation_result: Err(val_err),
+                context: &context,
+                extract_tracking: |_| (None, None),
+                upstream: || async { unreachable!() },
+            }).await;
+        }
+
+        let pair_res = validation::validate_classification_pair(input.classification, input.determination);
+        let assigned_res = input.assigned_to.as_deref().map(|a| validation::validate_text(a, 256, "assigned_to")).transpose();
+        let comment_res = match action {
+            "endpoint_alert_comment" | "xdr_alert_comment" | "xdr_incident_comment" => {
+                let c = required(&input.comment, "comment", action)?;
+                validation::validate_text(c, 1000, "comment").map(|_| ())
+            }
+            "endpoint_alert_update" | "endpoint_alert_batch_update" => {
+                input.comment.as_deref().map(|c| validation::validate_text(c, 1000, "comment").map(|_| ())).unwrap_or(Ok(()))
+            }
+            _ => Ok(()),
+        };
+        let tags_res: Result<Option<()>, McpError> = input.tags.as_ref().map(|tags| {
+            for t in tags {
+                validation::validate_text(t, 128, "tags")?;
+            }
+            Ok(())
+        }).transpose();
+
+        let target = match action {
+            "endpoint_alert_batch_update" => TriageTarget::MdeAlertBatch,
+            "endpoint_alert_update" | "endpoint_alert_comment" => TriageTarget::MdeAlertPatch,
+            "xdr_alert_update" | "xdr_alert_comment" => TriageTarget::XdrAlert,
+            "xdr_incident_update" | "xdr_incident_comment" => TriageTarget::XdrIncident,
+            _ => unreachable!(),
+        };
+
+        let status_wire = input.status.map(|s| s.wire(target)).transpose();
+
+        let mut params = serde_json::Map::new();
+        if let Some(s) = input.status {
+            params.insert("status".to_string(), json!(s.as_str()));
+        }
+        if let Some(a) = &input.assigned_to {
+            params.insert("assigned_to".to_string(), json!(a));
+        }
+        if let Some(c) = input.classification {
+            params.insert("classification".to_string(), json!(c.as_str()));
+        }
+        if let Some(d) = input.determination {
+            params.insert("determination".to_string(), json!(d.as_str()));
+        }
+
+        let val_res = match (&pair_res, &assigned_res, &comment_res, &tags_res, &status_wire) {
+            (Ok(_), Ok(_), Ok(_), Ok(_), Ok(_)) => Ok(()),
+            (Err(e), _, _, _, _) => Err(crate::error::tool_error(e.message.clone())),
+            (_, Err(e), _, _, _) => Err(crate::error::tool_error(e.message.clone())),
+            (_, _, Err(e), _, _) => Err(crate::error::tool_error(e.message.clone())),
+            (_, _, _, Err(e), _) => Err(crate::error::tool_error(e.message.clone())),
+            (_, _, _, _, Err(e)) => Err(crate::error::tool_error(e.message.clone())),
+        };
+
+        if action == "endpoint_alert_batch_update" {
+            let ids_opt = input.ids.as_ref();
+            let ids = ids_opt.ok_or_else(|| crate::error::invalid_params("action 'endpoint_alert_batch_update' requires 'ids'"))?;
+            let batch_res = validation::validate_batch(ids, crate::constants::MAX_ALERT_BATCH, "ids");
+            let targets = ids.iter().map(|id| crate::audit::AuditTarget::alert_id(id)).collect();
+            let combined_val = match (val_res, batch_res) {
+                (Ok(_), Ok(_)) => Ok(()),
+                (Err(e), _) => Err(e),
+                (_, Err(e)) => Err(crate::error::tool_error(e.message)),
+            };
+            let count = ids.len();
+            let mut body = json!({ "alertIds": ids });
+            if let Ok(Some(s)) = status_wire {
+                body["status"] = json!(s);
+            }
+            if let Some(a) = &input.assigned_to {
+                body["assignedTo"] = json!(a);
+            }
+            if let Some(c) = input.classification {
+                body["classification"] = json!(c.wire(target));
+            }
+            if let Some(d) = input.determination {
+                body["determination"] = json!(d.wire(target));
+            }
+            if let Some(cm) = &input.comment {
+                body["comment"] = json!(cm);
+            }
+
+            return self.execute_mutation(MutationRequest {
+                tool: MutatingTool::Triage,
+                action,
+                category: PermissionCategory::Triage,
+                targets,
+                parameters: params,
+                justification: input.justification.as_deref(),
+                validation_result: combined_val,
+                context: &context,
+                extract_tracking: |_| (None, None),
+                upstream: || async move {
+                    let _ = self.endpoint
+                        .endpoint_post_as("/api/alerts/batchUpdate", &body, PermissionCategory::Triage)
+                        .await?;
+                    Ok(MutationResponse {
+                        http_status: 200,
+                        body: json!({ "status": "ok", "count": count }),
+                    })
+                },
+            }).await;
+        }
+
+        let id = required(&input.id, "id", action)?;
+        let id_res = validation::validate_required_id(id, "id");
+        let id_str = id_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
+        let enc = validation::encode_path_segment(&id_str).to_string();
+        let is_incident = action.starts_with("xdr_incident");
+        let targets = if !id_str.is_empty() {
+            if is_incident {
+                vec![crate::audit::AuditTarget::incident_id(&id_str)]
+            } else {
+                vec![crate::audit::AuditTarget::alert_id(&id_str)]
+            }
+        } else {
+            vec![]
+        };
+
+        let combined_val = match (val_res, id_res) {
+            (Ok(_), Ok(_)) => Ok(()),
+            (Err(e), _) => Err(e),
+            (_, Err(e)) => Err(crate::error::tool_error(e.message)),
+        };
+
+        let mut body = serde_json::Map::new();
+        if let Ok(Some(s)) = status_wire {
+            body.insert("status".to_string(), json!(s));
+        }
+        if let Some(a) = &input.assigned_to {
+            body.insert("assignedTo".to_string(), json!(a));
+        }
+        if let Some(c) = input.classification {
+            body.insert("classification".to_string(), json!(c.wire(target)));
+        }
+        if let Some(d) = input.determination {
+            body.insert("determination".to_string(), json!(d.wire(target)));
+        }
+        if let Some(cm) = &input.comment {
+            body.insert("comment".to_string(), json!(cm));
+        }
+        if let Some(tg) = &input.tags {
+            body.insert("customTags".to_string(), json!(tg));
+        }
+        if action == "xdr_alert_comment" || action == "xdr_incident_comment" {
+            body.insert("@odata.type".to_string(), json!("microsoft.graph.security.alertComment"));
+        }
+        let body_val = Value::Object(body);
+
+        let tracking_val = id_str.clone();
+        self.execute_mutation(MutationRequest {
+            tool: MutatingTool::Triage,
+            action,
+            category: PermissionCategory::Triage,
+            targets,
+            parameters: params,
+            justification: input.justification.as_deref(),
+            validation_result: combined_val,
+            context: &context,
+            extract_tracking: move |_| (Some(tracking_val), None),
+            upstream: || async move {
+                match action {
+                    "endpoint_alert_update" => {
+                        self.endpoint
+                            .endpoint_patch_as(&format!("/api/alerts/{enc}"), &body_val, PermissionCategory::Triage)
+                            .await
+                    }
+                    "endpoint_alert_comment" => {
+                        self.endpoint
+                            .endpoint_patch_as(&format!("/api/alerts/{enc}"), &body_val, PermissionCategory::Triage)
+                            .await
+                    }
+                    "xdr_alert_update" => {
+                        self.client
+                            .graph_patch_as(&format!("/security/alerts_v2/{enc}"), &body_val, PermissionCategory::Triage)
+                            .await
+                    }
+                    "xdr_alert_comment" => {
+                        self.client
+                            .graph_post_as(&format!("/security/alerts_v2/{enc}/comments"), &body_val, PermissionCategory::Triage)
+                            .await
+                            .map(|v| MutationResponse { http_status: 201, body: v })
+                    }
+                    "xdr_incident_update" => {
+                        self.client
+                            .graph_patch_as(&format!("/security/incidents/{enc}"), &body_val, PermissionCategory::Triage)
+                            .await
+                    }
+                    "xdr_incident_comment" => {
+                        self.client
+                            .graph_post_as(&format!("/security/incidents/{enc}/comments"), &body_val, PermissionCategory::Triage)
+                            .await
+                            .map(|v| MutationResponse { http_status: 201, body: v })
+                    }
+                    _ => unreachable!(),
+                }
+            },
+        }).await
+    }
+}
 
 #[tool_handler(
     router = self.router,
     name = "microsoft-defender-mcp",
-    version = "0.2.0",
     instructions = "Investigate Microsoft Defender through Microsoft Graph Security and Defender for Endpoint APIs. \
-                    Granular mode (default) exposes 88 tools: 86 read-only plus defender_library_file_upload and \
-                    defender_endpoint_live_response_run. Consolidated mode (--tool-mode consolidated) exposes 7 \
-                    action-based tools: defender_hunting, defender_ti, defender_incidents_alerts, defender_machines, \
-                    defender_vulnerabilities, defender_forensics (read-only; downloads forensic archives to the \
-                    local quarantine directory), and defender_response (mutating). Mutating tools change cloud \
-                    library files or endpoint state: clients must obtain explicit human approval before invoking \
-                    them; they require --enable-live-response and are hidden and rejected under --read-only. \
-                    --allowed-commands restricts Live Response command types only. Tool results preserve upstream \
-                    JSON; OData collections are objects with a value array and optional metadata, not flattened \
-                    arrays. Pagination is not followed automatically. Grant only the application permissions \
-                    documented for the chosen tool; some read-only APIs require legacy write-named scopes. HTTP \
-                    transport has no bundled client authentication: use an authenticated, trusted boundary for \
-                    remote access."
+                    Six read-only domain tools are always listed: defender_hunting, defender_ti, \
+                    defender_incidents_alerts, defender_machines, defender_vulnerabilities, and defender_forensics \
+                    (read-only; downloads forensic archives to the local quarantine directory). Each tool takes an \
+                    'action' parameter. Up to four mutating tools are listed only when their category is enabled: \
+                    defender_response (--enable-live-response), defender_device_response (--enable-device-response; \
+                    offboard also needs --enable-offboarding), defender_indicators (--enable-indicators), and \
+                    defender_triage (--enable-triage). --read-only hides and rejects every mutating tool. Destructive \
+                    tools ask the human user to confirm each call through an MCP elicitation prompt unless the server \
+                    was started with --disable-human-confirmation; defender_triage is not destructive and never \
+                    prompts. Every mutating attempt, including rejections, is recorded in an append-only local audit \
+                    log with the acting identity. --allowed-commands restricts Live Response command types only. \
+                    Authentication is app mode (service principal) by default; in user mode (--auth-mode user) the \
+                    signed-in user's own Defender rights apply and permission errors name the missing scope or role. \
+                    Tool results preserve upstream JSON; OData collections are objects with a value array and optional \
+                    metadata, not flattened arrays. Pagination is not followed automatically. HTTP transport has no \
+                    bundled client authentication: use an authenticated, trusted boundary for remote access."
 )]
 impl ServerHandler for DefenderServer {
     async fn call_tool(
@@ -4858,13 +5615,48 @@ impl ServerHandler for DefenderServer {
         request: CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        // Defense in depth: a hidden mutating tool invoked by name is rejected with a structured
-        // read-only violation before routing, so no upstream request is ever issued.
-        if MUTATING_TOOLS.contains(&request.name.as_ref())
-            && let Some(blocked) = self.read_only_barrier(&request.name)
+        let tool_name = request.name.as_ref();
+        if let Some(tool) = crate::cli::MutatingTool::from_name(tool_name)
+            && !self.router.has_route(tool_name)
         {
-            return Ok(blocked.into());
+            let attempt_id = new_attempt_id();
+            let (res, reason) = if self.config.read_only {
+                (crate::error::read_only_violation(tool_name), RejectReason::ReadOnly)
+            } else {
+                (
+                    crate::error::category_disabled(tool.enable_flag()),
+                    RejectReason::CategoryDisabled,
+                )
+            };
+
+            let rec = AuditRecord {
+                ts: chrono::Utc::now(),
+                attempt_id,
+                phase: AuditPhase::Final,
+                tool: tool_name.to_string(),
+                action: String::new(),
+                targets: vec![],
+                parameters: serde_json::Map::new(),
+                justification: None,
+                identity: self.identity(),
+                confirmation: ConfirmationOutcome::NotApplicable,
+                result: AuditResult::Rejected { reason },
+            };
+
+            if let Some(sink) = &self.audit_sink {
+                let _ = sink.append(&rec).await;
+            } else {
+                eprintln!(
+                    "AUDIT {} {}. targets=0 identity={} confirmation=not_applicable result=rejected",
+                    rec.ts.to_rfc3339(),
+                    rec.tool,
+                    rec.identity.display_summary(),
+                );
+            }
+
+            return Ok(res.into());
         }
+
         let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.router.call(context).await
     }
@@ -4913,7 +5705,7 @@ mod tests {
         TestServerGuard { base_url, handle }
     }
 
-    fn create_test_server(base_url: &str, live_response_enabled: bool) -> DefenderServer {
+    fn create_test_server(base_url: &str, live_response: bool) -> DefenderServer {
         let http = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(5))
@@ -4922,16 +5714,55 @@ mod tests {
         let tm = TokenManager::for_test(http);
         let graph = GraphClient::for_test(tm.clone(), base_url.to_string());
         let endpoint = EndpointClient::for_test(tm, base_url.to_string());
+        let categories = crate::cli::MutationCategories {
+            live_response,
+            ..Default::default()
+        };
         let config = crate::cli::ServerConfig {
             transport: crate::cli::TransportMode::Stdio,
             bind_address: "127.0.0.1:8000".to_string(),
-            tool_mode: crate::cli::ToolMode::Granular,
             read_only: false,
-            live_response_enabled,
+            categories,
             live_response_allowed_commands: None,
             quarantine_dir: std::path::PathBuf::from("./quarantine_artifacts"),
+            audit_log: crate::cli::AuditLogSetting::Default(std::path::PathBuf::from("./audit.jsonl")),
+            confirm_destructive: true,
+            auth: crate::cli::AuthConfig::App,
         };
-        DefenderServer::new_with_config(graph, endpoint, config)
+        DefenderServer::new_with_config(graph, endpoint, config, None)
+    }
+
+    async fn create_test_server_with_sink(base_url: &str, live_response: bool) -> (DefenderServer, rmcp::service::RequestContext<rmcp::RoleServer>) {
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("loopback reqwest client");
+        let tm = TokenManager::for_test(http);
+        let graph = GraphClient::for_test(tm.clone(), base_url.to_string());
+        let endpoint = EndpointClient::for_test(tm, base_url.to_string());
+        let categories = crate::cli::MutationCategories {
+            live_response,
+            ..Default::default()
+        };
+        let audit_path = std::env::temp_dir().join(format!("mcp_test_audit_{}.jsonl", crate::audit::new_attempt_id()));
+        let sink = AuditSink::open(&audit_path).await.expect("scratch sink");
+        let config = crate::cli::ServerConfig {
+            transport: crate::cli::TransportMode::Stdio,
+            bind_address: "127.0.0.1:8000".to_string(),
+            read_only: false,
+            categories,
+            live_response_allowed_commands: None,
+            quarantine_dir: std::path::PathBuf::from("./quarantine_artifacts"),
+            audit_log: crate::cli::AuditLogSetting::Explicit(audit_path),
+            confirm_destructive: false,
+            auth: crate::cli::AuthConfig::App,
+        };
+        let server = DefenderServer::new_with_config(graph, endpoint, config, Some(std::sync::Arc::new(sink)));
+        let (server_t, _client_t) = tokio::io::duplex(1024);
+        let running = rmcp::service::serve_directly(server.clone(), server_t, None);
+        let ctx = rmcp::service::RequestContext::new(rmcp::model::RequestId::Number(1), running.peer().clone());
+        (server, ctx)
     }
 
     #[tokio::test]
@@ -5042,47 +5873,65 @@ mod tests {
             }),
         );
         let guard = spawn_test_server(app).await;
-        let server = create_test_server(&guard.base_url, true);
+        let (server, ctx) = create_test_server_with_sink(&guard.base_url, true).await;
 
         let res = server
-            .defender_library_file_upload(Parameters(LiveResponseLibraryUploadInput {
-                file_name: "remediation.ps1".to_string(),
-                file_content: "Write-Output 'Scan'".to_string(),
-                description: "Scan C:/Logs\nand /var/log".to_string(),
-                parameters_description: None,
-                override_if_exists: Some(true),
-            }))
+            .defender_response(
+                ctx,
+                Parameters(ResponseInput {
+                    action: "upload_library_file".to_string(),
+                    file_name: Some("remediation.ps1".to_string()),
+                    file_content: Some("Write-Output 'Scan'".to_string()),
+                    description: Some("Scan C:/Logs\nand /var/log".to_string()),
+                    parameters_description: None,
+                    override_if_exists: Some(true),
+                    comment: Some("Upload justification min 10 chars".to_string()),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("upload call succeeded");
         let val = res.structured_content.as_ref().expect("structured content");
         assert_eq!(val["id"], "lib-1");
         assert_eq!(val["name"], "remediation.ps1");
 
+        let (server, ctx) = create_test_server_with_sink(&guard.base_url, true).await;
         let empty_res = server
-            .defender_library_file_upload(Parameters(LiveResponseLibraryUploadInput {
-                file_name: "empty.ps1".to_string(),
-                file_content: "".to_string(),
-                description: "Valid description".to_string(),
-                parameters_description: None,
-                override_if_exists: None,
-            }))
+            .defender_response(
+                ctx,
+                Parameters(ResponseInput {
+                    action: "upload_library_file".to_string(),
+                    file_name: Some("empty.ps1".to_string()),
+                    file_content: Some("".to_string()),
+                    description: Some("Valid description".to_string()),
+                    parameters_description: None,
+                    override_if_exists: None,
+                    comment: Some("Upload justification min 10 chars".to_string()),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("handled empty content");
         assert_eq!(empty_res.is_error, Some(true));
 
+        let (server, ctx) = create_test_server_with_sink(&guard.base_url, true).await;
         let bad_name = server
-            .defender_library_file_upload(Parameters(LiveResponseLibraryUploadInput {
-                file_name: "../escaped.ps1".to_string(),
-                file_content: "Write-Output 'test'".to_string(),
-                description: "Valid description".to_string(),
-                parameters_description: None,
-                override_if_exists: None,
-            }))
-            .await;
-        assert_eq!(
-            bad_name.unwrap_err().code,
-            rmcp::model::ErrorCode::INVALID_PARAMS
-        );
+            .defender_response(
+                ctx,
+                Parameters(ResponseInput {
+                    action: "upload_library_file".to_string(),
+                    file_name: Some("../escaped.ps1".to_string()),
+                    file_content: Some("Write-Output 'test'".to_string()),
+                    description: Some("Valid description".to_string()),
+                    parameters_description: None,
+                    override_if_exists: None,
+                    comment: Some("Upload justification min 10 chars".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("mutation handled error");
+        assert_eq!(bad_name.is_error, Some(true));
     }
 
     #[tokio::test]
@@ -5116,26 +5965,31 @@ mod tests {
             }),
         );
         let guard = spawn_test_server(app).await;
-        let server = create_test_server(&guard.base_url, true);
+        let (server, ctx) = create_test_server_with_sink(&guard.base_url, true).await;
 
         let res = server
-            .defender_endpoint_live_response_run(Parameters(LiveResponseRunInput {
-                machine_id: "dev-machine-01".to_string(),
-                commands: vec![LiveResponseCommand {
-                    cmd_type: LiveResponseCommandType::RunScript,
-                    params: vec![
-                        LiveResponseParam {
-                            key: "ScriptName".to_string(),
-                            value: "triage.ps1".to_string(),
-                        },
-                        LiveResponseParam {
-                            key: "Args".to_string(),
-                            value: "-Detailed".to_string(),
-                        },
-                    ],
-                }],
-                comment: "Live response triage for investigation".to_string(),
-            }))
+            .defender_response(
+                ctx,
+                Parameters(ResponseInput {
+                    action: "live_response_run".to_string(),
+                    machine_id: Some("dev-machine-01".to_string()),
+                    commands: Some(vec![LiveResponseCommand {
+                        cmd_type: LiveResponseCommandType::RunScript,
+                        params: vec![
+                            LiveResponseParam {
+                                key: "ScriptName".to_string(),
+                                value: "triage.ps1".to_string(),
+                            },
+                            LiveResponseParam {
+                                key: "Args".to_string(),
+                                value: "-Detailed".to_string(),
+                            },
+                        ],
+                    }]),
+                    comment: Some("Live response triage for investigation".to_string()),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("run call succeeded");
 

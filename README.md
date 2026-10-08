@@ -2,106 +2,153 @@
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for security investigation, threat intelligence, vulnerability management, and response workflows across Microsoft Defender XDR and Microsoft Defender for Endpoint (MDE).
 
-Built in Rust with the official [`rmcp`](https://crates.io/crates/rmcp) SDK (v3), the server exposes Microsoft Graph Security and Defender for Endpoint APIs in one of two catalogs:
+Built in Rust with the official [`rmcp`](https://crates.io/crates/rmcp) SDK (v3), the server exposes Microsoft Graph Security and Defender for Endpoint APIs through a domain-oriented catalog of up to 10 action-based tools:
 
-- **Granular mode** (default): **88 tools**, **86 read-only**. The two mutating tools—Live Response execution and library file upload—are disabled unless the server starts with `--enable-live-response`.
-- **Consolidated mode** (`--tool-mode consolidated`): **7 action-based tools** covering the same capabilities plus forensic artifact retrieval—6 read-only (`defender_hunting`, `defender_ti`, `defender_incidents_alerts`, `defender_machines`, `defender_vulnerabilities`, `defender_forensics`) and 1 mutating (`defender_response`).
+- **6 read-only tools** (always exposed): `defender_hunting`, `defender_ti`, `defender_incidents_alerts`, `defender_machines`, `defender_vulnerabilities`, `defender_forensics`.
+- **4 mutating tools** (disabled by default, gated by explicit category flags):
+  - `defender_response`: Live Response commands, library files, investigation packages, file quarantine (`--enable-live-response`).
+  - `defender_device_response`: device containment, scans, tags, machine actions (`--enable-device-response`); device offboarding additionally requires `--enable-offboarding`.
+  - `defender_indicators`: custom indicator management and batch operations (`--enable-indicators`).
+  - `defender_triage`: alert and incident status, classification, assignment, and comments (`--enable-triage`).
 
-`--read-only` hides every mutating tool from `tools/list` and rejects calls to them locally, before any upstream request.
+`--read-only` hides every mutating tool from `tools/list` and rejects calls locally before any upstream request.
 
 > **Security warning**
-> `defender_library_file_upload` changes the tenant's Live Response library. `defender_endpoint_live_response_run` can copy files to, execute scripts on, or retrieve files from managed endpoints. `defender_response` can additionally collect investigation packages and stop-and-quarantine files. MCP clients should require explicit human confirmation before invoking any of them.
-> `defender_forensics` downloads investigation packages and retrieved (potentially malicious) files to the local quarantine directory. Files are written with mode `0600` and never executed; analyze them only in an isolated environment.
-> The HTTP transport has no built-in TLS or client authentication. Binding beyond `127.0.0.1` requires an authenticated reverse proxy, VPN, or equivalent trusted network boundary.
-
+> Mutating response tools can isolate endpoints, terminate processes, modify firewall rules, run scripts, manage custom block indicators, and alter security alerts. Destructive tools require interactive human confirmation via MCP elicitation unless explicitly disabled for automated workflows (`--disable-human-confirmation`).
+> `defender_forensics` downloads investigation packages and retrieved files to the local quarantine directory. Files are written with mode `0600` and never executed; analyze them only in an isolated environment.
+> The HTTP transport has no built-in TLS or client authentication. Binding beyond `127.0.0.1` requires an authenticated reverse proxy, VPN, or equivalent trusted network boundary. Over HTTP in user authentication mode, all connected clients act with the signed-in user's privileges.
 ---
 
 ## Capabilities & Tool Summary
 
-The server implements **88 tools** partitioned across two upstream API scopes:
+The server implements **10 domain-oriented action tools** partitioned across two upstream API scopes:
 
 ```mermaid
 flowchart TD
     Client["MCP Client (LLM)"]
-    Server["microsoft-defender-mcp-server<br/>(in-memory OAuth2 token cache)"]
-    Graph["Microsoft Graph API<br/>(Advanced Hunting, TI, XDR)"]
-    MDE["Defender for Endpoint API<br/>(Machines, TVM, Alerts, Response)"]
+    Server["microsoft-defender-mcp-server<br/>(in-memory token cache)"]
+    Graph["Microsoft Graph API<br/>(Advanced Hunting, TI, XDR Alerts/Incidents/Triage)"]
+    MDE["Defender for Endpoint API<br/>(Machines, TVM, Alerts, Response, Indicators)"]
 
     Client -->|"MCP protocol (stdio / HTTP)"| Server
-    Server -->|"OAuth scope: https://graph.microsoft.com/.default"| Graph
-    Server -->|"OAuth scope: https://api.securitycenter.microsoft.com/.default"| MDE
+    Server -->|"Graph Scope / Delegated Scopes"| Graph
+    Server -->|"MDE Scope / Delegated Scopes"| MDE
 ```
 
-### Tool Inventory & Categorization (88 Tools)
+### Tool Catalog & Enablement Gating
 
-| Category / Domain | API Scope | Tools | Mode | Key Example Tools |
-| :--- | :--- | :---: | :---: | :--- |
-| **Advanced Hunting** | Graph Security | 1 | Read-Only | `defender_advanced_hunting_run` |
-| **Threat Intelligence: Actors & Profiles** | Defender TI (Graph) | 5 | Read-Only | `defender_ti_intel_profiles_list`, `defender_ti_intel_profile_indicators_list` |
-| **Threat Intelligence: Research Articles** | Defender TI (Graph) | 5 | Read-Only | `defender_ti_articles_list`, `defender_ti_article_indicators_list` |
-| **Threat Intelligence: Host Infrastructure** | Defender TI (Graph) | 20 | Read-Only | `defender_ti_host_get`, `defender_ti_host_reputation_get`, `defender_ti_host_ports_list`, `defender_ti_host_pairs_list` |
-| **Threat Intelligence: Global Entities** | Defender TI (Graph) | 6 | Read-Only | `defender_ti_ssl_certs_list`, `defender_ti_whois_records_list`, `defender_ti_passive_dns_get` |
-| **Threat Intelligence: Vulnerabilities (CVE)** | Defender TI (Graph) | 3 | Read-Only | `defender_ti_vulnerability_get`, `defender_ti_vulnerability_components_list` |
-| **XDR Incidents & Multi-Stage Alerts** | Graph Security v2 | 4 | Read-Only | `defender_xdr_incident_list`, `defender_xdr_incident_get`, `defender_xdr_alert_list` |
-| **Endpoint Inventory & Configuration** | Defender for Endpoint | 6 | Read-Only | `defender_endpoint_machine_list`, `defender_endpoint_machine_logged_on_users`, `defender_endpoint_machine_find_by_tag` |
-| **Software Inventory & Missing KBs** | Defender for Endpoint | 6 | Read-Only | `defender_endpoint_software_list`, `defender_endpoint_software_machines`, `defender_endpoint_software_missing_kbs` |
-| **Vulnerability Management (TVM)** | Defender for Endpoint | 4 | Read-Only | `defender_endpoint_vulnerability_list`, `defender_endpoint_vulnerability_get_machines` |
-| **Security Recommendations** | Defender for Endpoint | 5 | Read-Only | `defender_endpoint_recommendation_list`, `defender_endpoint_recommendation_machines` |
-| **Remediation Tasks & Status** | Defender for Endpoint | 3 | Read-Only | `defender_endpoint_remediation_list`, `defender_endpoint_remediation_exposed_devices` |
-| **Exposure & Risk Scoring** | Defender for Endpoint | 2 | Read-Only | `defender_endpoint_exposure_score`, `defender_endpoint_exposure_score_by_machine_groups` |
-| **Entity Statistics: IP & Domain** | Defender for Endpoint | 5 | Read-Only | `defender_endpoint_ip_statistics`, `defender_endpoint_domain_statistics`, `defender_endpoint_domain_related_machines` |
-| **Entity Statistics: Files & Prevalence** | Defender for Endpoint | 4 | Read-Only | `defender_endpoint_file_get`, `defender_endpoint_file_statistics`, `defender_endpoint_file_related_machines` |
-| **User Entity Context** | Defender for Endpoint | 2 | Read-Only | `defender_endpoint_user_related_alerts`, `defender_endpoint_user_related_machines` |
-| **Endpoint Alerts & Actions** | Defender for Endpoint | 4 | Read-Only | `defender_endpoint_alert_list`, `defender_endpoint_machine_action_get_status` |
-| **Live Response (Gated Inspection)** | Defender for Endpoint | 1 | Read-Only | `defender_endpoint_live_response_get_result` |
-| **Live Response & Library (Gated Mutations)** | Defender for Endpoint | 2 | **Mutation** | `defender_library_file_upload`, `defender_endpoint_live_response_run` |
-| **Total** | | **88** | **86 RO / 2 Mut** | |
+| # | Tool | Kind | Listed when | Annotations (`readOnly` / `destructive`) | Key Actions |
+|---|------|------|-------------|------------------------------------------|-------------|
+| 1 | `defender_hunting` | Read-only | Always | `true` / `false` | `run` (KQL queries) |
+| 2 | `defender_ti` | Read-only | Always | `true` / `false` | 39 TI lookups (profiles, articles, hosts, SSL, WHOIS, CVEs), plus `custom_indicator_list` |
+| 3 | `defender_incidents_alerts` | Read-only | Always | `true` / `false` | `xdr_alert_*`, `xdr_incident_*`, `endpoint_alert_*`, `*_related_alerts` |
+| 4 | `defender_machines` | Read-only | Always | `true` / `false` | `machine_*`, `find_by_tag`, `find_by_ip`, `machine_alerts`, `machine_vulnerabilities`, `machine_missing_kbs`, statistics |
+| 5 | `defender_vulnerabilities` | Read-only | Always | `true` / `false` | `software_*`, `vulnerability_*`, `recommendation_*`, `remediation_*`, `exposure_score` |
+| 6 | `defender_forensics` | Read-only | Always | `true` / `false` | `machine_action_*`, `get_investigation_package_sas_url`, `download_*`, `investigation_*`, `library_file_list`, `live_response_get_result` |
+| 7 | `defender_response` | Mutating | `--enable-live-response` | `false` / `true` | `collect_investigation_package`, `stop_and_quarantine_file`, `live_response_run`, `upload_library_file`, `library_file_delete` |
+| 8 | `defender_device_response` | Mutating | `--enable-device-response` | `false` / `true` | `isolate`, `unisolate`, `restrict_app_execution`, `unrestrict_app_execution`, `run_av_scan`, `start_investigation`, `cancel_machine_action`, `tag_add`, `tag_remove`, `set_device_value`, `offboard` (requires `--enable-offboarding`) |
+| 9 | `defender_indicators` | Mutating | `--enable-indicators` | `false` / `true` | `submit` (create/update), `delete`, `batch_delete` |
+| 10 | `defender_triage` | Mutating | `--enable-triage` | `false` / `false` | `endpoint_alert_update`, `endpoint_alert_batch_update`, `endpoint_alert_comment`, `xdr_alert_update`, `xdr_alert_comment`, `xdr_incident_update`, `xdr_incident_comment` |
+
+Under `--read-only`, tools 7–10 are hidden from `tools/list` and rejected locally.
 
 > **Authoritative Schemas:**
 > Every tool publishes its complete JSON schema, parameter constraints, and security annotations via the standard MCP `tools/list` protocol endpoint.
-
 ---
 
-## Prerequisites & Entra ID Permissions
+## Authentication & Entra ID Permissions
 
-Access requires a **Microsoft Entra ID (Azure AD)** Application Registration configured with an application password (client secret).
+The server supports two authentication modes via `--auth-mode <app|user>`:
 
-### Token Acquisition & Scopes
+1. **Application Authentication (`--auth-mode app`, default)**:
+   - Uses Entra ID OAuth 2.0 `client_credentials`.
+   - Requires `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET`.
+   - Requests audience scopes `{audience}/.default` (`https://graph.microsoft.com/.default` and `https://api.securitycenter.microsoft.com/.default`).
 
-The server utilizes the OAuth 2.0 `client_credentials` grant. Access tokens are cached in-memory per scope with an automated **60-second safety refresh buffer**:
-- **Microsoft Graph Scope:** `https://graph.microsoft.com/.default`
-- **Defender for Endpoint Scope:** `https://api.securitycenter.microsoft.com/.default`
+2. **Delegated User Sign-In (`--auth-mode user`)**:
+   - Uses interactive browser sign-in with PKCE (OAuth 2.0 authorization code flow) or device code flow fallback (`--sign-in-flow <auto|browser|device-code>`).
+   - Requires `AZURE_TENANT_ID` and `AZURE_CLIENT_ID`. `AZURE_CLIENT_SECRET` is **ignored and never read**.
+   - **Prerequisites for Public Client App Registration**:
+     - In Entra ID App Registrations, under **Authentication**, register a Mobile and desktop applications redirect URI: `http://localhost` (or enable "Allow public client flows" under Advanced settings).
+     - Grant admin consent or user consent for required delegated permissions.
+   - Performs sign-in at server startup before any MCP requests are accepted.
+   - Token scopes are requested dynamically based on enabled categories (under `--read-only`, no write-named scopes are requested).
+   - Tokens and refresh tokens are cached strictly in memory; no credential material is ever written to disk or the OS keychain.
+   - Refreshes tokens silently in the background before expiry using single-flight synchronization.
 
-No credentials or access tokens are ever written to persistent storage.
+> **Security Notice for HTTP Transport in User Mode:**
+> When using `--transport http` with `--auth-mode user`, every connected MCP client shares the single authenticated identity established at startup. For per-analyst attribution, run one server instance per analyst bound to localhost or isolated network namespaces.
 
-### Application Permissions Reference
+### Permission Matrix
 
-Following the principle of **least privilege**, grant only the application permissions required for the tool subsets your integration exercises. Application permissions require Entra ID administrator consent.
+| Category | Application Permission (`--auth-mode app`) | Delegated Scope (`--auth-mode user`) | Defender Role Permission (User Mode) |
+|---|---|---|---|
+| **Read (Endpoint)** | `Machine.Read.All`, `Alert.Read.All`, `Vulnerability.Read.All`, `Software.Read.All`, `SecurityRecommendation.Read.All`, `Score.Read.All`, `RemediationTasks.Read.All`, `User.Read.All` | Corresponding `*.Read` scopes, plus `User.Read.All` | View data |
+| **Read (Graph)** | `ThreatHunting.Read.All`, `ThreatIntelligence.Read.All`, `SecurityAlert.Read.All`, `SecurityIncident.Read.All` | Same names (delegated) | Entra Security Reader, or Defender Unified RBAC role with equivalent read |
+| **Reads Needing Write-Named Scopes** | `Machine.ReadWrite.All`, `Alert.ReadWrite.All`, `Ti.ReadWrite.All`, `Library.Manage` | `Machine.ReadWrite`, `Alert.ReadWrite`, `Ti.ReadWrite`, `Library.Manage` (not requested under `--read-only`) | View data |
+| **Live Response (`defender_response`)** | `Machine.LiveResponse`, `Machine.CollectForensics`, `Machine.StopAndQuarantine`, `Library.Manage` | Same names | Live response capabilities; Alerts investigation; Active remediation actions |
+| **Device Response (`defender_device_response`)** | `Machine.Isolate`, `Machine.RestrictExecution`, `Machine.Scan`, `Machine.ReadWrite.All`, `Alert.ReadWrite.All` | `Machine.Isolate`, `Machine.RestrictExecution`, `Machine.Scan`, `Machine.ReadWrite`, `Alert.ReadWrite` | Active remediation actions (isolate, restrict, scan, investigate); Manage security settings (tags, device value) |
+| **Offboarding (`defender_device_response` `offboard`)** | `Machine.Offboard` | `Machine.Offboard` | Turn off capabilities / offboard |
+| **Indicators (`defender_indicators`)** | `Ti.ReadWrite.All` | `Ti.ReadWrite` | Active remediation actions (manage indicators) |
+| **Triage (`defender_triage`)** | `Alert.ReadWrite.All`, `SecurityAlert.ReadWrite.All`, `SecurityIncident.ReadWrite.All` | `Alert.ReadWrite`, `SecurityAlert.ReadWrite.All`, `SecurityIncident.ReadWrite.All` | Alerts investigation; Entra Security Operator |
 
-| Upstream Service | Application Permission | Operations / Tools Covered |
-| :--- | :--- | :--- |
-| **Microsoft Graph** | `ThreatHunting.Read.All` | KQL Advanced Hunting (`defender_advanced_hunting_run`) |
-| **Microsoft Graph** | `ThreatIntelligence.Read.All` | Threat actor profiles, articles, host infrastructure, DNS, WHOIS, SSL certificates, CVEs *(Requires active Defender TI Portal & API add-on license)* |
-| **Microsoft Graph** | `SecurityAlert.Read.All` | Microsoft Defender XDR Alerts v2 (`defender_xdr_alert_list`, `defender_xdr_alert_get`) |
-| **Microsoft Graph** | `SecurityIncident.Read.All` | Microsoft Defender XDR Incidents (`defender_xdr_incident_list`, `defender_xdr_incident_get`) |
-| **Defender for Endpoint** | `Machine.Read.All` | Device inventory/details, machine tags, and machine-action status |
-| **Defender for Endpoint** | `User.Read.All` | Users observed on a machine |
-| **Defender for Endpoint** | `Software.Read.All` | Organizational and per-machine software inventory, distributions, and missing KBs |
-| **Defender for Endpoint** | `Vulnerability.Read.All` | Vulnerabilities, exposed machines, and recommendation-related CVEs |
-| **Defender for Endpoint** | `SecurityRecommendation.Read.All` | Security recommendations and their machine references |
-| **Defender for Endpoint** | `RemediationTasks.Read.All` | Remediation activities and exposed device lists |
-| **Defender for Endpoint** | `Score.Read.All` | Tenant and device-group exposure scores |
-| **Defender for Endpoint** | `Ip.Read.All` | IP communication statistics |
-| **Defender for Endpoint** | `URL.Read.All` | Domain prevalence and communication statistics |
-| **Defender for Endpoint** | `File.Read.All` | Global file reputation and organizational file prevalence |
-| **Defender for Endpoint** | `Alert.Read.All` | Endpoint alerts plus IP- and user-related alerts |
-| **Defender for Endpoint** | `Alert.ReadWrite.All` | Required by the upstream API for domain- and file-related alert queries; also accepted for IP/user alert queries |
-| **Defender for Endpoint** | `Machine.ReadWrite.All` | Required by the upstream API for domain-, file-, and user-related machine queries, Live Response result links, and investigation package download links (`getPackageUri`) |
-| **Defender for Endpoint** | `Machine.LiveResponse` | Live Response command execution (`defender_endpoint_live_response_run`, `defender_response` `live_response_run`) |
-| **Defender for Endpoint** | `Library.Manage` | Live Response library uploads (`defender_library_file_upload`, `defender_response` `upload_library_file`) |
-| **Defender for Endpoint** | `Machine.CollectForensics` | Investigation package collection (`defender_response` `collect_investigation_package`) |
-| **Defender for Endpoint** | `Machine.StopAndQuarantine` | Stop-and-quarantine (`defender_response` `stop_and_quarantine_file`) |
+### Per-Action Upstream Permission Requirements
 
+- **`defender_hunting`**:
+  - `run`: `ThreatHunting.Read.All` (Graph). Upstream limits: 100,000 rows, 50 MB payload, ~3-minute timeout.
+- **`defender_ti`**:
+  - Intel profiles, articles, host infrastructure, SSL certs, WHOIS, DNS, CVE vulnerabilities: `ThreatIntelligence.Read.All` (Graph; requires active Defender TI license).
+  - `custom_indicator_list`: `Ti.ReadWrite` (MDE). Not requested in user mode under `--read-only`.
+- **`defender_incidents_alerts`**:
+  - `xdr_alert_list`, `xdr_alert_get`: `SecurityAlert.Read.All` (Graph).
+  - `xdr_incident_list`, `xdr_incident_get`: `SecurityIncident.Read.All` (Graph).
+  - `endpoint_alert_list`, `endpoint_alert_get`, `ip_related_alerts`, `domain_related_alerts`, `user_related_alerts`: `Alert.Read.All` (MDE; `Alert.ReadWrite.All` also accepted).
+  - `file_related_alerts`: `Alert.ReadWrite.All` (MDE).
+- **`defender_machines`**:
+  - `machine_list`, `machine_get`, `find_by_tag`: `Machine.Read.All` (MDE).
+  - `logged_on_users`, `user_related_machines`: `User.Read.All` (MDE).
+  - `installed_software`: `Software.Read.All` (MDE).
+  - `security_recommendations`: `SecurityRecommendation.Read.All` (MDE).
+  - `find_by_ip`: `Machine.Read.All` (MDE). Accepts timestamps up to 30 days old.
+  - `machine_alerts`: `Alert.ReadWrite` / `Alert.ReadWrite.All` (MDE).
+  - `machine_vulnerabilities`: `Vulnerability.Read.All` (MDE).
+  - `machine_missing_kbs`: `Software.Read.All` (MDE).
+  - `ip_statistics`: `Ip.Read.All` (MDE).
+  - `domain_statistics`: `URL.Read.All` (MDE).
+  - `file_get`, `file_statistics`: `File.Read.All` (MDE).
+  - `domain_related_machines`, `file_related_machines`: `Machine.ReadWrite.All` (MDE).
+- **`defender_vulnerabilities`**:
+  - Software inventory and missing KBs: `Software.Read.All` (MDE).
+  - Vulnerabilities: `Vulnerability.Read.All` (MDE).
+  - Recommendations: `SecurityRecommendation.Read.All` (MDE).
+  - Remediation tasks: `RemediationTasks.Read.All` (MDE).
+  - Exposure score: `Score.Read.All` (MDE).
+- **`defender_forensics`**:
+  - `machine_action_list`, `machine_action_get_status`: `Machine.Read.All` (MDE).
+  - `get_investigation_package_sas_url`, `download_investigation_package`: `Machine.ReadWrite.All` (MDE).
+  - `download_quarantined_file`: `Machine.ReadWrite.All` / `Machine.LiveResponse` (MDE).
+  - `live_response_get_result`: `Machine.ReadWrite.All` or `Machine.LiveResponse` (MDE; requires Live Response enabled).
+  - `investigation_list`, `investigation_get`: `Alert.ReadWrite` / `Alert.ReadWrite.All` (MDE).
+  - `library_file_list`: `Library.Manage` (MDE).
+- **`defender_response`**:
+  - `collect_investigation_package`: `Machine.CollectForensics` (MDE).
+  - `stop_and_quarantine_file`: `Machine.StopAndQuarantine` (MDE).
+  - `live_response_run`: `Machine.LiveResponse` (MDE).
+  - `upload_library_file`, `library_file_delete`: `Library.Manage` (MDE).
+- **`defender_device_response`**:
+  - `isolate`, `unisolate`: `Machine.Isolate` (MDE).
+  - `restrict_app_execution`, `unrestrict_app_execution`: `Machine.RestrictExecution` (MDE).
+  - `run_av_scan`: `Machine.Scan` (MDE).
+  - `start_investigation`: `Alert.ReadWrite.All` (MDE).
+  - `cancel_machine_action`: `Machine.ReadWrite.All` (MDE).
+  - `tag_add`, `tag_remove`, `set_device_value`: `Machine.ReadWrite.All` (MDE).
+  - `offboard`: `Machine.Offboard` (MDE).
+- **`defender_indicators`**:
+  - `submit`, `delete`, `batch_delete`: `Ti.ReadWrite.All` / `Ti.ReadWrite` (MDE).
+- **`defender_triage`**:
+  - `endpoint_alert_update`, `endpoint_alert_batch_update`, `endpoint_alert_comment`: `Alert.ReadWrite.All` / `Alert.ReadWrite` (MDE).
+  - `xdr_alert_update`, `xdr_alert_comment`: `SecurityAlert.ReadWrite.All` (Graph).
+  - `xdr_incident_update`, `xdr_incident_comment`: `SecurityIncident.ReadWrite.All` (Graph).
 ---
 
 ## Installation & Build
@@ -144,28 +191,39 @@ target/release/microsoft-defender-mcp-server
 
 Credentials come from environment variables. Every server option is a CLI flag with an environment-variable fallback; a flag on the command line overrides its environment variable. Run `microsoft-defender-mcp-server --help` for the full list.
 
-| Variable | Required | Default | Description |
-| :--- | :---: | :---: | :--- |
-| `AZURE_TENANT_ID` | **Yes** | — | Microsoft Entra ID Directory (tenant) ID (GUID). |
-| `AZURE_CLIENT_ID` | **Yes** | — | Application (client) ID registered in Entra ID (GUID). |
-| `AZURE_CLIENT_SECRET` | **Yes** | — | Application client secret string. |
-| `RUST_LOG` | No | `info` | Tracing log level filter (e.g. `info`, `debug`, `warn`). |
+### Credential Environment Variables
+
+| Variable | `--auth-mode app` | `--auth-mode user` | Description |
+|---|:---:|:---:|---|
+| `AZURE_TENANT_ID` | **Required** | **Required** | Microsoft Entra ID Directory (tenant) ID (GUID or verified domain). |
+| `AZURE_CLIENT_ID` | **Required** | **Required** | Application (client) ID registered in Entra ID (GUID). |
+| `AZURE_CLIENT_SECRET` | **Required** | **Ignored** | Application client secret string. Ignored in user mode. |
+| `RUST_LOG` | Optional | Optional | Tracing log level filter (e.g. `info`, `debug`, `warn`; default: `info`). |
+
+### CLI Flags & Environment Variables
 
 | Flag | Environment variable | Default | Description |
-| :--- | :--- | :---: | :--- |
+|---|---|:---:|---|
 | `--transport <stdio\|http>` | `TRANSPORT` | `stdio` | MCP transport. |
 | `--bind-address <ADDR>` | `BIND_ADDRESS` | `127.0.0.1:8000` | Socket address for HTTP transport. A non-loopback address prints a security warning to `stderr`. |
-| `--tool-mode <granular\|consolidated>` | `DEFENDER_TOOL_MODE` | `granular` | Tool catalog: 88 granular tools or 7 action-based tools. |
-| `--read-only` | `DEFENDER_READ_ONLY` | `false` | Hide mutating tools from discovery and reject mutating calls locally. Overrides `--enable-live-response`. |
-| `--enable-live-response` | `DEFENDER_ENABLE_LIVE_RESPONSE` | `false` | Enable mutating tools/actions (Live Response, library upload, investigation package collection, stop-and-quarantine) and Live Response result links. |
-| `--allowed-commands <LIST>` | `DEFENDER_LIVE_RESPONSE_ALLOWED_COMMANDS` | *(all)* | Comma-separated Live Response command allowlist: `PutFile`, `RunScript`, `GetFile`. Restricts only Live Response runs. |
+| `--read-only` | `DEFENDER_READ_ONLY` | `false` | Hide all mutating tools from discovery and reject mutating calls locally. In user mode, requests only read scopes. Overrides all enablement flags. |
+| `--enable-live-response` | `DEFENDER_ENABLE_LIVE_RESPONSE` | `false` | Enable `defender_response` (Live Response, library file upload/delete, investigation packages, quarantine). |
+| `--allowed-commands <LIST>` | `DEFENDER_LIVE_RESPONSE_ALLOWED_COMMANDS` | *(all)* | Comma-separated Live Response command allowlist: `PutFile`, `RunScript`, `GetFile`. |
+| `--enable-device-response` | `DEFENDER_ENABLE_DEVICE_RESPONSE` | `false` | Enable `defender_device_response` (isolate, unisolate, restrict apps, scan, investigate, tags, device value). |
+| `--enable-offboarding` | `DEFENDER_ENABLE_OFFBOARDING` | `false` | Add `offboard` action to `defender_device_response` (requires `--enable-device-response`). |
+| `--enable-indicators` | `DEFENDER_ENABLE_INDICATORS` | `false` | Enable `defender_indicators` (submit, delete, batch_delete custom indicators). |
+| `--enable-triage` | `DEFENDER_ENABLE_TRIAGE` | `false` | Enable `defender_triage` (alert and incident updates and comments). |
+| `--disable-human-confirmation` | `DEFENDER_DISABLE_HUMAN_CONFIRMATION` | `false` | Skip interactive human confirmation prompt for destructive actions. Prints a startup warning and marks audit logs `turned_off`. |
+| `--audit-log <PATH>` | `DEFENDER_AUDIT_LOG` | *(per-user state dir)* | Path of the append-only JSON Lines mutation audit file. |
+| `--auth-mode <app\|user>` | `DEFENDER_AUTH_MODE` | `app` | Authentication mode: `app` (client credentials) or `user` (delegated sign-in). |
+| `--sign-in-flow <auto\|browser\|device-code>` | `DEFENDER_SIGN_IN_FLOW` | `auto` | Sign-in flow when `--auth-mode user` is selected. |
 | `--quarantine-dir <DIR>` | `DEFENDER_QUARANTINE_DIR` | `./quarantine_artifacts` | Where `defender_forensics` stages downloads (created with mode `0700`). |
 
 ### Testing & Development Overrides (Advanced)
 
 * `GRAPH_BASE_URL`: Overrides `https://graph.microsoft.com/v1.0` (used for mock server testing).
 * `DEFENDER_ENDPOINT_BASE_URL`: Overrides `https://api.securitycenter.microsoft.com` (used for mock server testing).
-
+* `DEFENDER_AUTHORITY_BASE_URL`: Overrides `https://login.microsoftonline.com` for token, devicecode, and authorize endpoints.
 ---
 
 ## Running the Server
@@ -250,16 +308,16 @@ Add the server to your MCP client configuration (e.g., `claude_desktop_config.js
 
 Enabling Live Response also enables library upload and result-link retrieval. The command allowlist narrows only Live Response runs; it is not an upload allowlist.
 
-### Consolidated, Read-Only Configuration
+### Read-Only Configuration
 
-Seven action-based tools, no mutating surface:
+Six domain tools, no mutating surface:
 
 ```json
 {
   "mcpServers": {
     "microsoft-defender": {
       "command": "/absolute/path/to/microsoft-defender-mcp/target/release/microsoft-defender-mcp-server",
-      "args": ["--tool-mode", "consolidated", "--read-only", "--quarantine-dir", "/secure/quarantine"],
+      "args": ["--read-only", "--quarantine-dir", "/secure/quarantine"],
       "env": {
         "AZURE_TENANT_ID": "00000000-0000-0000-0000-000000000000",
         "AZURE_CLIENT_ID": "11111111-1111-1111-1111-111111111111",
@@ -270,34 +328,71 @@ Seven action-based tools, no mutating surface:
 }
 ```
 
-### Consolidated Tool Catalog
+### Delegated User Sign-In Configuration
 
-Each consolidated tool takes an `action` plus the parameters of the corresponding granular tool (`id` stands in for the action's identifier). Unknown actions and parameters an action does not support are rejected with `invalid_params`, which lists the valid actions. The full action list and parameters are in each tool's description and JSON schema.
-
-| Tool | Annotations | Actions |
-| :--- | :--- | :--- |
-| `defender_hunting` | read-only | `run` |
-| `defender_ti` | read-only | 39 actions mirroring every `defender_ti_*` tool (profiles, articles, indicators, hosts, SSL, WHOIS, passive DNS, CVEs) |
-| `defender_incidents_alerts` | read-only | `xdr_alert_list/get`, `xdr_incident_list/get`, `endpoint_alert_list/get`, `ip_/domain_/file_/user_related_alerts` |
-| `defender_machines` | read-only | `machine_list/get`, `logged_on_users`, `find_by_tag`, `installed_software`, `security_recommendations`, `ip_/domain_/file_statistics`, `domain_/file_/user_related_machines`, `file_get` |
-| `defender_vulnerabilities` | read-only | `software_*`, `vulnerability_*`, `recommendation_*`, `remediation_*`, `exposure_score`, `exposure_score_by_machine_groups` |
-| `defender_forensics` | read-only | `machine_action_list`, `machine_action_get_status`, `get_investigation_package_sas_url`, `download_investigation_package`, `download_quarantined_file`, `live_response_get_result` |
-| `defender_response` | **destructive** | `collect_investigation_package`, `stop_and_quarantine_file`, `live_response_run`, `upload_library_file` |
+```json
+{
+  "mcpServers": {
+    "microsoft-defender": {
+      "command": "/absolute/path/to/microsoft-defender-mcp/target/release/microsoft-defender-mcp-server",
+      "args": ["--auth-mode", "user", "--sign-in-flow", "auto"],
+      "env": {
+        "AZURE_TENANT_ID": "00000000-0000-0000-0000-000000000000",
+        "AZURE_CLIENT_ID": "11111111-1111-1111-1111-111111111111"
+      }
+    }
+  }
+}
+```
 
 ---
+
+## Human Confirmation & Mutation Safety
+
+### MCP Elicitation for Destructive Tools
+
+Every destructive tool action requires explicit operator approval before dispatching any request upstream:
+- **Protected Tools**: `defender_response`, `defender_device_response`, and `defender_indicators`.
+- **Non-Destructive Tool**: `defender_triage` actions update triage metadata and comments and do not trigger confirmation prompts.
+- **Interaction Protocol**: The server issues an MCP `Form` elicitation request displaying the tool, action, target identifiers, and justification reason. Only an explicit user acceptance (`confirm: true`) proceeds.
+- **Failure Handling**: If the MCP client lacks elicitation support, or the user declines, cancels, or times out (300 s), the call is rejected locally.
+- **Automated Pipelines**: To run without human prompts in trusted automation, pass `--disable-human-confirmation` (`DEFENDER_DISABLE_HUMAN_CONFIRMATION=true`). A startup warning is printed to `stderr` and audit records record `confirmation: "turned_off"`.
+
+---
+
+## Mutation Audit Logging
+
+Every mutating attempt is recorded in an append-only JSON Lines (`.jsonl`) audit file:
+
+### Path Resolution
+The audit log path is determined in order:
+1. CLI flag `--audit-log <PATH>` or environment variable `DEFENDER_AUDIT_LOG`.
+2. Unix: `$XDG_STATE_HOME/microsoft-defender-mcp/audit.jsonl`.
+3. Unix fallback: `$HOME/.local/state/microsoft-defender-mcp/audit.jsonl`.
+4. Windows: `%LOCALAPPDATA%\microsoft-defender-mcp\audit.jsonl`.
+5. Default fallback: `./microsoft-defender-mcp-audit.jsonl`.
+
+The parent directory is created with permissions `0700` and the audit file is opened/created with permissions `0600` (user read/write only).
+
+### Fail-Closed Behavior
+- Before any upstream request is made, an `intent` record is flushed to disk. If writing fails, the call is immediately rejected with `audit_unavailable` and no upstream call is dispatched.
+- After the upstream response returns, an `outcome` record is appended.
+- Calls rejected locally (due to validation, read-only enforcement, or declined confirmation) produce a single `final` record.
+- Under no circumstances are tokens, client secrets, auth codes, device codes, or PKCE verifiers logged.
 
 ## Key Tool Call Examples
 
 The following objects are the `params` portion of MCP `tools/call` requests. Tool responses use structured JSON.
 
-### 1. Advanced Hunting (`defender_advanced_hunting_run`)
+### 1. Advanced Hunting (`defender_hunting`, action `run`)
 
 Executes read-only KQL queries across Microsoft Defender XDR unified event tables (`DeviceProcessEvents`, `DeviceNetworkEvents`, `EmailEvents`, `IdentityLogonEvents`, etc.).
 
 ```json
 {
-  "name": "defender_advanced_hunting_run",
+  "name": "defender_hunting",
   "arguments": {
+    "action": "run",
     "query": "DeviceProcessEvents | where Timestamp > ago(7d) | where FileName =~ 'powershell.exe' | project Timestamp, DeviceName, AccountName, ProcessCommandLine | take 50",
     "timespan": "P7D"
   }
@@ -307,14 +402,15 @@ Executes read-only KQL queries across Microsoft Defender XDR unified event table
 - **Timespan:** Defaults to `P30D` (30 days). Accepts ISO 8601 duration/interval representations (e.g., `P7D`, `P90D`, or explicit start/end ISO intervals). Queryable history depends on tenant event retention policies.
 - **Client Limits:** Queries are locally validated (non-empty, <= 128 KB, cannot begin with management dot `.`). Upstream limits enforce a maximum of 100,000 rows, 50 MB response payload, and approximately 3-minute execution limit. The server HTTP client uses a 210-second timeout to accommodate long-running analytical queries.
 
-### 2. XDR Incidents Listing (`defender_xdr_incident_list`)
+### 2. XDR Incidents Listing (`defender_incidents_alerts`, action `xdr_incident_list`)
 
 Retrieves correlated security incidents aggregating signals across Identity, Endpoint, Cloud Apps, and Email.
 
 ```json
 {
-  "name": "defender_xdr_incident_list",
+  "name": "defender_incidents_alerts",
   "arguments": {
+    "action": "xdr_incident_list",
     "filter": "severity eq 'high' and status eq 'active'",
     "top": 25,
     "skip": 0
@@ -322,14 +418,15 @@ Retrieves correlated security incidents aggregating signals across Identity, End
 }
 ```
 
-### 3. Device Software Inventory (`defender_endpoint_machine_list_software`)
+### 3. Device Software Inventory (`defender_machines`, action `installed_software`)
 
 Lists installed software applications and versions discovered on an enrolled endpoint device.
 
 ```json
 {
-  "name": "defender_endpoint_machine_list_software",
+  "name": "defender_machines",
   "arguments": {
+    "action": "installed_software",
     "machine_id": "1e50020e54d31e974e64f8c14828114be2880017"
   }
 }
@@ -338,15 +435,16 @@ Lists installed software applications and versions discovered on an enrolled end
 ### 4. Live Response: Script Upload & Session (Gated Mutation)
 
 > **Human Authorization Required:**
-> Mutating actions must be confirmed by the human operator. Live Response operations require `DEFENDER_ENABLE_LIVE_RESPONSE=true`.
+> `defender_response` is listed only with `--enable-live-response` (`DEFENDER_ENABLE_LIVE_RESPONSE=true`). Each call asks the human user to confirm through an MCP elicitation prompt unless the server runs with `--disable-human-confirmation`.
 
-#### Step A: Upload File to Library (`defender_library_file_upload`)
+#### Step A: Upload File to Library (`defender_response`, action `upload_library_file`)
 Uploads a script to the shared Defender for Endpoint Live Response library.
 
 ```json
 {
-  "name": "defender_library_file_upload",
+  "name": "defender_response",
   "arguments": {
+    "action": "upload_library_file",
     "file_name": "collect_triage.ps1",
     "file_content": "Get-Process | Export-Csv -Path C:\\temp\\processes.csv -NoTypeInformation",
     "description": "Triage script for incident response process collection",
@@ -355,15 +453,16 @@ Uploads a script to the shared Defender for Endpoint Live Response library.
   }
 }
 ```
-*Validation:* `file_name` must be a bare basename without directory separators. File content must be valid UTF-8 up to 20 MiB.
+*Validation:* `file_name` must be a bare basename without directory separators. File content must be valid UTF-8 up to 20 MiB. `description` doubles as the audited justification for this action, so it must contain at least 10 characters after trimming.
 
-#### Step B: Execute Live Response Session (`defender_endpoint_live_response_run`)
+#### Step B: Execute Live Response Session (`defender_response`, action `live_response_run`)
 Dispatches ordered remediation commands to an active machine.
 
 ```json
 {
-  "name": "defender_endpoint_live_response_run",
+  "name": "defender_response",
   "arguments": {
+    "action": "live_response_run",
     "machine_id": "1e50020e54d31e974e64f8c14828114be2880017",
     "comment": "Executing forensic process collection for incident INC-10492",
     "commands": [
@@ -385,13 +484,14 @@ Dispatches ordered remediation commands to an active machine.
 ```
 *Validation:* `commands` supports up to 20 ordered items. `comment` must contain at least 10 Unicode characters after trimming leading and trailing whitespace. If the target device is offline, commands can remain queued by the upstream service for up to 2 hours.
 
-#### Step C: Download Command Result Link (`defender_endpoint_live_response_get_result`)
+#### Step C: Download Command Result Link (`defender_forensics`, action `live_response_get_result`)
 Fetches the SAS download URL for the output of a completed `RunScript` or `GetFile` command.
 
 ```json
 {
-  "name": "defender_endpoint_live_response_get_result",
+  "name": "defender_forensics",
   "arguments": {
+    "action": "live_response_get_result",
     "action_id": "3b2e7a10-4491-4d3f-912a-8c011e4bf312",
     "command_index": 1
   }
@@ -399,7 +499,7 @@ Fetches the SAS download URL for the output of a completed `RunScript` or `GetFi
 ```
 *Validation:* `command_index` must be zero or positive (`>= 0`).
 
-### 5. Forensic Artifact Retrieval (Consolidated Mode)
+### 5. Forensic Artifact Retrieval
 
 Collect an investigation package (mutating; requires `--enable-live-response` and human approval), poll the action, then stage the archive locally:
 
@@ -476,12 +576,118 @@ The test matrix exercises:
 - OData serialization and Graph/MDE parameter bounds.
 - RFC 3986 path-segment encoding and traversal defenses.
 - KQL, IP, hostname, hash, filename, and Unicode-boundary validation.
-- Live Response gating, typed commands, command allowlists, and result indices.
+- Mutation category gating (`live_response`, `device_response`, `offboarding`, `indicators`, `triage`).
+- Interactive human confirmation via MCP elicitation and `--disable-human-confirmation`.
+- Append-only mutation audit logging, mode 0600 file creation, and fail-closed guarantees.
+- Delegated user sign-in: PKCE browser flow, device code flow, in-memory token cache, single-flight renewal.
 - Upstream success parsing and HTTP error-status preservation through real loopback requests.
-- Granular (88) and consolidated (7) catalogs and their exact safety annotations; routing of every advertised consolidated action.
-- `--read-only` enforcement end to end over MCP stdio against the real binary: mutating tools hidden and rejected with `read_only_violation`.
+- Domain catalog tool surface (6 read-only, up to 10 total) and their exact safety annotations.
+- `--read-only` enforcement end to end over MCP stdio: mutating tools hidden and rejected with `read_only_violation`.
 - CLI flags, environment fallbacks, and flag-over-environment precedence.
 - Forensic staging: `0700`/`0600` permissions, SHA-256 digests, package-not-ready reporting, and quarantine-directory confinement.
+---
+
+## Migrating from 0.x
+
+**Breaking change.** Release 1.0.0 removes granular mode, the `--tool-mode` flag, and the `DEFENDER_TOOL_MODE` variable.
+
+- A client that calls any removed granular tool name gets the standard MCP unknown-tool error. No alias or redirect exists.
+- Each capability is reached by calling the domain tool with the listed `action`.
+- The response payload is the same upstream JSON that the granular tool returned.
+
+### Granular Tool Migration Table
+
+| Removed granular tool | Domain tool | `action` |
+|-----------------------|-------------|----------|
+| `defender_advanced_hunting_run` | `defender_hunting` | `run` |
+| `defender_ti_intel_profiles_list` | `defender_ti` | `intel_profiles_list` |
+| `defender_ti_intel_profile_get` | `defender_ti` | `intel_profile_get` |
+| `defender_ti_intel_profile_indicators_list` | `defender_ti` | `intel_profile_indicators_list` |
+| `defender_ti_intel_profile_indicator_get` | `defender_ti` | `intel_profile_indicator_get` |
+| `defender_ti_intel_profile_indicators_global_list` | `defender_ti` | `intel_profile_indicators_global_list` |
+| `defender_ti_articles_list` | `defender_ti` | `articles_list` |
+| `defender_ti_article_get` | `defender_ti` | `article_get` |
+| `defender_ti_article_indicators_list` | `defender_ti` | `article_indicators_list` |
+| `defender_ti_article_indicator_get` | `defender_ti` | `article_indicator_get` |
+| `defender_ti_article_indicators_global_list` | `defender_ti` | `article_indicators_global_list` |
+| `defender_ti_host_get` | `defender_ti` | `host_get` |
+| `defender_ti_host_reputation_get` | `defender_ti` | `host_reputation_get` |
+| `defender_ti_host_components_list` | `defender_ti` | `host_components_list` |
+| `defender_ti_host_component_get` | `defender_ti` | `host_component_get` |
+| `defender_ti_host_cookies_list` | `defender_ti` | `host_cookies_list` |
+| `defender_ti_host_cookie_get` | `defender_ti` | `host_cookie_get` |
+| `defender_ti_host_ports_list` | `defender_ti` | `host_ports_list` |
+| `defender_ti_host_port_get` | `defender_ti` | `host_port_get` |
+| `defender_ti_host_trackers_list` | `defender_ti` | `host_trackers_list` |
+| `defender_ti_host_tracker_get` | `defender_ti` | `host_tracker_get` |
+| `defender_ti_host_subdomains_list` | `defender_ti` | `host_subdomains_list` |
+| `defender_ti_host_ssl_certs_list` | `defender_ti` | `host_ssl_certs_list` |
+| `defender_ti_host_whois_get` | `defender_ti` | `host_whois_get` |
+| `defender_ti_host_whois_history_list` | `defender_ti` | `host_whois_history_list` |
+| `defender_ti_host_pairs_list` | `defender_ti` | `host_pairs_list` |
+| `defender_ti_host_pair_get` | `defender_ti` | `host_pair_get` |
+| `defender_ti_host_child_pairs_list` | `defender_ti` | `host_child_pairs_list` |
+| `defender_ti_host_parent_pairs_list` | `defender_ti` | `host_parent_pairs_list` |
+| `defender_ti_host_passive_dns_list` | `defender_ti` | `host_passive_dns_list` |
+| `defender_ti_host_passive_dns_reverse_list` | `defender_ti` | `host_passive_dns_reverse_list` |
+| `defender_ti_ssl_certs_list` | `defender_ti` | `ssl_certs_list` |
+| `defender_ti_ssl_cert_get` | `defender_ti` | `ssl_cert_get` |
+| `defender_ti_ssl_cert_related_hosts_list` | `defender_ti` | `ssl_cert_related_hosts_list` |
+| `defender_ti_whois_records_list` | `defender_ti` | `whois_records_list` |
+| `defender_ti_whois_record_get` | `defender_ti` | `whois_record_get` |
+| `defender_ti_passive_dns_get` | `defender_ti` | `passive_dns_get` |
+| `defender_ti_vulnerability_get` | `defender_ti` | `vulnerability_get` |
+| `defender_ti_vulnerability_components_list` | `defender_ti` | `vulnerability_components_list` |
+| `defender_ti_vulnerability_component_get` | `defender_ti` | `vulnerability_component_get` |
+| `defender_endpoint_machine_list` | `defender_machines` | `machine_list` |
+| `defender_endpoint_machine_get` | `defender_machines` | `machine_get` |
+| `defender_endpoint_machine_logged_on_users` | `defender_machines` | `logged_on_users` |
+| `defender_endpoint_machine_find_by_tag` | `defender_machines` | `find_by_tag` |
+| `defender_endpoint_machine_list_software` | `defender_machines` | `installed_software` |
+| `defender_endpoint_machine_security_recommendations` | `defender_machines` | `security_recommendations` |
+| `defender_endpoint_software_list` | `defender_vulnerabilities` | `software_list` |
+| `defender_endpoint_software_get` | `defender_vulnerabilities` | `software_get` |
+| `defender_endpoint_software_machines` | `defender_vulnerabilities` | `software_machines` |
+| `defender_endpoint_software_vulnerabilities` | `defender_vulnerabilities` | `software_vulnerabilities` |
+| `defender_endpoint_software_missing_kbs` | `defender_vulnerabilities` | `software_missing_kbs` |
+| `defender_endpoint_software_distribution` | `defender_vulnerabilities` | `software_distribution` |
+| `defender_endpoint_vulnerability_list` | `defender_vulnerabilities` | `vulnerability_list` |
+| `defender_endpoint_vulnerability_get_by_cve` | `defender_vulnerabilities` | `vulnerability_get_by_cve` |
+| `defender_endpoint_vulnerability_get_machines` | `defender_vulnerabilities` | `vulnerability_get_machines` |
+| `defender_endpoint_vulnerability_get_by_machine_software` | `defender_vulnerabilities` | `vulnerability_get_by_machine_software` |
+| `defender_endpoint_recommendation_list` | `defender_vulnerabilities` | `recommendation_list` |
+| `defender_endpoint_recommendation_get` | `defender_vulnerabilities` | `recommendation_get` |
+| `defender_endpoint_recommendation_machines` | `defender_vulnerabilities` | `recommendation_machines` |
+| `defender_endpoint_recommendation_vulnerabilities` | `defender_vulnerabilities` | `recommendation_vulnerabilities` |
+| `defender_endpoint_recommendation_by_software` | `defender_vulnerabilities` | `recommendation_by_software` |
+| `defender_endpoint_remediation_list` | `defender_vulnerabilities` | `remediation_list` |
+| `defender_endpoint_remediation_get` | `defender_vulnerabilities` | `remediation_get` |
+| `defender_endpoint_remediation_exposed_devices` | `defender_vulnerabilities` | `remediation_exposed_devices` |
+| `defender_endpoint_exposure_score` | `defender_vulnerabilities` | `exposure_score` |
+| `defender_endpoint_exposure_score_by_machine_groups` | `defender_vulnerabilities` | `exposure_score_by_machine_groups` |
+| `defender_endpoint_ip_statistics` | `defender_machines` | `ip_statistics` |
+| `defender_endpoint_ip_related_alerts` | `defender_incidents_alerts` | `ip_related_alerts` |
+| `defender_endpoint_domain_statistics` | `defender_machines` | `domain_statistics` |
+| `defender_endpoint_domain_related_machines` | `defender_machines` | `domain_related_machines` |
+| `defender_endpoint_domain_related_alerts` | `defender_incidents_alerts` | `domain_related_alerts` |
+| `defender_endpoint_file_get` | `defender_machines` | `file_get` |
+| `defender_endpoint_file_statistics` | `defender_machines` | `file_statistics` |
+| `defender_endpoint_file_related_machines` | `defender_machines` | `file_related_machines` |
+| `defender_endpoint_file_related_alerts` | `defender_incidents_alerts` | `file_related_alerts` |
+| `defender_endpoint_user_related_alerts` | `defender_incidents_alerts` | `user_related_alerts` |
+| `defender_endpoint_user_related_machines` | `defender_machines` | `user_related_machines` |
+| `defender_endpoint_alert_list` | `defender_incidents_alerts` | `endpoint_alert_list` |
+| `defender_endpoint_alert_get` | `defender_incidents_alerts` | `endpoint_alert_get` |
+| `defender_endpoint_machine_action_list` | `defender_forensics` | `machine_action_list` |
+| `defender_endpoint_machine_action_get_status` | `defender_forensics` | `machine_action_get_status` |
+| `defender_xdr_alert_list` | `defender_incidents_alerts` | `xdr_alert_list` |
+| `defender_xdr_alert_get` | `defender_incidents_alerts` | `xdr_alert_get` |
+| `defender_xdr_incident_list` | `defender_incidents_alerts` | `xdr_incident_list` |
+| `defender_xdr_incident_get` | `defender_incidents_alerts` | `xdr_incident_get` |
+| `defender_library_file_upload` | `defender_response` | `upload_library_file` |
+| `defender_endpoint_live_response_run` | `defender_response` | `live_response_run` |
+| `defender_endpoint_live_response_get_result` | `defender_forensics` | `live_response_get_result` |
+
 
 ---
 

@@ -4,9 +4,9 @@
 mod common;
 
 use axum::{Json, Router, extract::Request};
-use common::{ScratchDir, base_config, spawn_mock, test_server};
-use microsoft_defender_mcp_server::cli::{ServerConfig, ToolMode};
-use microsoft_defender_mcp_server::server::{ForensicsInput, ResponseInput};
+use common::{McpProcess, ScratchDir, base_config, spawn_mock, test_server};
+use microsoft_defender_mcp_server::cli::{MutationCategories, ServerConfig};
+use microsoft_defender_mcp_server::server::ForensicsInput;
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::json;
 use std::sync::Arc;
@@ -27,10 +27,11 @@ fn counting_fixture(hits: Arc<AtomicUsize>) -> Router {
 
 fn read_only_config(quarantine: &ScratchDir) -> ServerConfig {
     ServerConfig {
-        tool_mode: ToolMode::Consolidated,
         read_only: true,
-        // Even if an operator also requested Live Response, read-only must win.
-        live_response_enabled: true,
+        categories: MutationCategories {
+            live_response: true,
+            ..MutationCategories::default()
+        },
         quarantine_dir: quarantine.0.clone(),
         ..base_config()
     }
@@ -40,29 +41,32 @@ fn read_only_config(quarantine: &ScratchDir) -> ServerConfig {
 async fn test_forensic_collection_rejected_under_read_only_with_zero_upstream_calls() {
     let hits = Arc::new(AtomicUsize::new(0));
     let mock = spawn_mock(counting_fixture(hits.clone())).await;
-    let quarantine = ScratchDir::new("ro-collect");
-    let server = test_server(&mock.base_url, read_only_config(&quarantine));
+    let mut server = McpProcess::start(
+        &["--read-only", "--enable-live-response"],
+        &[("DEFENDER_ENDPOINT_BASE_URL", &mock.base_url)],
+    );
 
     for action in ["collect_investigation_package", "stop_and_quarantine_file"] {
-        let res = server
-            .defender_response(Parameters(ResponseInput {
-                action: action.to_string(),
-                machine_id: Some(MACHINE.to_string()),
-                sha1: Some("87662bc3d60e4200ceaf7aae249d1c343f4b83c9".to_string()),
-                comment: Some("Incident 4124 triage collection".to_string()),
-                ..Default::default()
-            }))
-            .await
-            .expect("tool-level error");
+        let res = server.call_tool(
+            "defender_response",
+            json!({
+                "action": action,
+                "machine_id": MACHINE,
+                "sha1": "87662bc3d60e4200ceaf7aae249d1c343f4b83c9",
+                "comment": "Incident 4124 triage collection",
+            }),
+        );
 
-        assert_eq!(res.is_error, Some(true), "{action}");
+        let result = &res["result"];
+        assert_eq!(result["isError"], json!(true), "{action}");
         assert_eq!(
-            res.structured_content.expect("error body")["code"],
-            "read_only_violation",
+            result["structuredContent"]["code"],
+            json!("read_only_violation"),
             "{action}"
         );
     }
     assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert!(server.shutdown().success());
 }
 
 #[tokio::test]

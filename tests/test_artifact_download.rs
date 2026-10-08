@@ -9,7 +9,7 @@ use axum::{
     response::IntoResponse,
 };
 use common::{ScratchDir, base_config, spawn_mock, test_server};
-use microsoft_defender_mcp_server::cli::{ServerConfig, ToolMode};
+use microsoft_defender_mcp_server::cli::ServerConfig;
 use microsoft_defender_mcp_server::server::{DefenderServer, ForensicsInput};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::ErrorCode;
@@ -60,7 +60,6 @@ fn server(base_url: &str, quarantine: &ScratchDir) -> DefenderServer {
     test_server(
         base_url,
         ServerConfig {
-            tool_mode: ToolMode::Consolidated,
             quarantine_dir: quarantine.0.clone(),
             ..base_config()
         },
@@ -76,7 +75,13 @@ fn forensics(action: &str) -> ForensicsInput {
 }
 
 fn expected_sha256() -> String {
-    format!("{:x}", Sha256::digest(PAYLOAD))
+    use std::fmt::Write;
+    Sha256::digest(PAYLOAD)
+        .iter()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 #[tokio::test]

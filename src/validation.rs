@@ -8,6 +8,7 @@ use regex::Regex;
 
 use crate::constants::{ENDPOINT_MAX_TOP, MAX_SKIP, MAX_TOP};
 use crate::error::invalid_params;
+use crate::server::{Classification, Determination, IndicatorAction, IndicatorType};
 
 // Pre-compiled regexes
 static CVE_RE: LazyLock<Regex> =
@@ -169,10 +170,10 @@ pub fn validate_comment<'a>(
 ) -> Result<&'a str, rmcp::ErrorData> {
     let trimmed = comment.trim();
     let char_count = trimmed.chars().count();
-    if char_count < crate::constants::MIN_LIVE_RESPONSE_COMMENT_LEN {
+    if char_count < crate::constants::MIN_JUSTIFICATION_LEN {
         return Err(invalid_params(format!(
             "{field_name} must be at least {} characters describing the purpose (got {char_count})",
-            crate::constants::MIN_LIVE_RESPONSE_COMMENT_LEN
+            crate::constants::MIN_JUSTIFICATION_LEN
         )));
     }
     Ok(trimmed)
@@ -415,6 +416,272 @@ pub fn validate_live_response_commands(
     Ok(())
 }
 
+/// Validate a text parameter (non-empty, length <= max characters, no invalid control characters).
+///
+/// If `field` represents a comment or justification (e.g. `field == "comment"` or `field == "justification"`
+/// or ends with `_comment`/`_justification`), `\n`, `\r`, and `\t` are permitted.
+pub fn validate_text<'a>(
+    s: &'a str,
+    max: usize,
+    field: &str,
+) -> Result<&'a str, rmcp::ErrorData> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(invalid_params(format!("{field} cannot be empty")));
+    }
+    let char_count = trimmed.chars().count();
+    if char_count > max {
+        return Err(invalid_params(format!(
+            "{field} exceeds maximum length of {max} characters (got {char_count})"
+        )));
+    }
+    let allows_newlines = field == "comment"
+        || field == "justification"
+        || field.ends_with("_comment")
+        || field.ends_with("_justification");
+    let has_invalid_ctrl = if allows_newlines {
+        trimmed
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
+    } else {
+        trimmed.chars().any(|c| c.is_control())
+    };
+    if has_invalid_ctrl {
+        return Err(invalid_params(format!(
+            "{field} contains invalid control characters"
+        )));
+    }
+    Ok(trimmed)
+}
+
+/// Validate a batch of string IDs (length 1..=max, stating the limit, and each ID passing `validate_required_id`).
+pub fn validate_batch<T: AsRef<str>>(
+    ids: &[T],
+    max: usize,
+    field: &str,
+) -> Result<(), rmcp::ErrorData> {
+    if ids.is_empty() {
+        return Err(invalid_params(format!(
+            "{field} cannot be empty (must contain between 1 and {max} items)"
+        )));
+    }
+    if ids.len() > max {
+        return Err(invalid_params(format!(
+            "{field} exceeds maximum batch size of {max} items (got {}) (server policy)",
+            ids.len()
+        )));
+    }
+    for id in ids {
+        validate_required_id(id.as_ref(), field)?;
+    }
+    Ok(())
+}
+
+/// Validate a tag string (1..=200 chars, no control characters). Errors name `tag`.
+pub fn validate_tag(tag: &str) -> Result<&str, rmcp::ErrorData> {
+    let trimmed = tag.trim();
+    if trimmed.is_empty() {
+        return Err(invalid_params("tag cannot be empty"));
+    }
+    let count = trimmed.chars().count();
+    if count > 200 {
+        return Err(invalid_params(format!(
+            "tag exceeds maximum length of 200 characters (got {count})"
+        )));
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(invalid_params("tag contains invalid control characters"));
+    }
+    Ok(trimmed)
+}
+
+/// Validate that a string has exact hex length and contains only ASCII hex characters.
+pub fn validate_hex<'a>(s: &'a str, len: usize, field: &str) -> Result<&'a str, rmcp::ErrorData> {
+    let trimmed = s.trim();
+    if trimmed.len() != len || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(invalid_params(format!(
+            "{field} must be a {len}-character hex string, got '{trimmed}'"
+        )));
+    }
+    Ok(trimmed)
+}
+
+/// Validate a URL indicator (http/https scheme, host present). Errors name `indicator_value`.
+pub fn validate_url_indicator(s: &str) -> Result<&str, rmcp::ErrorData> {
+    let trimmed = s.trim();
+    let parsed = url::Url::parse(trimmed).map_err(|e| {
+        invalid_params(format!("indicator_value must be a valid URL: {e}"))
+    })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(invalid_params(format!(
+            "indicator_value URL must use http or https scheme, got '{}'",
+            parsed.scheme()
+        )));
+    }
+    let host = parsed.host_str().unwrap_or("");
+    if host.is_empty() {
+        return Err(invalid_params("indicator_value URL must include a host"));
+    }
+    Ok(trimmed)
+}
+
+/// Validate a domain indicator (valid hostname and not an IP literal). Errors name `indicator_value`.
+pub fn validate_domain_indicator(s: &str) -> Result<&str, rmcp::ErrorData> {
+    let trimmed = s.trim();
+    if trimmed.parse::<IpAddr>().is_ok() {
+        return Err(invalid_params(format!(
+            "indicator_value for DomainName must not be an IP address, got '{trimmed}'"
+        )));
+    }
+    validate_hostname(trimmed).map_err(|e| {
+        invalid_params(format!("indicator_value: {}", e.message))
+    })
+}
+
+/// Validate an indicator value based on indicator type. Errors name `indicator_value`.
+pub fn validate_indicator_value<'a>(
+    indicator_type: IndicatorType,
+    value: &'a str,
+) -> Result<&'a str, rmcp::ErrorData> {
+    match indicator_type {
+        IndicatorType::FileSha1 | IndicatorType::CertificateThumbprint => {
+            validate_hex(value, 40, "indicator_value")
+        }
+        IndicatorType::FileSha256 => validate_hex(value, 64, "indicator_value"),
+        IndicatorType::FileMd5 => validate_hex(value, 32, "indicator_value"),
+        IndicatorType::IpAddress => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(invalid_params("indicator_value cannot be empty"));
+            }
+            if trimmed.parse::<IpAddr>().is_err() {
+                return Err(invalid_params(format!(
+                    "indicator_value must be a valid IPv4 or IPv6 address, got '{trimmed}'"
+                )));
+            }
+            Ok(trimmed)
+        }
+        IndicatorType::DomainName => validate_domain_indicator(value),
+        IndicatorType::Url => validate_url_indicator(value),
+    }
+}
+
+/// Validate indicator action compatibility with type and alert generation. Errors name `indicator_action` / `generate_alert`.
+pub fn validate_indicator_action(
+    indicator_type: IndicatorType,
+    action: IndicatorAction,
+    generate_alert: Option<bool>,
+) -> Result<(), rmcp::ErrorData> {
+    match action {
+        IndicatorAction::BlockAndRemediate => {
+            let allowed = matches!(
+                indicator_type,
+                IndicatorType::FileSha1
+                    | IndicatorType::FileSha256
+                    | IndicatorType::FileMd5
+                    | IndicatorType::CertificateThumbprint
+            );
+            if !allowed {
+                return Err(invalid_params(format!(
+                    "indicator_action 'BlockAndRemediate' is only supported for file hashes and CertificateThumbprint, got {:?}",
+                    indicator_type
+                )));
+            }
+        }
+        IndicatorAction::Warn => {
+            let allowed = matches!(
+                indicator_type,
+                IndicatorType::IpAddress | IndicatorType::DomainName | IndicatorType::Url
+            );
+            if !allowed {
+                return Err(invalid_params(format!(
+                    "indicator_action 'Warn' is only supported for IpAddress, DomainName, and Url, got {:?}",
+                    indicator_type
+                )));
+            }
+        }
+        IndicatorAction::Audit => {
+            if generate_alert == Some(false) {
+                return Err(invalid_params(
+                    "generate_alert must be true or omitted when indicator_action is Audit"
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Validate that a string is a valid RFC 3339 timestamp strictly in the future. Errors name the field.
+pub fn validate_future_rfc3339(
+    s: &str,
+    field: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, rmcp::ErrorData> {
+    let trimmed = s.trim();
+    let dt = chrono::DateTime::parse_from_rfc3339(trimmed).map_err(|e| {
+        invalid_params(format!("{field} must be a valid RFC 3339 timestamp: {e}"))
+    })?;
+    let utc_dt = dt.with_timezone(&chrono::Utc);
+    if utc_dt <= chrono::Utc::now() {
+        return Err(invalid_params(format!(
+            "{field} must be in the future, got '{trimmed}'"
+        )));
+    }
+    Ok(utc_dt)
+}
+
+/// Validate a recent timestamp (must parse RFC 3339, now - max_age_days <= t <= now). Errors name `timestamp`.
+/// Returns the normalized UTC string `YYYY-MM-DDThh:mm:ssZ`.
+pub fn validate_recent_timestamp(s: &str, max_age_days: i64) -> Result<String, rmcp::ErrorData> {
+    let trimmed = s.trim();
+    let dt = chrono::DateTime::parse_from_rfc3339(trimmed).map_err(|e| {
+        invalid_params(format!("timestamp must be a valid RFC 3339 timestamp: {e}"))
+    })?;
+    let utc_dt = dt.with_timezone(&chrono::Utc);
+    let now = chrono::Utc::now();
+    if utc_dt > now {
+        return Err(invalid_params(
+            "timestamp cannot be in the future".to_string(),
+        ));
+    }
+    let min_dt = now - chrono::Duration::days(max_age_days);
+    if utc_dt < min_dt {
+        return Err(invalid_params(format!(
+            "timestamp cannot be older than {max_age_days} days, got '{trimmed}'"
+        )));
+    }
+    Ok(utc_dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+/// Validate a classification and determination pair per R-13. Errors name `determination`.
+pub fn validate_classification_pair(
+    classification: Option<Classification>,
+    determination: Option<Determination>,
+) -> Result<(), rmcp::ErrorData> {
+    match (classification, determination) {
+        (None, Some(_)) => {
+            Err(invalid_params("determination requires classification to be specified"))
+        }
+        (Some(c), Some(d)) => {
+            let allowed = Determination::allowed_for(c);
+            if !allowed.contains(&d) {
+                let valid_str = allowed
+                    .iter()
+                    .map(|item| item.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(invalid_params(format!(
+                    "determination '{}' is not valid for classification '{}'; valid: {}",
+                    d.as_str(),
+                    c.as_str(),
+                    valid_str
+                )));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -982,5 +1249,273 @@ mod tests {
         assert!(validate_action_id("../etc/passwd").is_err());
         assert!(validate_action_id("action/id").is_err());
         assert!(validate_action_id("action\\id").is_err());
+    }
+
+    #[test]
+    fn test_validate_text_boundaries() {
+        // Empty / whitespace
+        assert!(validate_text("", 10, "title").is_err());
+        assert!(validate_text("   ", 10, "title").is_err());
+
+        // Length boundaries
+        let exact = "1234567890";
+        assert_eq!(validate_text(exact, 10, "title").unwrap(), exact);
+        let too_long = "12345678901";
+        let err = validate_text(too_long, 10, "title").unwrap_err();
+        assert!(err.message.contains("title exceeds maximum length of 10"));
+
+        // Control characters: disallowed in generic text
+        assert!(validate_text("hello\nworld", 20, "title").is_err());
+        assert!(validate_text("hello\tworld", 20, "title").is_err());
+        assert!(validate_text("hello\0world", 20, "title").is_err());
+
+        // Control characters in comments: newlines and tabs allowed, NUL disallowed
+        assert_eq!(
+            validate_text("line1\nline2\ttab", 50, "comment").unwrap(),
+            "line1\nline2\ttab"
+        );
+        assert_eq!(
+            validate_text("justification\ntext", 50, "justification").unwrap(),
+            "justification\ntext"
+        );
+        assert!(validate_text("bad\0comment", 50, "comment").is_err());
+    }
+
+    #[test]
+    fn test_validate_batch_boundaries() {
+        // Empty batch
+        let empty: Vec<String> = vec![];
+        let err_empty = validate_batch(&empty, 3, "ids").unwrap_err();
+        assert!(err_empty.message.contains("ids cannot be empty"));
+        assert!(err_empty.message.contains("between 1 and 3"));
+
+        // Within limits
+        let one = vec!["id-1"];
+        assert!(validate_batch(&one, 3, "ids").is_ok());
+
+        let three = vec!["id-1", "id-2", "id-3"];
+        assert!(validate_batch(&three, 3, "ids").is_ok());
+
+        // Exceeds max
+        let four = vec!["id-1", "id-2", "id-3", "id-4"];
+        let err_four = validate_batch(&four, 3, "ids").unwrap_err();
+        assert!(err_four.message.contains("ids exceeds maximum batch size of 3 items (got 4)"));
+
+        // Invalid ID inside batch
+        let invalid_item = vec!["id-1", "..", "id-3"];
+        let err_item = validate_batch(&invalid_item, 3, "ids").unwrap_err();
+        assert!(err_item.message.contains("ids cannot be '.' or '..'"));
+
+        let empty_item = vec!["id-1", "   ", "id-3"];
+        let err_empty_item = validate_batch(&empty_item, 3, "ids").unwrap_err();
+        assert!(err_empty_item.message.contains("ids cannot be empty"));
+    }
+
+    #[test]
+    fn test_validate_tag() {
+        assert!(validate_tag("").is_err());
+        assert!(validate_tag("   ").is_err());
+        assert!(validate_tag("server-prod").is_ok());
+        assert_eq!(validate_tag("  tier-1  ").unwrap(), "tier-1");
+
+        let exact_200 = "a".repeat(200);
+        assert_eq!(validate_tag(&exact_200).unwrap(), exact_200.as_str());
+
+        let too_long = "a".repeat(201);
+        let err = validate_tag(&too_long).unwrap_err();
+        assert!(err.message.contains("tag exceeds maximum length of 200"));
+
+        let with_ctrl = "tag\nwith\tcontrol";
+        let err_ctrl = validate_tag(with_ctrl).unwrap_err();
+        assert!(err_ctrl.message.contains("tag contains invalid control characters"));
+    }
+
+    #[test]
+    fn test_validate_hex() {
+        let sha1 = "1234567890abcdef1234567890abcdef12345678";
+        assert_eq!(validate_hex(sha1, 40, "sha1").unwrap(), sha1);
+
+        // Short
+        let short = "1234567890abcdef1234567890abcdef1234567";
+        let err_short = validate_hex(short, 40, "sha1").unwrap_err();
+        assert!(err_short.message.contains("sha1 must be a 40-character hex string"));
+
+        // Non-hex
+        let non_hex = "1234567890abcdef1234567890abcdef1234567g";
+        let err_non_hex = validate_hex(non_hex, 40, "sha1").unwrap_err();
+        assert!(err_non_hex.message.contains("sha1 must be a 40-character hex string"));
+    }
+
+    #[test]
+    fn test_validate_url_indicator() {
+        assert!(validate_url_indicator("https://example.com/malware.exe").is_ok());
+        assert!(validate_url_indicator("http://example.com").is_ok());
+
+        // Non-http/https
+        let ftp = validate_url_indicator("ftp://example.com/file").unwrap_err();
+        assert!(ftp.message.contains("indicator_value URL must use http or https scheme"));
+
+        let no_host = validate_url_indicator("https://").unwrap_err();
+        assert!(no_host.message.contains("indicator_value"));
+        // Invalid URL
+        assert!(validate_url_indicator("not a url").is_err());
+    }
+
+    #[test]
+    fn test_validate_domain_indicator() {
+        assert!(validate_domain_indicator("example.com").is_ok());
+        assert!(validate_domain_indicator("sub.domain.co.uk").is_ok());
+
+        // IP literal rejected
+        let ip_err = validate_domain_indicator("192.168.1.1").unwrap_err();
+        assert!(ip_err.message.contains("indicator_value for DomainName must not be an IP address"));
+
+        let ipv6_err = validate_domain_indicator("::1").unwrap_err();
+        assert!(ipv6_err.message.contains("indicator_value for DomainName must not be an IP address"));
+
+        // Invalid hostname
+        assert!(validate_domain_indicator("http://example.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_indicator_value() {
+        let sha1 = "1234567890abcdef1234567890abcdef12345678";
+        assert!(validate_indicator_value(IndicatorType::FileSha1, sha1).is_ok());
+        assert!(validate_indicator_value(IndicatorType::CertificateThumbprint, sha1).is_ok());
+        assert!(validate_indicator_value(IndicatorType::FileSha1, "short").is_err());
+
+        let sha256 = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        assert!(validate_indicator_value(IndicatorType::FileSha256, sha256).is_ok());
+        assert!(validate_indicator_value(IndicatorType::FileSha256, sha1).is_err());
+
+        let md5 = "1234567890abcdef1234567890abcdef";
+        assert!(validate_indicator_value(IndicatorType::FileMd5, md5).is_ok());
+        assert!(validate_indicator_value(IndicatorType::FileMd5, sha1).is_err());
+
+        assert!(validate_indicator_value(IndicatorType::IpAddress, "192.168.1.1").is_ok());
+        assert!(validate_indicator_value(IndicatorType::IpAddress, "2001:db8::1").is_ok());
+        assert!(validate_indicator_value(IndicatorType::IpAddress, "999.999.999.999").is_err());
+
+        assert!(validate_indicator_value(IndicatorType::DomainName, "contoso.com").is_ok());
+        assert!(validate_indicator_value(IndicatorType::DomainName, "192.168.1.1").is_err());
+
+        assert!(validate_indicator_value(IndicatorType::Url, "https://contoso.com/evil").is_ok());
+        assert!(validate_indicator_value(IndicatorType::Url, "ftp://evil.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_indicator_action() {
+        // BlockAndRemediate
+        assert!(validate_indicator_action(IndicatorType::FileSha256, IndicatorAction::BlockAndRemediate, None).is_ok());
+        assert!(validate_indicator_action(IndicatorType::CertificateThumbprint, IndicatorAction::BlockAndRemediate, None).is_ok());
+        let bar_url = validate_indicator_action(IndicatorType::Url, IndicatorAction::BlockAndRemediate, None).unwrap_err();
+        assert!(bar_url.message.contains("BlockAndRemediate"));
+
+        // Warn
+        assert!(validate_indicator_action(IndicatorType::Url, IndicatorAction::Warn, None).is_ok());
+        assert!(validate_indicator_action(IndicatorType::DomainName, IndicatorAction::Warn, None).is_ok());
+        assert!(validate_indicator_action(IndicatorType::IpAddress, IndicatorAction::Warn, None).is_ok());
+        let warn_sha = validate_indicator_action(IndicatorType::FileSha256, IndicatorAction::Warn, None).unwrap_err();
+        assert!(warn_sha.message.contains("Warn"));
+
+        // Audit
+        assert!(validate_indicator_action(IndicatorType::FileSha256, IndicatorAction::Audit, None).is_ok());
+        assert!(validate_indicator_action(IndicatorType::FileSha256, IndicatorAction::Audit, Some(true)).is_ok());
+        let audit_false = validate_indicator_action(IndicatorType::FileSha256, IndicatorAction::Audit, Some(false)).unwrap_err();
+        assert!(audit_false.message.contains("generate_alert must be true"));
+    }
+
+    #[test]
+    fn test_indicator_action_deserialize_legacy_alert_and_block() {
+        let allowed: IndicatorAction = serde_json::from_str("\"Allowed\"").unwrap();
+        assert_eq!(allowed, IndicatorAction::Allowed);
+
+        let err_alert: Result<IndicatorAction, _> = serde_json::from_str("\"Alert\"");
+        let msg_alert = err_alert.unwrap_err().to_string();
+        assert!(msg_alert.contains("legacy, unsupported since January 2022"));
+
+        let err_both: Result<IndicatorAction, _> = serde_json::from_str("\"AlertAndBlock\"");
+        let msg_both = err_both.unwrap_err().to_string();
+        assert!(msg_both.contains("legacy, unsupported since January 2022"));
+    }
+
+    #[test]
+    fn test_validate_future_rfc3339() {
+        let future = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        assert!(validate_future_rfc3339(&future, "expiration_time").is_ok());
+
+        let past = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let err_past = validate_future_rfc3339(&past, "expiration_time").unwrap_err();
+        assert!(err_past.message.contains("expiration_time must be in the future"));
+
+        assert!(validate_future_rfc3339("not-a-date", "expiration_time").is_err());
+    }
+
+    #[test]
+    fn test_validate_recent_timestamp() {
+        let now = chrono::Utc::now();
+        let valid = (now - chrono::Duration::days(5)).to_rfc3339();
+        let res = validate_recent_timestamp(&valid, 30).unwrap();
+        assert!(res.ends_with('Z'));
+
+        let future = (now + chrono::Duration::minutes(5)).to_rfc3339();
+        let err_future = validate_recent_timestamp(&future, 30).unwrap_err();
+        assert!(err_future.message.contains("timestamp cannot be in the future"));
+
+        let old = (now - chrono::Duration::days(31)).to_rfc3339();
+        let err_old = validate_recent_timestamp(&old, 30).unwrap_err();
+        assert!(err_old.message.contains("timestamp cannot be older than 30 days"));
+    }
+
+    #[test]
+    fn test_validate_classification_pair() {
+        // determination without classification
+        let err_orphan = validate_classification_pair(None, Some(Determination::Malware)).unwrap_err();
+        assert!(err_orphan.message.contains("determination requires classification"));
+
+        // valid pair
+        assert!(validate_classification_pair(Some(Classification::TruePositive), Some(Determination::Malware)).is_ok());
+        assert!(validate_classification_pair(Some(Classification::FalsePositive), Some(Determination::NotMalicious)).is_ok());
+
+        // invalid pair with exact required format
+        let err_invalid = validate_classification_pair(Some(Classification::FalsePositive), Some(Determination::Malware)).unwrap_err();
+        assert_eq!(
+            err_invalid.message,
+            "determination 'malware' is not valid for classification 'falsePositive'; valid: notMalicious, notEnoughDataToValidate, other"
+        );
+    }
+
+    #[test]
+    fn test_triage_wire_spellings_per_target() {
+        use crate::server::TriageTarget;
+
+        // Determination wire spellings
+        assert_eq!(Determination::ConfirmedActivity.wire(TriageTarget::MdeAlertPatch), "ConfirmedActivity");
+        assert_eq!(Determination::ConfirmedActivity.wire(TriageTarget::MdeAlertBatch), "ConfirmedUserActivity");
+        assert_eq!(Determination::ConfirmedActivity.wire(TriageTarget::XdrAlert), "confirmedActivity");
+
+        assert_eq!(Determination::NotMalicious.wire(TriageTarget::MdeAlertPatch), "NotMalicious");
+        assert_eq!(Determination::NotMalicious.wire(TriageTarget::MdeAlertBatch), "Clean");
+        assert_eq!(Determination::NotMalicious.wire(TriageTarget::XdrAlert), "notMalicious");
+
+        assert_eq!(Determination::CompromisedAccount.wire(TriageTarget::MdeAlertPatch), "CompromisedUser");
+        assert_eq!(Determination::CompromisedAccount.wire(TriageTarget::MdeAlertBatch), "CompromisedUser");
+        assert_eq!(Determination::CompromisedAccount.wire(TriageTarget::XdrIncident), "compromisedAccount");
+
+        assert_eq!(Determination::NotEnoughDataToValidate.wire(TriageTarget::MdeAlertPatch), "InsufficientData");
+        assert_eq!(Determination::NotEnoughDataToValidate.wire(TriageTarget::MdeAlertBatch), "InsufficientData");
+        assert_eq!(Determination::NotEnoughDataToValidate.wire(TriageTarget::XdrAlert), "notEnoughDataToValidate");
+
+        // Classification wire spellings
+        assert_eq!(Classification::TruePositive.wire(TriageTarget::MdeAlertPatch), "TruePositive");
+        assert_eq!(Classification::TruePositive.wire(TriageTarget::XdrAlert), "truePositive");
+
+        // TriageStatus wire spellings
+        use crate::server::TriageStatus;
+        assert_eq!(TriageStatus::New.wire(TriageTarget::MdeAlertPatch).unwrap(), "New");
+        assert_eq!(TriageStatus::New.wire(TriageTarget::XdrAlert).unwrap(), "new");
+        assert!(TriageStatus::New.wire(TriageTarget::XdrIncident).is_err());
+        assert!(TriageStatus::Active.wire(TriageTarget::MdeAlertPatch).is_err());
+        assert_eq!(TriageStatus::Active.wire(TriageTarget::XdrIncident).unwrap(), "active");
     }
 }
