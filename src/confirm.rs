@@ -4,11 +4,11 @@
 
 use std::time::Duration;
 
-use rmcp::service::ElicitationMode;
-use serde_json::Value;
 use crate::audit::{AuditTarget, ConfirmationOutcome};
 use crate::auth::IdentitySnapshot;
 use crate::constants::ELICITATION_TIMEOUT_SECS;
+use rmcp::service::ElicitationMode;
+use serde_json::Value;
 
 /// Truncate a text value to `max_chars` Unicode characters, appending an ellipsis if truncated.
 pub fn truncate_ellipsis(s: &str, max_chars: usize) -> String {
@@ -75,7 +75,9 @@ pub fn build_confirmation_message(
 /// Constructs the form elicitation schema with a single boolean `confirm` field.
 pub fn confirmation_schema() -> rmcp::model::ElicitationSchema {
     rmcp::model::ElicitationSchema::builder()
-        .required_bool_property("confirm", |b| b.title("Run this action").with_default(false))
+        .required_bool_property("confirm", |b| {
+            b.title("Run this action").with_default(false)
+        })
         .build()
         .expect("schema builder must succeed")
 }
@@ -84,10 +86,10 @@ pub fn confirmation_schema() -> rmcp::model::ElicitationSchema {
 pub fn elicitation_timeout() -> Duration {
     #[cfg(debug_assertions)]
     {
-        if let Ok(ms_str) = std::env::var("DEFENDER_TEST_ELICITATION_TIMEOUT_MS") {
-            if let Ok(ms) = ms_str.parse::<u64>() {
-                return Duration::from_millis(ms);
-            }
+        if let Ok(ms_str) = std::env::var("DEFENDER_TEST_ELICITATION_TIMEOUT_MS")
+            && let Ok(ms) = ms_str.parse::<u64>()
+        {
+            return Duration::from_millis(ms);
         }
     }
     Duration::from_secs(ELICITATION_TIMEOUT_SECS)
@@ -167,7 +169,10 @@ mod tests {
     fn test_truncate_ellipsis() {
         assert_eq!(truncate_ellipsis("short", 10), "short");
         assert_eq!(truncate_ellipsis("exact10len", 10), "exact10len");
-        assert_eq!(truncate_ellipsis("longer than ten chars", 10), "longer tha…");
+        assert_eq!(
+            truncate_ellipsis("longer than ten chars", 10),
+            "longer tha…"
+        );
     }
 
     #[test]

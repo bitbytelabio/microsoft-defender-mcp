@@ -1,4 +1,4 @@
-//! Consolidated dispatchers route each action to the same upstream API as its granular tool.
+//! Domain dispatchers route each action to its upstream API with the action's validation rules.
 
 mod common;
 
@@ -12,15 +12,15 @@ use common::{McpProcess, base_config, spawn_mock as spawn_test_server, test_serv
 use microsoft_defender_mcp_server::cli::{MutationCategories, ServerConfig};
 use microsoft_defender_mcp_server::server::{
     DefenderServer, FORENSICS_ACTIONS, ForensicsInput, HuntingInput, INCIDENTS_ALERTS_ACTIONS,
-    IncidentsAlertsInput, MACHINES_ACTIONS, MachinesInput, RESPONSE_ACTIONS, ResponseInput,
-    TI_ACTIONS, ThreatIntelInput, VULNERABILITIES_ACTIONS, VulnerabilitiesInput,
+    IncidentsAlertsInput, MACHINES_ACTIONS, MachinesInput, RESPONSE_ACTIONS, TI_ACTIONS,
+    ThreatIntelInput, VULNERABILITIES_ACTIONS, VulnerabilitiesInput,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ErrorCode};
 use serde_json::json;
 use std::collections::HashMap;
 
-/// Consolidated mode with Live Response enabled so every action is reachable.
+/// Server with Live Response enabled so every action is reachable.
 fn create_test_server(base_url: &str) -> DefenderServer {
     test_server(
         base_url,
@@ -334,10 +334,14 @@ async fn pivots_find_by_ip_sends_path_and_normalizes_timestamp() {
     let input_dt = now - chrono::Duration::days(5);
     let input_ts = input_dt.to_rfc3339();
     let expected_utc_ts = input_dt.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let expected_path = format!("/api/machines/findbyip(ip='10.1.2.3',timestamp={expected_utc_ts})");
+    let expected_path =
+        format!("/api/machines/findbyip(ip='10.1.2.3',timestamp={expected_utc_ts})");
 
-    let app = Router::new().fallback(|req: Request| async move {
-        (StatusCode::OK, Json(json!({ "value": [{ "id": "m-123", "ip": "10.1.2.3" }] })))
+    let app = Router::new().fallback(|_: Request| async move {
+        (
+            StatusCode::OK,
+            Json(json!({ "value": [{ "id": "m-123", "ip": "10.1.2.3" }] })),
+        )
     });
     let guard = spawn_test_server(app).await;
     let server = test_server(
@@ -417,13 +421,18 @@ async fn pivots_find_by_ip_local_rejections() {
     assert_eq!(err_ip.code, ErrorCode::INVALID_PARAMS);
 
     // 0 hits
-    assert_eq!(guard.total_hits(), 0, "rejected calls must produce 0 upstream hits");
+    assert_eq!(
+        guard.total_hits(),
+        0,
+        "rejected calls must produce 0 upstream hits"
+    );
 }
 
 #[tokio::test]
 async fn pivots_read_actions_hit_path_under_read_only() {
     let machine_id = "1e5bc9d7e413ddd7902c2932e418702b84d0cc07";
-    let seen_queries = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::<String, String>::new()));
+    let seen_queries =
+        std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::<String, String>::new()));
     let seen_queries_clone = seen_queries.clone();
 
     let app = Router::new().fallback(move |req: Request| {
@@ -432,7 +441,10 @@ async fn pivots_read_actions_hit_path_under_read_only() {
             let path = req.uri().path().to_string();
             let query = req.uri().query().unwrap_or_default().to_string();
             seen.lock().await.insert(path, query);
-            (StatusCode::OK, Json(json!({ "value": [{ "status": "ok" }] })))
+            (
+                StatusCode::OK,
+                Json(json!({ "value": [{ "status": "ok" }] })),
+            )
         }
     });
     let guard = spawn_test_server(app).await;
@@ -472,7 +484,12 @@ async fn pivots_read_actions_hit_path_under_read_only() {
     let vulns_path = format!("/api/machines/{machine_id}/vulnerabilities");
     guard.assert_hits(&vulns_path, 1);
     {
-        let q = seen_queries.lock().await.get(&vulns_path).cloned().unwrap_or_default();
+        let q = seen_queries
+            .lock()
+            .await
+            .get(&vulns_path)
+            .cloned()
+            .unwrap_or_default();
         assert!(q.contains("%24top=10") || q.contains("$top=10"));
         assert!(q.contains("%24skip=20") || q.contains("$skip=20"));
         assert!(q.contains("severity"));
@@ -504,7 +521,12 @@ async fn pivots_read_actions_hit_path_under_read_only() {
     assert_ne!(res_inv_list.is_error, Some(true));
     guard.assert_hits("/api/investigations", 1);
     {
-        let q = seen_queries.lock().await.get("/api/investigations").cloned().unwrap_or_default();
+        let q = seen_queries
+            .lock()
+            .await
+            .get("/api/investigations")
+            .cloned()
+            .unwrap_or_default();
         assert!(q.contains("%24top=5") || q.contains("$top=5"));
         assert!(q.contains("%24skip=15") || q.contains("$skip=15"));
         assert!(q.contains("Running"));
@@ -591,20 +613,45 @@ fn pivots_tools_list_advertises_actions_in_descriptions_under_read_only() {
         .iter()
         .find(|t| t["name"] == "defender_machines")
         .expect("defender_machines tool present");
-    let machines_desc = machines_tool["description"].as_str().expect("description string");
-    assert!(machines_desc.contains("find_by_ip"), "missing find_by_ip in defender_machines desc: {machines_desc}");
-    assert!(machines_desc.contains("machine_alerts"), "missing machine_alerts in defender_machines desc: {machines_desc}");
-    assert!(machines_desc.contains("machine_vulnerabilities"), "missing machine_vulnerabilities in defender_machines desc: {machines_desc}");
-    assert!(machines_desc.contains("machine_missing_kbs"), "missing machine_missing_kbs in defender_machines desc: {machines_desc}");
+    let machines_desc = machines_tool["description"]
+        .as_str()
+        .expect("description string");
+    assert!(
+        machines_desc.contains("find_by_ip"),
+        "missing find_by_ip in defender_machines desc: {machines_desc}"
+    );
+    assert!(
+        machines_desc.contains("machine_alerts"),
+        "missing machine_alerts in defender_machines desc: {machines_desc}"
+    );
+    assert!(
+        machines_desc.contains("machine_vulnerabilities"),
+        "missing machine_vulnerabilities in defender_machines desc: {machines_desc}"
+    );
+    assert!(
+        machines_desc.contains("machine_missing_kbs"),
+        "missing machine_missing_kbs in defender_machines desc: {machines_desc}"
+    );
 
     let forensics_tool = tools
         .iter()
         .find(|t| t["name"] == "defender_forensics")
         .expect("defender_forensics tool present");
-    let forensics_desc = forensics_tool["description"].as_str().expect("description string");
-    assert!(forensics_desc.contains("investigation_list"), "missing investigation_list in defender_forensics desc: {forensics_desc}");
-    assert!(forensics_desc.contains("investigation_get"), "missing investigation_get in defender_forensics desc: {forensics_desc}");
-    assert!(forensics_desc.contains("library_file_list"), "missing library_file_list in defender_forensics desc: {forensics_desc}");
+    let forensics_desc = forensics_tool["description"]
+        .as_str()
+        .expect("description string");
+    assert!(
+        forensics_desc.contains("investigation_list"),
+        "missing investigation_list in defender_forensics desc: {forensics_desc}"
+    );
+    assert!(
+        forensics_desc.contains("investigation_get"),
+        "missing investigation_get in defender_forensics desc: {forensics_desc}"
+    );
+    assert!(
+        forensics_desc.contains("library_file_list"),
+        "missing library_file_list in defender_forensics desc: {forensics_desc}"
+    );
 
     assert!(proc.shutdown().success());
 }

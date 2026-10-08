@@ -183,20 +183,24 @@ async fn read_json(
     category: PermissionCategory,
 ) -> Result<MutationResponse, CallToolResult> {
     let status = resp.status().as_u16();
-    if status == 401 {
-        if let Some(auth_header) = resp.headers().get(reqwest::header::WWW_AUTHENTICATE) {
-            if let Ok(val) = auth_header.to_str() {
-                if val.contains("error=\"insufficient_claims\"") || val.contains("error=insufficient_claims") {
-                    token_manager.set_reauth(ReauthReason::ConditionalAccess);
-                    return Err(crate::error::reauthentication_required(
-                        ReauthReason::ConditionalAccess.as_str(),
-                    ));
-                }
-            }
-        }
+    if status == 401
+        && let Some(auth_header) = resp.headers().get(reqwest::header::WWW_AUTHENTICATE)
+        && let Ok(val) = auth_header.to_str()
+        && (val.contains("error=\"insufficient_claims\"")
+            || val.contains("error=insufficient_claims"))
+    {
+        token_manager.set_reauth(ReauthReason::ConditionalAccess);
+        return Err(crate::error::reauthentication_required(
+            ReauthReason::ConditionalAccess.as_str(),
+        ));
     }
     if status != 200 && status != 201 && status != 204 {
-        return Err(http_error(status, path, token_manager.auth_kind(), category));
+        return Err(http_error(
+            status,
+            path,
+            token_manager.auth_kind(),
+            category,
+        ));
     }
     if status == 204 {
         return Ok(MutationResponse {
@@ -204,10 +208,7 @@ async fn read_json(
             body: Value::Null,
         });
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| network_error(&e, path))?;
+    let bytes = resp.bytes().await.map_err(|e| network_error(&e, path))?;
     if bytes.is_empty() || bytes.iter().all(|b| b.is_ascii_whitespace()) {
         return Ok(MutationResponse {
             http_status: status,
@@ -245,7 +246,8 @@ impl GraphClient {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<Value, CallToolResult> {
-        self.graph_get_as(path, query, PermissionCategory::ReadGraph).await
+        self.graph_get_as(path, query, PermissionCategory::ReadGraph)
+            .await
     }
 
     pub async fn graph_get_as(
@@ -254,7 +256,9 @@ impl GraphClient {
         query: &[(&str, &str)],
         category: PermissionCategory,
     ) -> Result<Value, CallToolResult> {
-        self.0.request(reqwest::Method::GET, path, query, None, category).await
+        self.0
+            .request(reqwest::Method::GET, path, query, None, category)
+            .await
     }
 
     pub async fn graph_get_with_odata(
@@ -262,7 +266,8 @@ impl GraphClient {
         path: &str,
         odata: &ODataParams<'_>,
     ) -> Result<Value, CallToolResult> {
-        self.graph_get_with_odata_as(path, odata, PermissionCategory::ReadGraph).await
+        self.graph_get_with_odata_as(path, odata, PermissionCategory::ReadGraph)
+            .await
     }
 
     pub async fn graph_get_with_odata_as(
@@ -271,11 +276,20 @@ impl GraphClient {
         odata: &ODataParams<'_>,
         category: PermissionCategory,
     ) -> Result<Value, CallToolResult> {
-        self.0.request(reqwest::Method::GET, path, &odata.to_query_vec(), None, category).await
+        self.0
+            .request(
+                reqwest::Method::GET,
+                path,
+                &odata.to_query_vec(),
+                None,
+                category,
+            )
+            .await
     }
 
     pub async fn graph_post(&self, path: &str, body: &Value) -> Result<Value, CallToolResult> {
-        self.graph_post_as(path, body, PermissionCategory::ReadGraph).await
+        self.graph_post_as(path, body, PermissionCategory::ReadGraph)
+            .await
     }
 
     pub async fn graph_post_as(
@@ -284,7 +298,9 @@ impl GraphClient {
         body: &Value,
         category: PermissionCategory,
     ) -> Result<Value, CallToolResult> {
-        self.0.request(reqwest::Method::POST, path, NO_QUERY, Some(body), category).await
+        self.0
+            .request(reqwest::Method::POST, path, NO_QUERY, Some(body), category)
+            .await
     }
 
     pub async fn graph_patch(
@@ -292,7 +308,8 @@ impl GraphClient {
         path: &str,
         body: &Value,
     ) -> Result<MutationResponse, CallToolResult> {
-        self.graph_patch_as(path, body, PermissionCategory::Triage).await
+        self.graph_patch_as(path, body, PermissionCategory::Triage)
+            .await
     }
 
     pub async fn graph_patch_as(
@@ -301,7 +318,9 @@ impl GraphClient {
         body: &Value,
         category: PermissionCategory,
     ) -> Result<MutationResponse, CallToolResult> {
-        self.0.request_mutation(reqwest::Method::PATCH, path, NO_QUERY, Some(body), category).await
+        self.0
+            .request_mutation(reqwest::Method::PATCH, path, NO_QUERY, Some(body), category)
+            .await
     }
 
     pub async fn graph_delete(&self, path: &str) -> Result<MutationResponse, CallToolResult> {
@@ -313,7 +332,9 @@ impl GraphClient {
         path: &str,
         category: PermissionCategory,
     ) -> Result<MutationResponse, CallToolResult> {
-        self.0.request_mutation(reqwest::Method::DELETE, path, NO_QUERY, None, category).await
+        self.0
+            .request_mutation(reqwest::Method::DELETE, path, NO_QUERY, None, category)
+            .await
     }
 }
 
@@ -346,7 +367,8 @@ impl EndpointClient {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<Value, CallToolResult> {
-        self.endpoint_get_as(path, query, PermissionCategory::ReadEndpoint).await
+        self.endpoint_get_as(path, query, PermissionCategory::ReadEndpoint)
+            .await
     }
 
     pub async fn endpoint_get_as(
@@ -355,7 +377,9 @@ impl EndpointClient {
         query: &[(&str, &str)],
         category: PermissionCategory,
     ) -> Result<Value, CallToolResult> {
-        self.0.request(reqwest::Method::GET, path, query, None, category).await
+        self.0
+            .request(reqwest::Method::GET, path, query, None, category)
+            .await
     }
 
     pub async fn endpoint_get_with_odata(
@@ -363,7 +387,8 @@ impl EndpointClient {
         path: &str,
         odata: &ODataParams<'_>,
     ) -> Result<Value, CallToolResult> {
-        self.endpoint_get_with_odata_as(path, odata, PermissionCategory::ReadEndpoint).await
+        self.endpoint_get_with_odata_as(path, odata, PermissionCategory::ReadEndpoint)
+            .await
     }
 
     pub async fn endpoint_get_with_odata_as(
@@ -372,7 +397,15 @@ impl EndpointClient {
         odata: &ODataParams<'_>,
         category: PermissionCategory,
     ) -> Result<Value, CallToolResult> {
-        self.0.request(reqwest::Method::GET, path, &odata.to_query_vec(), None, category).await
+        self.0
+            .request(
+                reqwest::Method::GET,
+                path,
+                &odata.to_query_vec(),
+                None,
+                category,
+            )
+            .await
     }
 
     pub async fn endpoint_post(
@@ -380,7 +413,8 @@ impl EndpointClient {
         path: &str,
         body: &Value,
     ) -> Result<MutationResponse, CallToolResult> {
-        self.endpoint_post_as(path, body, PermissionCategory::LiveResponse).await
+        self.endpoint_post_as(path, body, PermissionCategory::LiveResponse)
+            .await
     }
 
     pub async fn endpoint_post_as(
@@ -389,7 +423,9 @@ impl EndpointClient {
         body: &Value,
         category: PermissionCategory,
     ) -> Result<MutationResponse, CallToolResult> {
-        self.0.request_mutation(reqwest::Method::POST, path, NO_QUERY, Some(body), category).await
+        self.0
+            .request_mutation(reqwest::Method::POST, path, NO_QUERY, Some(body), category)
+            .await
     }
 
     pub async fn endpoint_patch(
@@ -397,7 +433,8 @@ impl EndpointClient {
         path: &str,
         body: &Value,
     ) -> Result<MutationResponse, CallToolResult> {
-        self.endpoint_patch_as(path, body, PermissionCategory::Triage).await
+        self.endpoint_patch_as(path, body, PermissionCategory::Triage)
+            .await
     }
 
     pub async fn endpoint_patch_as(
@@ -406,11 +443,14 @@ impl EndpointClient {
         body: &Value,
         category: PermissionCategory,
     ) -> Result<MutationResponse, CallToolResult> {
-        self.0.request_mutation(reqwest::Method::PATCH, path, NO_QUERY, Some(body), category).await
+        self.0
+            .request_mutation(reqwest::Method::PATCH, path, NO_QUERY, Some(body), category)
+            .await
     }
 
     pub async fn endpoint_delete(&self, path: &str) -> Result<MutationResponse, CallToolResult> {
-        self.endpoint_delete_as(path, PermissionCategory::Indicators).await
+        self.endpoint_delete_as(path, PermissionCategory::Indicators)
+            .await
     }
 
     pub async fn endpoint_delete_as(
@@ -418,7 +458,9 @@ impl EndpointClient {
         path: &str,
         category: PermissionCategory,
     ) -> Result<MutationResponse, CallToolResult> {
-        self.0.request_mutation(reqwest::Method::DELETE, path, NO_QUERY, None, category).await
+        self.0
+            .request_mutation(reqwest::Method::DELETE, path, NO_QUERY, None, category)
+            .await
     }
     /// Upload a file to the live response library via multipart/form-data.
     pub async fn endpoint_multipart_upload(
@@ -457,7 +499,13 @@ impl EndpointClient {
             .send()
             .await
             .map_err(|e| network_error(&e, path))?;
-        read_json(resp, path, &self.0.token_manager, PermissionCategory::LiveResponse).await
+        read_json(
+            resp,
+            path,
+            &self.0.token_manager,
+            PermissionCategory::LiveResponse,
+        )
+        .await
     }
 
     /// Stream a pre-authenticated (SAS) artifact URL into `dest_dir/dest_filename`.
@@ -489,17 +537,18 @@ impl EndpointClient {
             .map_err(|e| network_error(&e, "artifact download"))?;
         let status = resp.status().as_u16();
         if status != 200 {
-            if status == 401 {
-                if let Some(auth_header) = resp.headers().get(reqwest::header::WWW_AUTHENTICATE) {
-                    if let Ok(val) = auth_header.to_str() {
-                        if val.contains("error=\"insufficient_claims\"") || val.contains("error=insufficient_claims") {
-                            self.0.token_manager.set_reauth(ReauthReason::ConditionalAccess);
-                            return Err(crate::error::reauthentication_required(
-                                ReauthReason::ConditionalAccess.as_str(),
-                            ));
-                        }
-                    }
-                }
+            if status == 401
+                && let Some(auth_header) = resp.headers().get(reqwest::header::WWW_AUTHENTICATE)
+                && let Ok(val) = auth_header.to_str()
+                && (val.contains("error=\"insufficient_claims\"")
+                    || val.contains("error=insufficient_claims"))
+            {
+                self.0
+                    .token_manager
+                    .set_reauth(ReauthReason::ConditionalAccess);
+                return Err(crate::error::reauthentication_required(
+                    ReauthReason::ConditionalAccess.as_str(),
+                ));
             }
             return Err(http_error(
                 status,
@@ -566,13 +615,7 @@ async fn stream_to_file(
     file.flush()
         .await
         .map_err(|e| staging_filesystem_error(format!("failed to flush artifact file: {e}")))?;
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest.iter() {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    Ok((total, hex))
+    Ok((total, format!("{:x}", hasher.finalize())))
 }
 
 #[cfg(test)]

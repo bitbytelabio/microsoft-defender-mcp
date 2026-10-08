@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Mutex, OnceLock};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
@@ -293,9 +293,14 @@ fn format_audience_section(
             if scopes.is_empty() {
                 format!("{aud_name}: (expires {expires_str})")
             } else {
-                let cleaned_scopes: Vec<&str> =
-                    scopes.iter().map(|s| clean_scope_name(s.as_str())).collect();
-                format!("{aud_name}: {} (expires {expires_str})", cleaned_scopes.join(" "))
+                let cleaned_scopes: Vec<&str> = scopes
+                    .iter()
+                    .map(|s| clean_scope_name(s.as_str()))
+                    .collect();
+                format!(
+                    "{aud_name}: {} (expires {expires_str})",
+                    cleaned_scopes.join(" ")
+                )
             }
         }
         Some(ConsentState::Missing { aadsts }) => {
@@ -313,7 +318,10 @@ fn format_audience_section(
                 .collect();
 
             if !missing_scopes.is_empty() {
-                sec.push_str(&format!(" — grant admin consent for {}", missing_scopes.join(" ")));
+                sec.push_str(&format!(
+                    " — grant admin consent for {}",
+                    missing_scopes.join(" ")
+                ));
             }
             sec
         }
@@ -362,7 +370,10 @@ mod tests {
         let reasons = [
             (ReauthReason::SessionExpired, "\"session_expired\""),
             (ReauthReason::MfaRequired, "\"mfa_required\""),
-            (ReauthReason::InteractionRequired, "\"interaction_required\""),
+            (
+                ReauthReason::InteractionRequired,
+                "\"interaction_required\"",
+            ),
             (ReauthReason::SessionRevoked, "\"session_revoked\""),
             (ReauthReason::ConditionalAccess, "\"conditional_access\""),
         ];
@@ -389,9 +400,18 @@ mod tests {
         let jwt = format!("eyJhbGciOiJub25lIn0.{}.mock_signature", payload_b64);
 
         let claims = decode_id_token_claims(&jwt).expect("decode id token claims");
-        assert_eq!(claims.preferred_username.as_deref(), Some("alice@contoso.com"));
-        assert_eq!(claims.tid.as_deref(), Some("72f988bf-1234-5678-9abc-def012345678"));
-        assert_eq!(claims.oid.as_deref(), Some("00000000-0000-0000-0000-000000000001"));
+        assert_eq!(
+            claims.preferred_username.as_deref(),
+            Some("alice@contoso.com")
+        );
+        assert_eq!(
+            claims.tid.as_deref(),
+            Some("72f988bf-1234-5678-9abc-def012345678")
+        );
+        assert_eq!(
+            claims.oid.as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
         assert_eq!(claims.account_name(), Some("alice@contoso.com"));
     }
 
@@ -406,7 +426,10 @@ mod tests {
         let jwt = format!("hdr.{}.sig", payload_b64_padded);
 
         let claims = decode_id_token_claims(&jwt).expect("decode id token claims with padding");
-        assert_eq!(claims.preferred_username.as_deref(), Some("bob@example.com"));
+        assert_eq!(
+            claims.preferred_username.as_deref(),
+            Some("bob@example.com")
+        );
         assert_eq!(claims.tid.as_deref(), Some("tenant-xyz"));
     }
 
@@ -431,7 +454,10 @@ mod tests {
         consent.insert(
             Audience::Graph,
             ConsentState::Granted {
-                scopes: vec!["ThreatHunting.Read.All".into(), "SecurityAlert.Read.All".into()],
+                scopes: vec![
+                    "ThreatHunting.Read.All".into(),
+                    "SecurityAlert.Read.All".into(),
+                ],
                 expires_at: 1791467112,
             },
         );

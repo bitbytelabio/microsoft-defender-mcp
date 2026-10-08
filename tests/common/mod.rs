@@ -14,7 +14,7 @@ use axum::{Json, Router};
 use microsoft_defender_mcp_server::audit::AuditSink;
 use microsoft_defender_mcp_server::auth::TokenManager;
 use microsoft_defender_mcp_server::cli::{
-    AuthConfig, AuditLogSetting, MutationCategories, ServerConfig, TransportMode,
+    AuditLogSetting, AuthConfig, MutationCategories, ServerConfig, TransportMode,
 };
 use microsoft_defender_mcp_server::client::{EndpointClient, GraphClient};
 use microsoft_defender_mcp_server::server::DefenderServer;
@@ -63,7 +63,8 @@ impl MockUpstream {
     pub fn assert_hits(&self, path: &str, n: usize) {
         let actual = self.hit_count(path);
         assert_eq!(
-            actual, n,
+            actual,
+            n,
             "expected {n} hits for '{path}', but got {actual}; all recorded hits: {:?}",
             self.hits.lock().unwrap()
         );
@@ -71,8 +72,7 @@ impl MockUpstream {
 }
 
 pub async fn spawn_mock(app: Router) -> MockUpstream {
-    let std_listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind loopback port");
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback port");
     let base_url = format!("http://{}", std_listener.local_addr().expect("local addr"));
     std_listener.set_nonblocking(true).expect("set nonblocking");
 
@@ -80,19 +80,17 @@ pub async fn spawn_mock(app: Router) -> MockUpstream {
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let hits_counter = hits.clone();
 
-    let app = app.layer(middleware::from_fn(
-        move |req: Request, next: Next| {
-            let hits_counter = hits_counter.clone();
-            async move {
-                let path = req.uri().path().to_string();
-                {
-                    let mut map = hits_counter.lock().unwrap();
-                    *map.entry(path).or_insert(0) += 1;
-                }
-                next.run(req).await
+    let app = app.layer(middleware::from_fn(move |req: Request, next: Next| {
+        let hits_counter = hits_counter.clone();
+        async move {
+            let path = req.uri().path().to_string();
+            {
+                let mut map = hits_counter.lock().unwrap();
+                *map.entry(path).or_insert(0) += 1;
             }
-        },
-    ));
+            next.run(req).await
+        }
+    }));
 
     let (tx, rx) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {
@@ -103,8 +101,8 @@ pub async fn spawn_mock(app: Router) -> MockUpstream {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let _ = tx.send(shutdown_tx);
         rt.block_on(async move {
-            let listener = tokio::net::TcpListener::from_std(std_listener)
-                .expect("convert to tokio listener");
+            let listener =
+                tokio::net::TcpListener::from_std(std_listener).expect("convert to tokio listener");
             let server = axum::serve(listener, app);
             tokio::select! {
                 _ = server => {},
@@ -272,6 +270,7 @@ pub fn server_command(args: &[&str], envs: &[(&str, &str)]) -> Command {
         "DEFENDER_TEST_BROWSER_CMD",
         "DEFENDER_TEST_DEVICE_CODE_INTERVAL_MS",
         "DEFENDER_TEST_ELICITATION_TIMEOUT_MS",
+        "DEFENDER_TEST_SLOW_DOWN_MS",
     ] {
         cmd.env_remove(var);
     }
@@ -347,7 +346,8 @@ impl McpProcess {
         let (stderr_cfg, stderr_path) = if null_stderr {
             (Stdio::null(), None)
         } else {
-            static STDERR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            static STDERR_COUNTER: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
             let seq = STDERR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let p = std::env::temp_dir().join(format!(
                 "mcp-proc-stderr-{}-{:?}-{seq}-{}.log",

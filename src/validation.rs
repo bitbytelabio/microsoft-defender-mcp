@@ -420,11 +420,7 @@ pub fn validate_live_response_commands(
 ///
 /// If `field` represents a comment or justification (e.g. `field == "comment"` or `field == "justification"`
 /// or ends with `_comment`/`_justification`), `\n`, `\r`, and `\t` are permitted.
-pub fn validate_text<'a>(
-    s: &'a str,
-    max: usize,
-    field: &str,
-) -> Result<&'a str, rmcp::ErrorData> {
+pub fn validate_text<'a>(s: &'a str, max: usize, field: &str) -> Result<&'a str, rmcp::ErrorData> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Err(invalid_params(format!("{field} cannot be empty")));
@@ -509,9 +505,8 @@ pub fn validate_hex<'a>(s: &'a str, len: usize, field: &str) -> Result<&'a str, 
 /// Validate a URL indicator (http/https scheme, host present). Errors name `indicator_value`.
 pub fn validate_url_indicator(s: &str) -> Result<&str, rmcp::ErrorData> {
     let trimmed = s.trim();
-    let parsed = url::Url::parse(trimmed).map_err(|e| {
-        invalid_params(format!("indicator_value must be a valid URL: {e}"))
-    })?;
+    let parsed = url::Url::parse(trimmed)
+        .map_err(|e| invalid_params(format!("indicator_value must be a valid URL: {e}")))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(invalid_params(format!(
             "indicator_value URL must use http or https scheme, got '{}'",
@@ -533,16 +528,15 @@ pub fn validate_domain_indicator(s: &str) -> Result<&str, rmcp::ErrorData> {
             "indicator_value for DomainName must not be an IP address, got '{trimmed}'"
         )));
     }
-    validate_hostname(trimmed).map_err(|e| {
-        invalid_params(format!("indicator_value: {}", e.message))
-    })
+    validate_hostname(trimmed)
+        .map_err(|e| invalid_params(format!("indicator_value: {}", e.message)))
 }
 
 /// Validate an indicator value based on indicator type. Errors name `indicator_value`.
-pub fn validate_indicator_value<'a>(
+pub fn validate_indicator_value(
     indicator_type: IndicatorType,
-    value: &'a str,
-) -> Result<&'a str, rmcp::ErrorData> {
+    value: &str,
+) -> Result<&str, rmcp::ErrorData> {
     match indicator_type {
         IndicatorType::FileSha1 | IndicatorType::CertificateThumbprint => {
             validate_hex(value, 40, "indicator_value")
@@ -603,7 +597,7 @@ pub fn validate_indicator_action(
         IndicatorAction::Audit => {
             if generate_alert == Some(false) {
                 return Err(invalid_params(
-                    "generate_alert must be true or omitted when indicator_action is Audit"
+                    "generate_alert must be true or omitted when indicator_action is Audit",
                 ));
             }
         }
@@ -618,9 +612,8 @@ pub fn validate_future_rfc3339(
     field: &str,
 ) -> Result<chrono::DateTime<chrono::Utc>, rmcp::ErrorData> {
     let trimmed = s.trim();
-    let dt = chrono::DateTime::parse_from_rfc3339(trimmed).map_err(|e| {
-        invalid_params(format!("{field} must be a valid RFC 3339 timestamp: {e}"))
-    })?;
+    let dt = chrono::DateTime::parse_from_rfc3339(trimmed)
+        .map_err(|e| invalid_params(format!("{field} must be a valid RFC 3339 timestamp: {e}")))?;
     let utc_dt = dt.with_timezone(&chrono::Utc);
     if utc_dt <= chrono::Utc::now() {
         return Err(invalid_params(format!(
@@ -659,9 +652,9 @@ pub fn validate_classification_pair(
     determination: Option<Determination>,
 ) -> Result<(), rmcp::ErrorData> {
     match (classification, determination) {
-        (None, Some(_)) => {
-            Err(invalid_params("determination requires classification to be specified"))
-        }
+        (None, Some(_)) => Err(invalid_params(
+            "determination requires classification to be specified",
+        )),
         (Some(c), Some(d)) => {
             let allowed = Determination::allowed_for(c);
             if !allowed.contains(&d) {
@@ -1299,7 +1292,11 @@ mod tests {
         // Exceeds max
         let four = vec!["id-1", "id-2", "id-3", "id-4"];
         let err_four = validate_batch(&four, 3, "ids").unwrap_err();
-        assert!(err_four.message.contains("ids exceeds maximum batch size of 3 items (got 4)"));
+        assert!(
+            err_four
+                .message
+                .contains("ids exceeds maximum batch size of 3 items (got 4)")
+        );
 
         // Invalid ID inside batch
         let invalid_item = vec!["id-1", "..", "id-3"];
@@ -1327,7 +1324,11 @@ mod tests {
 
         let with_ctrl = "tag\nwith\tcontrol";
         let err_ctrl = validate_tag(with_ctrl).unwrap_err();
-        assert!(err_ctrl.message.contains("tag contains invalid control characters"));
+        assert!(
+            err_ctrl
+                .message
+                .contains("tag contains invalid control characters")
+        );
     }
 
     #[test]
@@ -1338,12 +1339,20 @@ mod tests {
         // Short
         let short = "1234567890abcdef1234567890abcdef1234567";
         let err_short = validate_hex(short, 40, "sha1").unwrap_err();
-        assert!(err_short.message.contains("sha1 must be a 40-character hex string"));
+        assert!(
+            err_short
+                .message
+                .contains("sha1 must be a 40-character hex string")
+        );
 
         // Non-hex
         let non_hex = "1234567890abcdef1234567890abcdef1234567g";
         let err_non_hex = validate_hex(non_hex, 40, "sha1").unwrap_err();
-        assert!(err_non_hex.message.contains("sha1 must be a 40-character hex string"));
+        assert!(
+            err_non_hex
+                .message
+                .contains("sha1 must be a 40-character hex string")
+        );
     }
 
     #[test]
@@ -1353,7 +1362,10 @@ mod tests {
 
         // Non-http/https
         let ftp = validate_url_indicator("ftp://example.com/file").unwrap_err();
-        assert!(ftp.message.contains("indicator_value URL must use http or https scheme"));
+        assert!(
+            ftp.message
+                .contains("indicator_value URL must use http or https scheme")
+        );
 
         let no_host = validate_url_indicator("https://").unwrap_err();
         assert!(no_host.message.contains("indicator_value"));
@@ -1368,10 +1380,18 @@ mod tests {
 
         // IP literal rejected
         let ip_err = validate_domain_indicator("192.168.1.1").unwrap_err();
-        assert!(ip_err.message.contains("indicator_value for DomainName must not be an IP address"));
+        assert!(
+            ip_err
+                .message
+                .contains("indicator_value for DomainName must not be an IP address")
+        );
 
         let ipv6_err = validate_domain_indicator("::1").unwrap_err();
-        assert!(ipv6_err.message.contains("indicator_value for DomainName must not be an IP address"));
+        assert!(
+            ipv6_err
+                .message
+                .contains("indicator_value for DomainName must not be an IP address")
+        );
 
         // Invalid hostname
         assert!(validate_domain_indicator("http://example.com").is_err());
@@ -1406,22 +1426,61 @@ mod tests {
     #[test]
     fn test_validate_indicator_action() {
         // BlockAndRemediate
-        assert!(validate_indicator_action(IndicatorType::FileSha256, IndicatorAction::BlockAndRemediate, None).is_ok());
-        assert!(validate_indicator_action(IndicatorType::CertificateThumbprint, IndicatorAction::BlockAndRemediate, None).is_ok());
-        let bar_url = validate_indicator_action(IndicatorType::Url, IndicatorAction::BlockAndRemediate, None).unwrap_err();
+        assert!(
+            validate_indicator_action(
+                IndicatorType::FileSha256,
+                IndicatorAction::BlockAndRemediate,
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_indicator_action(
+                IndicatorType::CertificateThumbprint,
+                IndicatorAction::BlockAndRemediate,
+                None
+            )
+            .is_ok()
+        );
+        let bar_url =
+            validate_indicator_action(IndicatorType::Url, IndicatorAction::BlockAndRemediate, None)
+                .unwrap_err();
         assert!(bar_url.message.contains("BlockAndRemediate"));
 
         // Warn
         assert!(validate_indicator_action(IndicatorType::Url, IndicatorAction::Warn, None).is_ok());
-        assert!(validate_indicator_action(IndicatorType::DomainName, IndicatorAction::Warn, None).is_ok());
-        assert!(validate_indicator_action(IndicatorType::IpAddress, IndicatorAction::Warn, None).is_ok());
-        let warn_sha = validate_indicator_action(IndicatorType::FileSha256, IndicatorAction::Warn, None).unwrap_err();
+        assert!(
+            validate_indicator_action(IndicatorType::DomainName, IndicatorAction::Warn, None)
+                .is_ok()
+        );
+        assert!(
+            validate_indicator_action(IndicatorType::IpAddress, IndicatorAction::Warn, None)
+                .is_ok()
+        );
+        let warn_sha =
+            validate_indicator_action(IndicatorType::FileSha256, IndicatorAction::Warn, None)
+                .unwrap_err();
         assert!(warn_sha.message.contains("Warn"));
 
         // Audit
-        assert!(validate_indicator_action(IndicatorType::FileSha256, IndicatorAction::Audit, None).is_ok());
-        assert!(validate_indicator_action(IndicatorType::FileSha256, IndicatorAction::Audit, Some(true)).is_ok());
-        let audit_false = validate_indicator_action(IndicatorType::FileSha256, IndicatorAction::Audit, Some(false)).unwrap_err();
+        assert!(
+            validate_indicator_action(IndicatorType::FileSha256, IndicatorAction::Audit, None)
+                .is_ok()
+        );
+        assert!(
+            validate_indicator_action(
+                IndicatorType::FileSha256,
+                IndicatorAction::Audit,
+                Some(true)
+            )
+            .is_ok()
+        );
+        let audit_false = validate_indicator_action(
+            IndicatorType::FileSha256,
+            IndicatorAction::Audit,
+            Some(false),
+        )
+        .unwrap_err();
         assert!(audit_false.message.contains("generate_alert must be true"));
     }
 
@@ -1446,7 +1505,11 @@ mod tests {
 
         let past = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         let err_past = validate_future_rfc3339(&past, "expiration_time").unwrap_err();
-        assert!(err_past.message.contains("expiration_time must be in the future"));
+        assert!(
+            err_past
+                .message
+                .contains("expiration_time must be in the future")
+        );
 
         assert!(validate_future_rfc3339("not-a-date", "expiration_time").is_err());
     }
@@ -1460,25 +1523,54 @@ mod tests {
 
         let future = (now + chrono::Duration::minutes(5)).to_rfc3339();
         let err_future = validate_recent_timestamp(&future, 30).unwrap_err();
-        assert!(err_future.message.contains("timestamp cannot be in the future"));
+        assert!(
+            err_future
+                .message
+                .contains("timestamp cannot be in the future")
+        );
 
         let old = (now - chrono::Duration::days(31)).to_rfc3339();
         let err_old = validate_recent_timestamp(&old, 30).unwrap_err();
-        assert!(err_old.message.contains("timestamp cannot be older than 30 days"));
+        assert!(
+            err_old
+                .message
+                .contains("timestamp cannot be older than 30 days")
+        );
     }
 
     #[test]
     fn test_validate_classification_pair() {
         // determination without classification
-        let err_orphan = validate_classification_pair(None, Some(Determination::Malware)).unwrap_err();
-        assert!(err_orphan.message.contains("determination requires classification"));
+        let err_orphan =
+            validate_classification_pair(None, Some(Determination::Malware)).unwrap_err();
+        assert!(
+            err_orphan
+                .message
+                .contains("determination requires classification")
+        );
 
         // valid pair
-        assert!(validate_classification_pair(Some(Classification::TruePositive), Some(Determination::Malware)).is_ok());
-        assert!(validate_classification_pair(Some(Classification::FalsePositive), Some(Determination::NotMalicious)).is_ok());
+        assert!(
+            validate_classification_pair(
+                Some(Classification::TruePositive),
+                Some(Determination::Malware)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_classification_pair(
+                Some(Classification::FalsePositive),
+                Some(Determination::NotMalicious)
+            )
+            .is_ok()
+        );
 
         // invalid pair with exact required format
-        let err_invalid = validate_classification_pair(Some(Classification::FalsePositive), Some(Determination::Malware)).unwrap_err();
+        let err_invalid = validate_classification_pair(
+            Some(Classification::FalsePositive),
+            Some(Determination::Malware),
+        )
+        .unwrap_err();
         assert_eq!(
             err_invalid.message,
             "determination 'malware' is not valid for classification 'falsePositive'; valid: notMalicious, notEnoughDataToValidate, other"
@@ -1490,32 +1582,89 @@ mod tests {
         use crate::server::TriageTarget;
 
         // Determination wire spellings
-        assert_eq!(Determination::ConfirmedActivity.wire(TriageTarget::MdeAlertPatch), "ConfirmedActivity");
-        assert_eq!(Determination::ConfirmedActivity.wire(TriageTarget::MdeAlertBatch), "ConfirmedUserActivity");
-        assert_eq!(Determination::ConfirmedActivity.wire(TriageTarget::XdrAlert), "confirmedActivity");
+        assert_eq!(
+            Determination::ConfirmedActivity.wire(TriageTarget::MdeAlertPatch),
+            "ConfirmedActivity"
+        );
+        assert_eq!(
+            Determination::ConfirmedActivity.wire(TriageTarget::MdeAlertBatch),
+            "ConfirmedUserActivity"
+        );
+        assert_eq!(
+            Determination::ConfirmedActivity.wire(TriageTarget::XdrAlert),
+            "confirmedActivity"
+        );
 
-        assert_eq!(Determination::NotMalicious.wire(TriageTarget::MdeAlertPatch), "NotMalicious");
-        assert_eq!(Determination::NotMalicious.wire(TriageTarget::MdeAlertBatch), "Clean");
-        assert_eq!(Determination::NotMalicious.wire(TriageTarget::XdrAlert), "notMalicious");
+        assert_eq!(
+            Determination::NotMalicious.wire(TriageTarget::MdeAlertPatch),
+            "NotMalicious"
+        );
+        assert_eq!(
+            Determination::NotMalicious.wire(TriageTarget::MdeAlertBatch),
+            "Clean"
+        );
+        assert_eq!(
+            Determination::NotMalicious.wire(TriageTarget::XdrAlert),
+            "notMalicious"
+        );
 
-        assert_eq!(Determination::CompromisedAccount.wire(TriageTarget::MdeAlertPatch), "CompromisedUser");
-        assert_eq!(Determination::CompromisedAccount.wire(TriageTarget::MdeAlertBatch), "CompromisedUser");
-        assert_eq!(Determination::CompromisedAccount.wire(TriageTarget::XdrIncident), "compromisedAccount");
+        assert_eq!(
+            Determination::CompromisedAccount.wire(TriageTarget::MdeAlertPatch),
+            "CompromisedUser"
+        );
+        assert_eq!(
+            Determination::CompromisedAccount.wire(TriageTarget::MdeAlertBatch),
+            "CompromisedUser"
+        );
+        assert_eq!(
+            Determination::CompromisedAccount.wire(TriageTarget::XdrIncident),
+            "compromisedAccount"
+        );
 
-        assert_eq!(Determination::NotEnoughDataToValidate.wire(TriageTarget::MdeAlertPatch), "InsufficientData");
-        assert_eq!(Determination::NotEnoughDataToValidate.wire(TriageTarget::MdeAlertBatch), "InsufficientData");
-        assert_eq!(Determination::NotEnoughDataToValidate.wire(TriageTarget::XdrAlert), "notEnoughDataToValidate");
+        assert_eq!(
+            Determination::NotEnoughDataToValidate.wire(TriageTarget::MdeAlertPatch),
+            "InsufficientData"
+        );
+        assert_eq!(
+            Determination::NotEnoughDataToValidate.wire(TriageTarget::MdeAlertBatch),
+            "InsufficientData"
+        );
+        assert_eq!(
+            Determination::NotEnoughDataToValidate.wire(TriageTarget::XdrAlert),
+            "notEnoughDataToValidate"
+        );
 
         // Classification wire spellings
-        assert_eq!(Classification::TruePositive.wire(TriageTarget::MdeAlertPatch), "TruePositive");
-        assert_eq!(Classification::TruePositive.wire(TriageTarget::XdrAlert), "truePositive");
+        assert_eq!(
+            Classification::TruePositive.wire(TriageTarget::MdeAlertPatch),
+            "TruePositive"
+        );
+        assert_eq!(
+            Classification::TruePositive.wire(TriageTarget::XdrAlert),
+            "truePositive"
+        );
 
         // TriageStatus wire spellings
         use crate::server::TriageStatus;
-        assert_eq!(TriageStatus::New.wire(TriageTarget::MdeAlertPatch).unwrap(), "New");
-        assert_eq!(TriageStatus::New.wire(TriageTarget::XdrAlert).unwrap(), "new");
+        assert_eq!(
+            TriageStatus::New.wire(TriageTarget::MdeAlertPatch).unwrap(),
+            "New"
+        );
+        assert_eq!(
+            TriageStatus::New.wire(TriageTarget::XdrAlert).unwrap(),
+            "new"
+        );
         assert!(TriageStatus::New.wire(TriageTarget::XdrIncident).is_err());
-        assert!(TriageStatus::Active.wire(TriageTarget::MdeAlertPatch).is_err());
-        assert_eq!(TriageStatus::Active.wire(TriageTarget::XdrIncident).unwrap(), "active");
+        assert!(
+            TriageStatus::Active
+                .wire(TriageTarget::MdeAlertPatch)
+                .is_err()
+        );
+        assert_eq!(
+            TriageStatus::Active
+                .wire(TriageTarget::XdrIncident)
+                .unwrap(),
+            "active"
+        );
     }
 }

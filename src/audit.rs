@@ -264,7 +264,8 @@ impl AuditSink {
             {
                 if !parent_existed {
                     use std::os::unix::fs::PermissionsExt;
-                    tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+                    tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                        .await?;
                 }
             }
         }
@@ -334,7 +335,10 @@ mod tests {
             targets: vec![AuditTarget::machine_id("1a2b3c4d")],
             parameters: {
                 let mut map = serde_json::Map::new();
-                map.insert("isolation_type".to_string(), Value::String("Full".to_string()));
+                map.insert(
+                    "isolation_type".to_string(),
+                    Value::String("Full".to_string()),
+                );
                 map
             },
             justification: Some("Ransomware beaconing".to_string()),
@@ -366,9 +370,7 @@ mod tests {
         let audit_dir = temp_dir.join("audit_subdir");
         let audit_file = audit_dir.join("audit.jsonl");
 
-        let sink: AuditSink = AuditSink::open(&audit_file)
-            .await
-            .expect("open audit sink");
+        let sink: AuditSink = AuditSink::open(&audit_file).await.expect("open audit sink");
 
         #[cfg(unix)]
         {

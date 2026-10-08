@@ -4,8 +4,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 
 use super::session::{IdTokenClaims, IdTokenError, Secret};
@@ -63,7 +63,10 @@ pub fn parse_token_error(body: &str) -> TokenEndpointError {
 fn extract_aadsts_code(desc: &str) -> Option<u32> {
     if let Some(pos) = desc.find("AADSTS") {
         let remainder = &desc[pos + 6..];
-        let digits: String = remainder.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let digits: String = remainder
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
         digits.parse::<u32>().ok()
     } else {
         None
@@ -300,10 +303,10 @@ impl LoopbackListener {
                         "<!DOCTYPE html><html><head><title>Sign-in complete</title></head><body style=\"font-family: sans-serif; text-align: center; padding: 50px;\"><h2>Authentication complete</h2><p>You can close this window and return to the terminal.</p></body></html>"
                     };
 
-                    if let Ok(mut guard) = tx_holder.lock() {
-                        if let Some(sender) = guard.take() {
-                            let _ = sender.send(result);
-                        }
+                    if let Ok(mut guard) = tx_holder.lock()
+                        && let Some(sender) = guard.take()
+                    {
+                        let _ = sender.send(result);
                     }
                     notify.notify_one();
 
@@ -384,10 +387,10 @@ pub type BrowserLauncher = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>
 /// Spawn system browser or test launcher command.
 pub fn launch_browser(url: &str) -> Result<(), String> {
     #[cfg(debug_assertions)]
-    if let Ok(cmd) = std::env::var("DEFENDER_TEST_BROWSER_CMD") {
-        if !cmd.trim().is_empty() {
-            return spawn_test_browser_cmd(&cmd, url);
-        }
+    if let Ok(cmd) = std::env::var("DEFENDER_TEST_BROWSER_CMD")
+        && !cmd.trim().is_empty()
+    {
+        return spawn_test_browser_cmd(&cmd, url);
     }
 
     #[cfg(target_os = "macos")]
@@ -477,7 +480,7 @@ pub async fn redeem_auth_code(
     ];
 
     let resp = http_client
-        .post(&token_endpoint(tenant))
+        .post(token_endpoint(tenant))
         .form(&params)
         .send()
         .await?;
@@ -541,7 +544,9 @@ async fn run_browser_attempt(
     }
 
     let timeout_secs = crate::constants::BROWSER_SIGN_IN_TIMEOUT_SECS;
-    let code = listener.wait_for_code(Duration::from_secs(timeout_secs)).await?;
+    let code = listener
+        .wait_for_code(Duration::from_secs(timeout_secs))
+        .await?;
 
     redeem_auth_code(
         http_client,
@@ -573,7 +578,9 @@ pub async fn run_browser_flow_with_launcher(
     {
         Ok(res) => Ok(res),
         Err(SignInError::InvalidScope) if !requested_scopes.is_empty() => {
-            eprintln!("Scope invalid on authorize URL; retrying sign-in with standard OIDC scopes...");
+            eprintln!(
+                "Scope invalid on authorize URL; retrying sign-in with standard OIDC scopes..."
+            );
             run_browser_attempt(http_client, tenant, client_id, &[], launcher.as_ref()).await
         }
         Err(e) => Err(e),
@@ -612,7 +619,7 @@ pub async fn run_device_code_flow(
     ];
 
     let resp = http_client
-        .post(&devicecode_endpoint(tenant))
+        .post(devicecode_endpoint(tenant))
         .form(&params)
         .send()
         .await?;
@@ -636,9 +643,22 @@ pub async fn run_device_code_flow(
     let expires_in_secs = dc_resp.expires_in.unwrap_or(900);
     let expires_at = tokio::time::Instant::now() + Duration::from_secs(expires_in_secs);
 
-    let slow_down_step = if cfg!(debug_assertions) {
+    let slow_down_step = if cfg!(test) {
         Duration::from_millis(50)
     } else {
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(val) = std::env::var("DEFENDER_TEST_SLOW_DOWN_MS") {
+                if let Ok(ms) = val.parse::<u64>() {
+                    Duration::from_millis(ms)
+                } else {
+                    Duration::from_secs(5)
+                }
+            } else {
+                Duration::from_secs(5)
+            }
+        }
+        #[cfg(not(debug_assertions))]
         Duration::from_secs(5)
     };
 
@@ -659,7 +679,7 @@ pub async fn run_device_code_flow(
         ];
 
         let poll_resp = http_client
-            .post(&token_endpoint(tenant))
+            .post(token_endpoint(tenant))
             .form(&poll_params)
             .send()
             .await?;
@@ -668,8 +688,9 @@ pub async fn run_device_code_flow(
         let poll_body = poll_resp.text().await?;
 
         if poll_status.is_success() {
-            let token_resp: RawTokenResponse = serde_json::from_str(&poll_body)
-                .map_err(|e| SignInError::Internal(format!("failed to parse token response: {e}")))?;
+            let token_resp: RawTokenResponse = serde_json::from_str(&poll_body).map_err(|e| {
+                SignInError::Internal(format!("failed to parse token response: {e}"))
+            })?;
 
             let id_token_str = token_resp.id_token.ok_or(SignInError::MissingIdToken)?;
             let claims = super::session::decode_id_token_claims(&id_token_str)?;
@@ -747,7 +768,7 @@ pub async fn refresh_token_grant(
     ];
 
     let resp = http_client
-        .post(&token_endpoint(tenant))
+        .post(token_endpoint(tenant))
         .form(&params)
         .send()
         .await?;
@@ -760,8 +781,9 @@ pub async fn refresh_token_grant(
         return Err(RefreshTokenError::Endpoint(err));
     }
 
-    let token_resp: RawTokenResponse = serde_json::from_str(&body)
-        .map_err(|e| RefreshTokenError::InvalidResponse(format!("failed to parse token response: {e}")))?;
+    let token_resp: RawTokenResponse = serde_json::from_str(&body).map_err(|e| {
+        RefreshTokenError::InvalidResponse(format!("failed to parse token response: {e}"))
+    })?;
 
     let access_token_str = token_resp
         .access_token
@@ -796,7 +818,9 @@ pub async fn interactive_sign_in(
             if is_headless() {
                 run_device_code_flow(http_client, tenant, client_id).await
             } else {
-                match run_browser_flow(http_client, tenant, client_id, requested_resource_scopes).await {
+                match run_browser_flow(http_client, tenant, client_id, requested_resource_scopes)
+                    .await
+                {
                     Ok(res) => Ok(res),
                     Err(SignInError::BrowserLaunchFailed(_)) => {
                         run_device_code_flow(http_client, tenant, client_id).await
@@ -808,9 +832,7 @@ pub async fn interactive_sign_in(
         SignInFlow::Browser => {
             run_browser_flow(http_client, tenant, client_id, requested_resource_scopes).await
         }
-        SignInFlow::DeviceCode => {
-            run_device_code_flow(http_client, tenant, client_id).await
-        }
+        SignInFlow::DeviceCode => run_device_code_flow(http_client, tenant, client_id).await,
     }
 }
 
@@ -887,7 +909,10 @@ pub(crate) mod tests {
         assert!(url.to_string().contains("state=state-xyz"));
         assert!(url.to_string().contains("code_challenge=challenge-123"));
         assert!(url.to_string().contains("client_id=client-abc"));
-        assert!(url.to_string().contains("redirect_uri=http%3A%2F%2Flocalhost%3A54321"));
+        assert!(
+            url.to_string()
+                .contains("redirect_uri=http%3A%2F%2Flocalhost%3A54321")
+        );
         let query = url.query().expect("query");
         assert!(query.contains("scope=openid+profile+offline_access+https%3A%2F%2Fapi.securitycenter.microsoft.com%2FMachine.Read"));
     }
@@ -895,13 +920,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_loopback_listener_state_mismatch_rejected() {
         let expected_state = "correct-state-123".to_string();
-        let listener = LoopbackListener::bind(expected_state).await.expect("bind listener");
+        let listener = LoopbackListener::bind(expected_state)
+            .await
+            .expect("bind listener");
         let port = listener.port;
 
         // Make an HTTP GET request with a mismatched state
         let client = reqwest::Client::new();
         let resp = client
-            .get(format!("http://127.0.0.1:{port}/?code=mock-code&state=wrong-state"))
+            .get(format!(
+                "http://127.0.0.1:{port}/?code=mock-code&state=wrong-state"
+            ))
             .send()
             .await
             .expect("send redirect");
@@ -915,23 +944,32 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_loopback_listener_success() {
         let expected_state = "state-999".to_string();
-        let listener = LoopbackListener::bind(expected_state).await.expect("bind listener");
+        let listener = LoopbackListener::bind(expected_state)
+            .await
+            .expect("bind listener");
         let port = listener.port;
 
         let client = reqwest::Client::new();
         let resp = client
-            .get(format!("http://127.0.0.1:{port}/?code=auth-code-123&state=state-999"))
+            .get(format!(
+                "http://127.0.0.1:{port}/?code=auth-code-123&state=state-999"
+            ))
             .send()
             .await
             .expect("send redirect");
 
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-        let code = listener.wait_for_code(Duration::from_secs(5)).await.expect("wait for code");
+        let code = listener
+            .wait_for_code(Duration::from_secs(5))
+            .await
+            .expect("wait for code");
         assert_eq!(code, "auth-code-123");
     }
 
-    pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serializes unit tests that mutate process environment variables. A Tokio mutex, because
+    /// the guard is held across awaits.
+    pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn make_mock_id_token(account: &str, tid: &str) -> String {
         let payload_json = serde_json::json!({
@@ -955,7 +993,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_device_code_polling_success() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().await;
         let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let call_count_clone = Arc::clone(&call_count);
         let jwt = make_mock_id_token("alice@contoso.com", "tenant-1");
@@ -979,13 +1017,16 @@ pub(crate) mod tests {
                 axum::routing::post({
                     let jwt = jwt.clone();
                     move || {
-                        let count = call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let count =
+                            call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let jwt = jwt.clone();
                         async move {
                             match count {
                                 0 => (
                                     axum::http::StatusCode::BAD_REQUEST,
-                                    axum::Json(serde_json::json!({"error": "authorization_pending"})),
+                                    axum::Json(
+                                        serde_json::json!({"error": "authorization_pending"}),
+                                    ),
                                 ),
                                 1 => (
                                     axum::http::StatusCode::BAD_REQUEST,
@@ -1018,7 +1059,10 @@ pub(crate) mod tests {
             .await
             .expect("device code flow success");
 
-        assert_eq!(claims.preferred_username.as_deref(), Some("alice@contoso.com"));
+        assert_eq!(
+            claims.preferred_username.as_deref(),
+            Some("alice@contoso.com")
+        );
         assert_eq!(refresh_token.expose(), "SENTINEL-RT-1");
         assert!(call_count.load(std::sync::atomic::Ordering::SeqCst) >= 3);
 
@@ -1031,7 +1075,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_device_code_polling_expired() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().await;
         let app = axum::Router::new()
             .route(
                 "/mock-tenant/oauth2/v2.0/devicecode",
@@ -1077,7 +1121,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_browser_flow_end_to_end() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().await;
         let app = axum::Router::new().route(
             "/mock-tenant/oauth2/v2.0/token",
             axum::routing::post(|body: String| async move {
@@ -1108,9 +1152,16 @@ pub(crate) mod tests {
 
         let launcher: BrowserLauncher = Arc::new(|url_str: &str| {
             let parsed = url::Url::parse(url_str).map_err(|e| e.to_string())?;
-            let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-            assert_eq!(pairs.get("code_challenge_method").map(|s| s.as_str()), Some("S256"));
-            assert_eq!(pairs.get("prompt").map(|s| s.as_str()), Some("select_account"));
+            let pairs: std::collections::HashMap<_, _> =
+                parsed.query_pairs().into_owned().collect();
+            assert_eq!(
+                pairs.get("code_challenge_method").map(|s| s.as_str()),
+                Some("S256")
+            );
+            assert_eq!(
+                pairs.get("prompt").map(|s| s.as_str()),
+                Some("select_account")
+            );
 
             let redirect_uri = pairs.get("redirect_uri").expect("redirect_uri").clone();
             let state = pairs.get("state").expect("state").clone();
@@ -1118,7 +1169,9 @@ pub(crate) mod tests {
             tokio::spawn(async move {
                 let client = reqwest::Client::new();
                 let _ = client
-                    .get(format!("{redirect_uri}?code=SENTINEL-CODE-99&state={state}"))
+                    .get(format!(
+                        "{redirect_uri}?code=SENTINEL-CODE-99&state={state}"
+                    ))
                     .send()
                     .await;
             });
@@ -1137,7 +1190,10 @@ pub(crate) mod tests {
         .await
         .expect("browser flow should succeed");
 
-        assert_eq!(claims.preferred_username.as_deref(), Some("analyst@example.com"));
+        assert_eq!(
+            claims.preferred_username.as_deref(),
+            Some("analyst@example.com")
+        );
         assert_eq!(refresh_token.expose(), "SENTINEL-RT-2");
 
         // SAFETY: Cleaning up environment variable.
@@ -1149,7 +1205,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_refresh_token_grant() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().await;
         let app = axum::Router::new().route(
             "/mock-tenant/oauth2/v2.0/token",
             axum::routing::post(|body: String| async move {
@@ -1189,7 +1245,10 @@ pub(crate) mod tests {
         .expect("refresh token grant success");
 
         assert_eq!(res.access_token.expose(), "SENTINEL-AT-ROTATED");
-        assert_eq!(res.refresh_token.as_ref().map(|s| s.expose()), Some("SENTINEL-RT-ROTATED"));
+        assert_eq!(
+            res.refresh_token.as_ref().map(|s| s.expose()),
+            Some("SENTINEL-RT-ROTATED")
+        );
         assert_eq!(res.scopes, vec!["Machine.Read"]);
 
         // SAFETY: Cleaning up environment variable.

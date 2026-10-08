@@ -10,10 +10,10 @@ use clap::{Parser, ValueEnum};
 
 use crate::constants::{
     DEFAULT_BIND_ADDRESS, DEFAULT_QUARANTINE_DIR, ENV_AUDIT_LOG, ENV_AUTH_MODE, ENV_BIND_ADDRESS,
-    ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_DEVICE_RESPONSE_ENABLED,
-    ENV_DISABLE_HUMAN_CONFIRMATION, ENV_INDICATORS_ENABLED, ENV_LIVE_RESPONSE_ALLOWED_COMMANDS,
-    ENV_LIVE_RESPONSE_ENABLED, ENV_OFFBOARDING_ENABLED, ENV_QUARANTINE_DIR, ENV_READ_ONLY,
-    ENV_SIGN_IN_FLOW, ENV_TENANT_ID, ENV_TRANSPORT, ENV_TRIAGE_ENABLED,
+    ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_DEVICE_RESPONSE_ENABLED, ENV_DISABLE_HUMAN_CONFIRMATION,
+    ENV_INDICATORS_ENABLED, ENV_LIVE_RESPONSE_ALLOWED_COMMANDS, ENV_LIVE_RESPONSE_ENABLED,
+    ENV_OFFBOARDING_ENABLED, ENV_QUARANTINE_DIR, ENV_READ_ONLY, ENV_SIGN_IN_FLOW, ENV_TENANT_ID,
+    ENV_TRANSPORT, ENV_TRIAGE_ENABLED,
 };
 
 /// MCP transport.
@@ -36,7 +36,9 @@ pub enum AuthMode {
 }
 
 /// Interactive sign-in flow for `--auth-mode user`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize, serde::Deserialize,
+)]
 #[value(rename_all = "kebab-case")]
 pub enum SignInFlow {
     /// Try browser flow, falling back to device-code flow if headless or launch fails.
@@ -82,19 +84,25 @@ impl AuditLogSetting {
 
 /// Resolves the default audit log file path per platform conventions.
 pub fn default_audit_path() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|s| !s.is_empty()) {
+    resolve_audit_path(|key| std::env::var_os(key))
+}
+
+/// Resolves the default audit log path from `XDG_STATE_HOME`, then `HOME`, then
+/// `LOCALAPPDATA`, falling back to the working directory. `var` looks up an environment
+/// variable; empty values count as unset.
+pub fn resolve_audit_path(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    let var = |key: &str| var(key).filter(|s| !s.is_empty());
+    if let Some(xdg) = var("XDG_STATE_HOME") {
         PathBuf::from(xdg)
             .join("microsoft-defender-mcp")
             .join("audit.jsonl")
-    } else if let Some(home) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+    } else if let Some(home) = var("HOME") {
         PathBuf::from(home)
             .join(".local")
             .join("state")
             .join("microsoft-defender-mcp")
             .join("audit.jsonl")
-    } else if let Some(local_app_data) =
-        std::env::var_os("LOCALAPPDATA").filter(|s| !s.is_empty())
-    {
+    } else if let Some(local_app_data) = var("LOCALAPPDATA") {
         PathBuf::from(local_app_data)
             .join("microsoft-defender-mcp")
             .join("audit.jsonl")
@@ -388,7 +396,9 @@ pub fn validate_credentials(auth_mode: AuthMode) -> Result<(), String> {
             let client_secret = std::env::var(ENV_CLIENT_SECRET)
                 .map_err(|_| format!("{ENV_CLIENT_SECRET} environment variable is required"))?;
             if client_secret.trim().is_empty() {
-                return Err(format!("{ENV_CLIENT_SECRET} environment variable is required"));
+                return Err(format!(
+                    "{ENV_CLIENT_SECRET} environment variable is required"
+                ));
             }
         }
         AuthMode::User => {
@@ -485,7 +495,10 @@ mod tests {
         assert!(!config.confirm_destructive);
         assert_eq!(config.auth, AuthConfig::App);
         assert!(config.audit_log.is_explicit());
-        assert_eq!(config.audit_log.path(), std::path::Path::new("/custom/audit.jsonl"));
+        assert_eq!(
+            config.audit_log.path(),
+            std::path::Path::new("/custom/audit.jsonl")
+        );
         assert_eq!(
             config.live_response_allowed_commands,
             Some(vec!["PutFile".to_string(), "RunScript".to_string()])
@@ -524,13 +537,19 @@ mod tests {
             std::env::set_var(ENV_TENANT_ID, "common");
         }
         let err_common = validate_credentials(AuthMode::User).unwrap_err();
-        assert_eq!(err_common, "AZURE_TENANT_ID cannot be 'common' or 'organizations'");
+        assert_eq!(
+            err_common,
+            "AZURE_TENANT_ID cannot be 'common' or 'organizations'"
+        );
 
         unsafe {
             std::env::set_var(ENV_TENANT_ID, "organizations");
         }
         let err_orgs = validate_credentials(AuthMode::User).unwrap_err();
-        assert_eq!(err_orgs, "AZURE_TENANT_ID cannot be 'common' or 'organizations'");
+        assert_eq!(
+            err_orgs,
+            "AZURE_TENANT_ID cannot be 'common' or 'organizations'"
+        );
 
         unsafe {
             std::env::set_var(ENV_TENANT_ID, "72f988bf-1234-5678-9abc-def012345678");

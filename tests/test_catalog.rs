@@ -16,29 +16,8 @@ const READ_ONLY_TOOLS: [&str; 6] = [
     "defender_forensics",
 ];
 
+/// The 88 tool names removed in 1.0.0 (contracts/migration-table.md, left column).
 fn extract_removed_tool_names() -> HashSet<String> {
-    // Attempt to read from the repo contracts file; if running in an isolated environment,
-    // fall back to the known 88 removed names.
-    let table_path = std::path::Path::new("specs/002-mde-response-delegated-auth/contracts/migration-table.md");
-    if let Ok(content) = std::fs::read_to_string(table_path) {
-        let mut names = HashSet::new();
-        for line in content.lines() {
-            let line = line.trim();
-            if line.starts_with("| `defender_") {
-                if let Some(col) = line.split('|').nth(1) {
-                    let tool = col.trim().trim_matches('`');
-                    if tool.starts_with("defender_") {
-                        names.insert(tool.to_string());
-                    }
-                }
-            }
-        }
-        if !names.is_empty() {
-            return names;
-        }
-    }
-
-    // Fallback embedded set of all 88 removed granular tools
     [
         "defender_advanced_hunting_run",
         "defender_ti_intel_profiles_list",
@@ -248,7 +227,11 @@ fn test_call_granular_tool_returns_unknown_tool_error() {
     );
     let err = &resp["error"];
     assert!(
-        err["message"].as_str().unwrap().to_lowercase().contains("tool not found"),
+        err["message"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("tool not found"),
         "expected tool not found error, got: {err}"
     );
     assert!(server.shutdown().success());
@@ -374,10 +357,8 @@ fn test_offboarding_catalog_configurations() {
 
     // 2. --enable-device-response --enable-offboarding: description includes offboard
     {
-        let mut server = McpProcess::start(
-            &["--enable-device-response", "--enable-offboarding"],
-            &[],
-        );
+        let mut server =
+            McpProcess::start(&["--enable-device-response", "--enable-offboarding"], &[]);
         let tools = server.tools();
         let tool = tools
             .iter()
@@ -451,16 +432,22 @@ fn test_all_categories_enabled_lists_ten_tools_full_annotations_and_server_info(
         stdin.flush().expect("flush initialize");
 
         let mut line = String::new();
-        stdout.read_line(&mut line).expect("read initialize response");
+        stdout
+            .read_line(&mut line)
+            .expect("read initialize response");
         let init_resp: Value = serde_json::from_str(&line).expect("valid JSON initialize response");
         let result = &init_resp["result"];
 
         // Assert literal "1.0.0"
-        let ver = result["serverInfo"]["version"].as_str().expect("version string");
+        let ver = result["serverInfo"]["version"]
+            .as_str()
+            .expect("version string");
         assert_eq!(ver, "1.0.0", "serverInfo.version must be literal '1.0.0'");
 
         // Assert instructions contain NO migration-table name
-        let instructions = result["instructions"].as_str().expect("instructions string");
+        let instructions = result["instructions"]
+            .as_str()
+            .expect("instructions string");
         let removed = extract_removed_tool_names();
         for name in &removed {
             assert!(
@@ -480,16 +467,86 @@ fn test_all_categories_enabled_lists_ten_tools_full_annotations_and_server_info(
     assert_eq!(tools.len(), 10, "expected exactly 10 tools; got: {tools:?}");
 
     let expected_tools: [(&str, &str, bool, bool, bool, bool); 10] = [
-        ("defender_hunting", "Defender Hunting", true, false, true, true),
-        ("defender_ti", "Defender Threat Intelligence", true, false, true, true),
-        ("defender_incidents_alerts", "Defender Incidents & Alerts", true, false, true, true),
-        ("defender_machines", "Defender Machines", true, false, true, true),
-        ("defender_vulnerabilities", "Defender Vulnerabilities", true, false, true, true),
-        ("defender_forensics", "Defender Forensics", true, false, true, true),
-        ("defender_response", "Defender Response", false, true, false, true),
-        ("defender_device_response", "Defender Device Response", false, true, false, true),
-        ("defender_indicators", "Defender Custom Indicators", false, true, false, true),
-        ("defender_triage", "Defender Triage", false, false, false, true),
+        (
+            "defender_hunting",
+            "Defender Hunting",
+            true,
+            false,
+            true,
+            true,
+        ),
+        (
+            "defender_ti",
+            "Defender Threat Intelligence",
+            true,
+            false,
+            true,
+            true,
+        ),
+        (
+            "defender_incidents_alerts",
+            "Defender Incidents & Alerts",
+            true,
+            false,
+            true,
+            true,
+        ),
+        (
+            "defender_machines",
+            "Defender Machines",
+            true,
+            false,
+            true,
+            true,
+        ),
+        (
+            "defender_vulnerabilities",
+            "Defender Vulnerabilities",
+            true,
+            false,
+            true,
+            true,
+        ),
+        (
+            "defender_forensics",
+            "Defender Forensics",
+            true,
+            false,
+            true,
+            true,
+        ),
+        (
+            "defender_response",
+            "Defender Response",
+            false,
+            true,
+            false,
+            true,
+        ),
+        (
+            "defender_device_response",
+            "Defender Device Response",
+            false,
+            true,
+            false,
+            true,
+        ),
+        (
+            "defender_indicators",
+            "Defender Custom Indicators",
+            false,
+            true,
+            false,
+            true,
+        ),
+        (
+            "defender_triage",
+            "Defender Triage",
+            false,
+            false,
+            false,
+            true,
+        ),
     ];
 
     for (name, title, ro, dest, idemp, ow) in expected_tools {
@@ -500,8 +557,14 @@ fn test_all_categories_enabled_lists_ten_tools_full_annotations_and_server_info(
         let a = &tool["annotations"];
         assert_eq!(a["title"], title, "title mismatch for {name}");
         assert_eq!(a["readOnlyHint"], ro, "readOnlyHint mismatch for {name}");
-        assert_eq!(a["destructiveHint"], dest, "destructiveHint mismatch for {name}");
-        assert_eq!(a["idempotentHint"], idemp, "idempotentHint mismatch for {name}");
+        assert_eq!(
+            a["destructiveHint"], dest,
+            "destructiveHint mismatch for {name}"
+        );
+        assert_eq!(
+            a["idempotentHint"], idemp,
+            "idempotentHint mismatch for {name}"
+        );
         assert_eq!(a["openWorldHint"], ow, "openWorldHint mismatch for {name}");
     }
 

@@ -705,17 +705,8 @@ pub struct LiveResponseLibraryUploadInput {
 }
 
 // ---------------------------------------------------------------------------
-// Consolidated domain dispatchers: action catalogs and inputs
+// Domain dispatchers: action catalogs and inputs
 // ---------------------------------------------------------------------------
-
-/// Tools (granular or consolidated) that can change endpoint or tenant state. They are omitted
-/// from discovery and rejected before any network call when the server runs `--read-only`.
-pub const MUTATING_TOOLS: &[&str] = &[
-    "defender_response",
-    "defender_device_response",
-    "defender_indicators",
-    "defender_triage",
-];
 
 pub const HUNTING_ACTIONS: &[&str] = &["run"];
 
@@ -921,7 +912,34 @@ classification, determination, tags: customTags), xdr_incident_comment (id, comm
 justification is mandatory (minimum 10 characters) for the audit log and is never sent upstream. \
 Non-destructive: no human confirmation prompt.";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Deserialize a closed input enum from its exact input spelling (`name`). Errors name the
+/// input `field` and list the valid values, because the parameter extractor reports serde
+/// errors without a field path.
+fn closed_enum<'de, D, T>(
+    deserializer: D,
+    field: &str,
+    variants: &[T],
+    name: fn(&T) -> &'static str,
+) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Copy,
+{
+    let value = String::deserialize(deserializer)?;
+    variants
+        .iter()
+        .find(|v| name(v) == value)
+        .copied()
+        .ok_or_else(|| {
+            let valid: Vec<&str> = variants.iter().map(name).collect();
+            serde::de::Error::custom(format!(
+                "invalid {field} '{value}'; valid values: {}",
+                valid.join(", ")
+            ))
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 pub enum IsolationType {
     Full,
     Selective,
@@ -938,7 +956,18 @@ impl IsolationType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+impl<'de> Deserialize<'de> for IsolationType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        closed_enum(
+            deserializer,
+            "isolation_type",
+            &[Self::Full, Self::Selective, Self::UnManagedDevice],
+            Self::as_str,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 pub enum ScanType {
     Quick,
     Full,
@@ -953,7 +982,18 @@ impl ScanType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+impl<'de> Deserialize<'de> for ScanType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        closed_enum(
+            deserializer,
+            "scan_type",
+            &[Self::Quick, Self::Full],
+            Self::as_str,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 pub enum DeviceValue {
     Low,
     Normal,
@@ -967,6 +1007,17 @@ impl DeviceValue {
             Self::Normal => "Normal",
             Self::High => "High",
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for DeviceValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        closed_enum(
+            deserializer,
+            "device_value",
+            &[Self::Low, Self::Normal, Self::High],
+            Self::as_str,
+        )
     }
 }
 
@@ -990,7 +1041,7 @@ pub struct DeviceResponseInput {
     pub device_value: Option<DeviceValue>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 pub enum IndicatorType {
     FileSha1,
     FileSha256,
@@ -1012,6 +1063,25 @@ impl IndicatorType {
             Self::DomainName => "DomainName",
             Self::Url => "Url",
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for IndicatorType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        closed_enum(
+            deserializer,
+            "indicator_type",
+            &[
+                Self::FileSha1,
+                Self::FileSha256,
+                Self::FileMd5,
+                Self::CertificateThumbprint,
+                Self::IpAddress,
+                Self::DomainName,
+                Self::Url,
+            ],
+            Self::as_str,
+        )
     }
 }
 
@@ -1037,28 +1107,29 @@ impl IndicatorAction {
 }
 
 impl<'de> Deserialize<'de> for IndicatorAction {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        match s.as_str() {
-            "Allowed" => Ok(Self::Allowed),
-            "Audit" => Ok(Self::Audit),
-            "Warn" => Ok(Self::Warn),
-            "Block" => Ok(Self::Block),
-            "BlockAndRemediate" => Ok(Self::BlockAndRemediate),
-            "Alert" | "AlertAndBlock" => Err(serde::de::Error::custom(
-                format!("Action '{s}' is legacy, unsupported since January 2022")
-            )),
-            _ => Err(serde::de::Error::custom(format!(
-                "Unknown indicator action '{s}'"
-            ))),
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if matches!(value.as_str(), "Alert" | "AlertAndBlock") {
+            return Err(serde::de::Error::custom(format!(
+                "indicator_action '{value}' is legacy, unsupported since January 2022"
+            )));
         }
+        closed_enum(
+            serde::de::value::StringDeserializer::<D::Error>::new(value),
+            "indicator_action",
+            &[
+                Self::Allowed,
+                Self::Audit,
+                Self::Warn,
+                Self::Block,
+                Self::BlockAndRemediate,
+            ],
+            Self::as_str,
+        )
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 pub enum IndicatorSeverity {
     Informational,
     Low,
@@ -1074,6 +1145,17 @@ impl IndicatorSeverity {
             Self::Medium => "Medium",
             Self::High => "High",
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for IndicatorSeverity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        closed_enum(
+            deserializer,
+            "severity",
+            &[Self::Informational, Self::Low, Self::Medium, Self::High],
+            Self::as_str,
+        )
     }
 }
 
@@ -1117,7 +1199,7 @@ pub enum TriageTarget {
     XdrIncident,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum TriageStatus {
     New,
@@ -1164,14 +1246,31 @@ impl TriageStatus {
                 Self::Resolved => Ok("resolved"),
                 Self::Redirected => Ok("redirected"),
                 Self::New => Err(crate::error::invalid_params(
-                    "status 'new' is not supported for XDR incidents; valid: active, inProgress, resolved, redirected"
+                    "status 'new' is not supported for XDR incidents; valid: active, inProgress, resolved, redirected",
                 )),
             },
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+impl<'de> Deserialize<'de> for TriageStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        closed_enum(
+            deserializer,
+            "status",
+            &[
+                Self::New,
+                Self::InProgress,
+                Self::Resolved,
+                Self::Active,
+                Self::Redirected,
+            ],
+            Self::as_str,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum Classification {
     TruePositive,
@@ -1200,7 +1299,22 @@ impl Classification {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+impl<'de> Deserialize<'de> for Classification {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        closed_enum(
+            deserializer,
+            "classification",
+            &[
+                Self::TruePositive,
+                Self::InformationalExpectedActivity,
+                Self::FalsePositive,
+            ],
+            Self::as_str,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum Determination {
     MultiStagedAttack,
@@ -1295,6 +1409,30 @@ impl Determination {
     }
 }
 
+impl<'de> Deserialize<'de> for Determination {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        closed_enum(
+            deserializer,
+            "determination",
+            &[
+                Self::MultiStagedAttack,
+                Self::MaliciousUserActivity,
+                Self::CompromisedAccount,
+                Self::Malware,
+                Self::Phishing,
+                Self::UnwantedSoftware,
+                Self::SecurityTesting,
+                Self::LineOfBusinessApplication,
+                Self::ConfirmedActivity,
+                Self::NotMalicious,
+                Self::NotEnoughDataToValidate,
+                Self::Other,
+            ],
+            Self::as_str,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TriageInput {
@@ -1338,9 +1476,8 @@ pub struct HuntingInput {
     pub timespan: Option<String>,
 }
 
-/// Input for `defender_ti`. Unused fields must be omitted; each action accepts the same
-/// fields as its granular `defender_ti_<action>` tool, with `id` standing in for the
-/// action's identifier (profile, article, indicator, certificate, record, or CVE ID).
+/// Input for `defender_ti`. Unused fields must be omitted; `id` stands in for the action's
+/// identifier (profile, article, indicator, certificate, record, or CVE ID).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ThreatIntelInput {
@@ -1538,7 +1675,7 @@ pub struct ResponseInput {
     pub sha1: Option<String>,
 }
 
-/// Serialize a dispatcher input into granular-tool arguments: drop `action` and absent fields.
+/// Serialize a dispatcher input into per-action arguments: drop `action` and absent fields.
 fn action_args<T: Serialize>(input: &T) -> serde_json::Map<String, serde_json::Value> {
     let mut args = match serde_json::to_value(input) {
         Ok(serde_json::Value::Object(map)) => map,
@@ -1549,7 +1686,7 @@ fn action_args<T: Serialize>(input: &T) -> serde_json::Map<String, serde_json::V
     args
 }
 
-/// Move `from` to `to` when the target granular input has no `id` alias for that field.
+/// Move `from` to `to` when the target per-action input has no `id` alias for that field.
 fn rename_arg(args: &mut serde_json::Map<String, serde_json::Value>, from: &str, to: &str) {
     if !args.contains_key(to)
         && let Some(v) = args.remove(from)
@@ -1614,9 +1751,13 @@ impl DefenderServer {
         }
         if let Some(route) = router.map.get_mut("defender_device_response") {
             if config.categories.offboarding {
-                route.attr.description = Some(std::borrow::Cow::Borrowed(DEVICE_RESPONSE_DESCRIPTION_WITH_OFFBOARD));
+                route.attr.description = Some(std::borrow::Cow::Borrowed(
+                    DEVICE_RESPONSE_DESCRIPTION_WITH_OFFBOARD,
+                ));
             } else {
-                route.attr.description = Some(std::borrow::Cow::Borrowed(DEVICE_RESPONSE_DESCRIPTION_WITHOUT_OFFBOARD));
+                route.attr.description = Some(std::borrow::Cow::Borrowed(
+                    DEVICE_RESPONSE_DESCRIPTION_WITHOUT_OFFBOARD,
+                ));
             }
         }
         Self {
@@ -1636,14 +1777,6 @@ impl DefenderServer {
     /// Tools exposed by `tools/list` for the active configuration.
     pub fn list_tools_for_config(&self) -> Vec<Tool> {
         self.router.list_all()
-    }
-
-    /// Pre-network barrier for mutating tools: `Some(error)` when `--read-only` is active.
-    #[allow(dead_code)]
-    fn read_only_barrier(&self, tool: &str) -> Option<CallToolResult> {
-        self.config
-            .read_only
-            .then(|| crate::error::read_only_violation(tool))
     }
 
     /// Resolve the staging directory for a download, confining `destination_dir` to a
@@ -1776,13 +1909,16 @@ impl DefenderServer {
         category: PermissionCategory,
     ) -> Result<CallToolResult, McpError> {
         Ok(tool_result(
-            self.endpoint.endpoint_get_with_odata_as(path, odata, category).await,
+            self.endpoint
+                .endpoint_get_with_odata_as(path, odata, category)
+                .await,
         ))
     }
 
     /// Check whether the action is a write-named read that was not requested under delegated --read-only.
     fn check_scope_not_requested(&self, action: &str) -> Option<CallToolResult> {
-        if matches!(self.config.auth, crate::cli::AuthConfig::User { .. }) && self.config.read_only {
+        if matches!(self.config.auth, crate::cli::AuthConfig::User { .. }) && self.config.read_only
+        {
             let scope = match action {
                 "domain_related_machines"
                 | "file_related_machines"
@@ -3458,11 +3594,11 @@ impl DefenderServer {
 }
 
 // ---------------------------------------------------------------------------
-// Consolidated domain dispatchers (`--tool-mode consolidated`)
+// Domain dispatchers
 // ---------------------------------------------------------------------------
 
-/// Deserialize dispatcher arguments into the granular tool's typed input and invoke it, so the
-/// consolidated surface reuses every granular validation rule and endpoint mapping unchanged.
+/// Deserialize dispatcher arguments into the action's typed input and invoke its private
+/// handler, so every action keeps its validation rules and endpoint mapping.
 macro_rules! call_action {
     ($self:ident, $method:ident, $args:expr) => {{
         let params = serde_json::from_value(serde_json::Value::Object($args)).map_err(|e| {
@@ -3551,14 +3687,22 @@ impl DefenderServer {
         }
     }
     fn wrap_machine_action(resp: MutationResponse, warning: Option<&str>) -> MutationResponse {
-        let action_id = resp.body.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let action_id = resp
+            .body
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let mut map = serde_json::Map::new();
         map.insert("machineAction".to_string(), resp.body);
-        map.insert("poll_with".to_string(), json!({
-            "tool": "defender_forensics",
-            "action": "machine_action_get_status",
-            "action_id": action_id
-        }));
+        map.insert(
+            "poll_with".to_string(),
+            json!({
+                "tool": "defender_forensics",
+                "action": "machine_action_get_status",
+                "action_id": action_id
+            }),
+        );
         if let Some(w) = warning {
             map.insert("warning".to_string(), json!(w));
         }
@@ -3569,22 +3713,28 @@ impl DefenderServer {
     }
 
     fn wrap_investigation(resp: MutationResponse) -> MutationResponse {
-        let inv_id = resp.body.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let inv_id = resp
+            .body
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let mut map = serde_json::Map::new();
         map.insert("investigation".to_string(), resp.body);
-        map.insert("poll_with".to_string(), json!({
-            "tool": "defender_forensics",
-            "action": "investigation_get",
-            "investigation_id": inv_id
-        }));
+        map.insert(
+            "poll_with".to_string(),
+            json!({
+                "tool": "defender_forensics",
+                "action": "investigation_get",
+                "investigation_id": inv_id
+            }),
+        );
         MutationResponse {
             http_status: resp.http_status,
             body: Value::Object(map),
         }
     }
-
 }
-
 
 /// Parameters for executing a mutating tool action through the shared mutation pipeline.
 ///
@@ -3628,20 +3778,18 @@ impl DefenderServer {
         let attempt_id = new_attempt_id();
         let identity = self.identity();
 
-        let record_final = |reason: RejectReason, confirmation: ConfirmationOutcome| {
-            AuditRecord {
-                ts: chrono::Utc::now(),
-                attempt_id: attempt_id.clone(),
-                phase: AuditPhase::Final,
-                tool: req.tool.name().to_string(),
-                action: req.action.to_string(),
-                targets: req.targets.clone(),
-                parameters: req.parameters.clone(),
-                justification: req.justification.map(str::to_owned),
-                identity: identity.clone(),
-                confirmation,
-                result: AuditResult::Rejected { reason },
-            }
+        let record_final = |reason: RejectReason, confirmation: ConfirmationOutcome| AuditRecord {
+            ts: chrono::Utc::now(),
+            attempt_id: attempt_id.clone(),
+            phase: AuditPhase::Final,
+            tool: req.tool.name().to_string(),
+            action: req.action.to_string(),
+            targets: req.targets.clone(),
+            parameters: req.parameters.clone(),
+            justification: req.justification.map(str::to_owned),
+            identity: identity.clone(),
+            confirmation,
+            result: AuditResult::Rejected { reason },
         };
 
         // 1. Read-only check
@@ -3660,7 +3808,10 @@ impl DefenderServer {
             } else {
                 req.tool.enable_flag()
             };
-            let rec = record_final(RejectReason::CategoryDisabled, ConfirmationOutcome::NotApplicable);
+            let rec = record_final(
+                RejectReason::CategoryDisabled,
+                ConfirmationOutcome::NotApplicable,
+            );
             self.write_audit_record_best_effort(&rec).await;
             return Ok(crate::error::category_disabled(flag));
         }
@@ -3675,9 +3826,14 @@ impl DefenderServer {
         let justification = match req.justification.map(str::trim) {
             Some(j) if j.chars().count() >= crate::constants::MIN_JUSTIFICATION_LEN => j,
             _ => {
-                let rec = record_final(RejectReason::Validation, ConfirmationOutcome::NotApplicable);
+                let rec =
+                    record_final(RejectReason::Validation, ConfirmationOutcome::NotApplicable);
                 self.write_audit_record_best_effort(&rec).await;
-                let field_name = if req.tool == MutatingTool::Triage { "justification" } else { "comment" };
+                let field_name = if req.tool == MutatingTool::Triage {
+                    "justification"
+                } else {
+                    "comment"
+                };
                 return Ok(crate::error::tool_error(format!(
                     "{field_name} must be at least {} characters describing the purpose",
                     crate::constants::MIN_JUSTIFICATION_LEN
@@ -3695,12 +3851,16 @@ impl DefenderServer {
                 &req.targets,
                 justification,
                 &identity,
-            ).await;
+            )
+            .await;
 
             match outcome {
                 ConfirmationOutcome::Accepted => ConfirmationOutcome::Accepted,
                 ConfirmationOutcome::Unavailable => {
-                    let rec = record_final(RejectReason::ConfirmationUnavailable, ConfirmationOutcome::Unavailable);
+                    let rec = record_final(
+                        RejectReason::ConfirmationUnavailable,
+                        ConfirmationOutcome::Unavailable,
+                    );
                     self.write_audit_record_best_effort(&rec).await;
                     return Ok(crate::error::confirmation_unavailable());
                 }
@@ -3773,7 +3933,9 @@ impl DefenderServer {
             }
             Err(err) => {
                 let status_opt = http_status_of(&err);
-                let msg = err.content.first()
+                let msg = err
+                    .content
+                    .first()
                     .and_then(|c| c.as_text())
                     .map(|t| t.text.clone())
                     .unwrap_or_else(|| "upstream error".to_string());
@@ -3782,9 +3944,7 @@ impl DefenderServer {
                         http_status: status as u16,
                         message: msg,
                     },
-                    None => AuditResult::TransportError {
-                        message: msg,
-                    },
+                    None => AuditResult::TransportError { message: msg },
                 };
                 (audit_res, Ok(err))
             }
@@ -3804,12 +3964,12 @@ impl DefenderServer {
             result: audit_result,
         };
 
-        if let Some(sink) = &self.audit_sink {
-            if let Err(e) = sink.append(&outcome_record).await {
-                eprintln!(
-                    "AUDIT ERROR: failed to write outcome audit record for attempt {attempt_id}: {e}"
-                );
-            }
+        if let Some(sink) = &self.audit_sink
+            && let Err(e) = sink.append(&outcome_record).await
+        {
+            eprintln!(
+                "AUDIT ERROR: failed to write outcome audit record for attempt {attempt_id}: {e}"
+            );
         }
 
         tool_result
@@ -3817,11 +3977,46 @@ impl DefenderServer {
 
     /// Best effort write of an audit record to the sink if present; logs to stderr if failed.
     async fn write_audit_record_best_effort(&self, record: &AuditRecord) {
-        if let Some(sink) = &self.audit_sink {
-            if let Err(e) = sink.append(record).await {
-                eprintln!("AUDIT ERROR: failed to append audit record: {e}");
-            }
+        if let Some(sink) = &self.audit_sink
+            && let Err(e) = sink.append(record).await
+        {
+            eprintln!("AUDIT ERROR: failed to append audit record: {e}");
         }
+    }
+
+    /// Audit a protocol-level error raised while validating a known mutating action (for
+    /// example a missing required field) as a `final` validation rejection, and return it as a
+    /// tool error. Every rejection of a known action thus leaves one audit record and makes no
+    /// upstream request. Successful results pass through unchanged.
+    async fn audit_validation_error(
+        &self,
+        tool: MutatingTool,
+        action: &str,
+        category: PermissionCategory,
+        justification: Option<&str>,
+        context: &rmcp::service::RequestContext<rmcp::RoleServer>,
+        result: Result<CallToolResult, McpError>,
+    ) -> Result<CallToolResult, McpError> {
+        let Err(err) = result else {
+            return result;
+        };
+        self.execute_mutation(MutationRequest {
+            tool,
+            action,
+            category,
+            targets: Vec::new(),
+            parameters: serde_json::Map::new(),
+            justification,
+            validation_result: Err(crate::error::tool_error(err.message)),
+            context,
+            extract_tracking: |_| (None, None),
+            upstream: || async {
+                Err(crate::error::tool_error(
+                    "internal error: upstream called after a validation failure",
+                ))
+            },
+        })
+        .await
     }
 }
 
@@ -3978,16 +4173,49 @@ impl DefenderServer {
                 call_action!(self, defender_ti_vulnerability_component_get, args)
             }
             "custom_indicator_list" => {
-                if input.id.is_some() { return Err(crate::error::invalid_params("field 'id' is not used by action 'custom_indicator_list'")); }
-                if input.hostname.is_some() { return Err(crate::error::invalid_params("field 'hostname' is not used by action 'custom_indicator_list'")); }
-                if input.component_id.is_some() { return Err(crate::error::invalid_params("field 'component_id' is not used by action 'custom_indicator_list'")); }
-                if input.select.is_some() { return Err(crate::error::invalid_params("field 'select' is not used by action 'custom_indicator_list'")); }
-                if input.expand.is_some() { return Err(crate::error::invalid_params("field 'expand' is not used by action 'custom_indicator_list'")); }
-                if input.search.is_some() { return Err(crate::error::invalid_params("field 'search' is not used by action 'custom_indicator_list'")); }
-                if input.count.is_some() { return Err(crate::error::invalid_params("field 'count' is not used by action 'custom_indicator_list'")); }
+                if input.id.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'id' is not used by action 'custom_indicator_list'",
+                    ));
+                }
+                if input.hostname.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'hostname' is not used by action 'custom_indicator_list'",
+                    ));
+                }
+                if input.component_id.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'component_id' is not used by action 'custom_indicator_list'",
+                    ));
+                }
+                if input.select.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'select' is not used by action 'custom_indicator_list'",
+                    ));
+                }
+                if input.expand.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'expand' is not used by action 'custom_indicator_list'",
+                    ));
+                }
+                if input.search.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'search' is not used by action 'custom_indicator_list'",
+                    ));
+                }
+                if input.count.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'count' is not used by action 'custom_indicator_list'",
+                    ));
+                }
                 validation::validate_endpoint_odata_params(input.top, input.skip)?;
-                let odata = Self::ep_odata(input.filter.as_deref(), input.top.unwrap_or(DEFAULT_TOP), input.skip.unwrap_or(0));
-                self.ep_odata_get_as("/api/indicators", &odata, PermissionCategory::Indicators).await
+                let odata = Self::ep_odata(
+                    input.filter.as_deref(),
+                    input.top.unwrap_or(DEFAULT_TOP),
+                    input.skip.unwrap_or(0),
+                );
+                self.ep_odata_get_as("/api/indicators", &odata, PermissionCategory::Indicators)
+                    .await
             }
             _ => Err(crate::error::unknown_action_error(
                 "defender_ti",
@@ -4138,56 +4366,194 @@ impl DefenderServer {
                 call_action!(self, defender_endpoint_user_related_machines, args)
             }
             "find_by_ip" => {
-                if input.machine_id.is_some() { return Err(crate::error::invalid_params("field 'machine_id' is not used by action 'find_by_ip'")); }
-                if input.tag_name.is_some() { return Err(crate::error::invalid_params("field 'tag_name' is not used by action 'find_by_ip'")); }
-                if input.use_starts_with.is_some() { return Err(crate::error::invalid_params("field 'use_starts_with' is not used by action 'find_by_ip'")); }
-                if input.look_back_hours.is_some() { return Err(crate::error::invalid_params("field 'look_back_hours' is not used by action 'find_by_ip'")); }
-                if input.top.is_some() { return Err(crate::error::invalid_params("field 'top' is not used by action 'find_by_ip'")); }
-                if input.skip.is_some() { return Err(crate::error::invalid_params("field 'skip' is not used by action 'find_by_ip'")); }
-                if input.filter.is_some() { return Err(crate::error::invalid_params("field 'filter' is not used by action 'find_by_ip'")); }
+                if input.machine_id.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'machine_id' is not used by action 'find_by_ip'",
+                    ));
+                }
+                if input.tag_name.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'tag_name' is not used by action 'find_by_ip'",
+                    ));
+                }
+                if input.use_starts_with.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'use_starts_with' is not used by action 'find_by_ip'",
+                    ));
+                }
+                if input.look_back_hours.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'look_back_hours' is not used by action 'find_by_ip'",
+                    ));
+                }
+                if input.top.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'top' is not used by action 'find_by_ip'",
+                    ));
+                }
+                if input.skip.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'skip' is not used by action 'find_by_ip'",
+                    ));
+                }
+                if input.filter.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'filter' is not used by action 'find_by_ip'",
+                    ));
+                }
                 let ip = required(&input.id, "id", action)?;
                 let validated_ip = validation::validate_ip_address(ip)?;
                 let ts = required(&input.timestamp, "timestamp", action)?;
-                let normalized_ts = validation::validate_recent_timestamp(ts, crate::constants::FIND_BY_IP_MAX_AGE_DAYS)?;
-                let path = format!("/api/machines/findbyip(ip='{validated_ip}',timestamp={normalized_ts})");
-                self.ep_simple_get_as(&path, PermissionCategory::ReadWriteNamed).await
+                let normalized_ts = validation::validate_recent_timestamp(
+                    ts,
+                    crate::constants::FIND_BY_IP_MAX_AGE_DAYS,
+                )?;
+                let path = format!(
+                    "/api/machines/findbyip(ip='{validated_ip}',timestamp={normalized_ts})"
+                );
+                self.ep_simple_get_as(&path, PermissionCategory::ReadWriteNamed)
+                    .await
             }
             "machine_alerts" => {
-                if input.timestamp.is_some() { return Err(crate::error::invalid_params("field 'timestamp' is not used by action 'machine_alerts'")); }
-                if input.tag_name.is_some() { return Err(crate::error::invalid_params("field 'tag_name' is not used by action 'machine_alerts'")); }
-                if input.use_starts_with.is_some() { return Err(crate::error::invalid_params("field 'use_starts_with' is not used by action 'machine_alerts'")); }
-                if input.look_back_hours.is_some() { return Err(crate::error::invalid_params("field 'look_back_hours' is not used by action 'machine_alerts'")); }
-                let m_id = input.machine_id.as_deref().or(input.id.as_deref()).ok_or_else(|| crate::error::invalid_params("action 'machine_alerts' requires 'machine_id'"))?;
+                if input.timestamp.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'timestamp' is not used by action 'machine_alerts'",
+                    ));
+                }
+                if input.tag_name.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'tag_name' is not used by action 'machine_alerts'",
+                    ));
+                }
+                if input.use_starts_with.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'use_starts_with' is not used by action 'machine_alerts'",
+                    ));
+                }
+                if input.look_back_hours.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'look_back_hours' is not used by action 'machine_alerts'",
+                    ));
+                }
+                let m_id = input
+                    .machine_id
+                    .as_deref()
+                    .or(input.id.as_deref())
+                    .ok_or_else(|| {
+                        crate::error::invalid_params(
+                            "action 'machine_alerts' requires 'machine_id'",
+                        )
+                    })?;
                 let validated_m_id = validation::validate_machine_id(m_id)?;
                 validation::validate_endpoint_odata_params(input.top, input.skip)?;
-                let odata = Self::ep_odata(input.filter.as_deref(), input.top.unwrap_or(DEFAULT_TOP), input.skip.unwrap_or(0));
-                let path = format!("/api/machines/{}/alerts", validation::encode_path_segment(validated_m_id));
-                self.ep_odata_get_as(&path, &odata, PermissionCategory::ReadWriteNamed).await
+                let odata = Self::ep_odata(
+                    input.filter.as_deref(),
+                    input.top.unwrap_or(DEFAULT_TOP),
+                    input.skip.unwrap_or(0),
+                );
+                let path = format!(
+                    "/api/machines/{}/alerts",
+                    validation::encode_path_segment(validated_m_id)
+                );
+                self.ep_odata_get_as(&path, &odata, PermissionCategory::ReadWriteNamed)
+                    .await
             }
             "machine_vulnerabilities" => {
-                if input.timestamp.is_some() { return Err(crate::error::invalid_params("field 'timestamp' is not used by action 'machine_vulnerabilities'")); }
-                if input.tag_name.is_some() { return Err(crate::error::invalid_params("field 'tag_name' is not used by action 'machine_vulnerabilities'")); }
-                if input.use_starts_with.is_some() { return Err(crate::error::invalid_params("field 'use_starts_with' is not used by action 'machine_vulnerabilities'")); }
-                if input.look_back_hours.is_some() { return Err(crate::error::invalid_params("field 'look_back_hours' is not used by action 'machine_vulnerabilities'")); }
-                let m_id = input.machine_id.as_deref().or(input.id.as_deref()).ok_or_else(|| crate::error::invalid_params("action 'machine_vulnerabilities' requires 'machine_id'"))?;
+                if input.timestamp.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'timestamp' is not used by action 'machine_vulnerabilities'",
+                    ));
+                }
+                if input.tag_name.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'tag_name' is not used by action 'machine_vulnerabilities'",
+                    ));
+                }
+                if input.use_starts_with.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'use_starts_with' is not used by action 'machine_vulnerabilities'",
+                    ));
+                }
+                if input.look_back_hours.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'look_back_hours' is not used by action 'machine_vulnerabilities'",
+                    ));
+                }
+                let m_id = input
+                    .machine_id
+                    .as_deref()
+                    .or(input.id.as_deref())
+                    .ok_or_else(|| {
+                        crate::error::invalid_params(
+                            "action 'machine_vulnerabilities' requires 'machine_id'",
+                        )
+                    })?;
                 let validated_m_id = validation::validate_machine_id(m_id)?;
                 validation::validate_endpoint_odata_params(input.top, input.skip)?;
-                let odata = Self::ep_odata(input.filter.as_deref(), input.top.unwrap_or(DEFAULT_TOP), input.skip.unwrap_or(0));
-                let path = format!("/api/machines/{}/vulnerabilities", validation::encode_path_segment(validated_m_id));
-                self.ep_odata_get_as(&path, &odata, PermissionCategory::ReadEndpoint).await
+                let odata = Self::ep_odata(
+                    input.filter.as_deref(),
+                    input.top.unwrap_or(DEFAULT_TOP),
+                    input.skip.unwrap_or(0),
+                );
+                let path = format!(
+                    "/api/machines/{}/vulnerabilities",
+                    validation::encode_path_segment(validated_m_id)
+                );
+                self.ep_odata_get_as(&path, &odata, PermissionCategory::ReadEndpoint)
+                    .await
             }
             "machine_missing_kbs" => {
-                if input.timestamp.is_some() { return Err(crate::error::invalid_params("field 'timestamp' is not used by action 'machine_missing_kbs'")); }
-                if input.tag_name.is_some() { return Err(crate::error::invalid_params("field 'tag_name' is not used by action 'machine_missing_kbs'")); }
-                if input.use_starts_with.is_some() { return Err(crate::error::invalid_params("field 'use_starts_with' is not used by action 'machine_missing_kbs'")); }
-                if input.look_back_hours.is_some() { return Err(crate::error::invalid_params("field 'look_back_hours' is not used by action 'machine_missing_kbs'")); }
-                if input.top.is_some() { return Err(crate::error::invalid_params("field 'top' is not used by action 'machine_missing_kbs'")); }
-                if input.skip.is_some() { return Err(crate::error::invalid_params("field 'skip' is not used by action 'machine_missing_kbs'")); }
-                if input.filter.is_some() { return Err(crate::error::invalid_params("field 'filter' is not used by action 'machine_missing_kbs'")); }
-                let m_id = input.machine_id.as_deref().or(input.id.as_deref()).ok_or_else(|| crate::error::invalid_params("action 'machine_missing_kbs' requires 'machine_id'"))?;
+                if input.timestamp.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'timestamp' is not used by action 'machine_missing_kbs'",
+                    ));
+                }
+                if input.tag_name.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'tag_name' is not used by action 'machine_missing_kbs'",
+                    ));
+                }
+                if input.use_starts_with.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'use_starts_with' is not used by action 'machine_missing_kbs'",
+                    ));
+                }
+                if input.look_back_hours.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'look_back_hours' is not used by action 'machine_missing_kbs'",
+                    ));
+                }
+                if input.top.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'top' is not used by action 'machine_missing_kbs'",
+                    ));
+                }
+                if input.skip.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'skip' is not used by action 'machine_missing_kbs'",
+                    ));
+                }
+                if input.filter.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'filter' is not used by action 'machine_missing_kbs'",
+                    ));
+                }
+                let m_id = input
+                    .machine_id
+                    .as_deref()
+                    .or(input.id.as_deref())
+                    .ok_or_else(|| {
+                        crate::error::invalid_params(
+                            "action 'machine_missing_kbs' requires 'machine_id'",
+                        )
+                    })?;
                 let validated_m_id = validation::validate_machine_id(m_id)?;
-                let path = format!("/api/machines/{}/getmissingkbs", validation::encode_path_segment(validated_m_id));
-                self.ep_simple_get_as(&path, PermissionCategory::ReadEndpoint).await
+                let path = format!(
+                    "/api/machines/{}/getmissingkbs",
+                    validation::encode_path_segment(validated_m_id)
+                );
+                self.ep_simple_get_as(&path, PermissionCategory::ReadEndpoint)
+                    .await
             }
             _ => Err(crate::error::unknown_action_error(
                 "defender_machines",
@@ -4432,38 +4798,132 @@ impl DefenderServer {
                     .await)
             }
             "investigation_list" => {
-                if input.action_id.is_some() { return Err(crate::error::invalid_params("field 'action_id' is not used by action 'investigation_list'")); }
-                if input.sha1.is_some() { return Err(crate::error::invalid_params("field 'sha1' is not used by action 'investigation_list'")); }
-                if input.command_index.is_some() { return Err(crate::error::invalid_params("field 'command_index' is not used by action 'investigation_list'")); }
-                if input.destination_dir.is_some() { return Err(crate::error::invalid_params("field 'destination_dir' is not used by action 'investigation_list'")); }
-                if input.investigation_id.is_some() { return Err(crate::error::invalid_params("field 'investigation_id' is not used by action 'investigation_list'")); }
+                if input.action_id.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'action_id' is not used by action 'investigation_list'",
+                    ));
+                }
+                if input.sha1.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'sha1' is not used by action 'investigation_list'",
+                    ));
+                }
+                if input.command_index.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'command_index' is not used by action 'investigation_list'",
+                    ));
+                }
+                if input.destination_dir.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'destination_dir' is not used by action 'investigation_list'",
+                    ));
+                }
+                if input.investigation_id.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'investigation_id' is not used by action 'investigation_list'",
+                    ));
+                }
                 validation::validate_endpoint_odata_params(input.top, input.skip)?;
-                let odata = Self::ep_odata(input.filter.as_deref(), input.top.unwrap_or(DEFAULT_TOP), input.skip.unwrap_or(0));
-                self.ep_odata_get_as("/api/investigations", &odata, PermissionCategory::ReadWriteNamed).await
+                let odata = Self::ep_odata(
+                    input.filter.as_deref(),
+                    input.top.unwrap_or(DEFAULT_TOP),
+                    input.skip.unwrap_or(0),
+                );
+                self.ep_odata_get_as(
+                    "/api/investigations",
+                    &odata,
+                    PermissionCategory::ReadWriteNamed,
+                )
+                .await
             }
             "investigation_get" => {
-                if input.action_id.is_some() { return Err(crate::error::invalid_params("field 'action_id' is not used by action 'investigation_get'")); }
-                if input.sha1.is_some() { return Err(crate::error::invalid_params("field 'sha1' is not used by action 'investigation_get'")); }
-                if input.command_index.is_some() { return Err(crate::error::invalid_params("field 'command_index' is not used by action 'investigation_get'")); }
-                if input.destination_dir.is_some() { return Err(crate::error::invalid_params("field 'destination_dir' is not used by action 'investigation_get'")); }
-                if input.top.is_some() { return Err(crate::error::invalid_params("field 'top' is not used by action 'investigation_get'")); }
-                if input.skip.is_some() { return Err(crate::error::invalid_params("field 'skip' is not used by action 'investigation_get'")); }
-                if input.filter.is_some() { return Err(crate::error::invalid_params("field 'filter' is not used by action 'investigation_get'")); }
+                if input.action_id.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'action_id' is not used by action 'investigation_get'",
+                    ));
+                }
+                if input.sha1.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'sha1' is not used by action 'investigation_get'",
+                    ));
+                }
+                if input.command_index.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'command_index' is not used by action 'investigation_get'",
+                    ));
+                }
+                if input.destination_dir.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'destination_dir' is not used by action 'investigation_get'",
+                    ));
+                }
+                if input.top.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'top' is not used by action 'investigation_get'",
+                    ));
+                }
+                if input.skip.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'skip' is not used by action 'investigation_get'",
+                    ));
+                }
+                if input.filter.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'filter' is not used by action 'investigation_get'",
+                    ));
+                }
                 let id = required(&input.investigation_id, "investigation_id", action)?;
                 let validated_id = validation::validate_required_id(id, "investigation_id")?;
                 let encoded_id = validation::encode_path_segment(validated_id);
-                self.ep_simple_get_as(&format!("/api/investigations/{encoded_id}"), PermissionCategory::ReadWriteNamed).await
+                self.ep_simple_get_as(
+                    &format!("/api/investigations/{encoded_id}"),
+                    PermissionCategory::ReadWriteNamed,
+                )
+                .await
             }
             "library_file_list" => {
-                if input.action_id.is_some() { return Err(crate::error::invalid_params("field 'action_id' is not used by action 'library_file_list'")); }
-                if input.sha1.is_some() { return Err(crate::error::invalid_params("field 'sha1' is not used by action 'library_file_list'")); }
-                if input.command_index.is_some() { return Err(crate::error::invalid_params("field 'command_index' is not used by action 'library_file_list'")); }
-                if input.destination_dir.is_some() { return Err(crate::error::invalid_params("field 'destination_dir' is not used by action 'library_file_list'")); }
-                if input.investigation_id.is_some() { return Err(crate::error::invalid_params("field 'investigation_id' is not used by action 'library_file_list'")); }
-                if input.top.is_some() { return Err(crate::error::invalid_params("field 'top' is not used by action 'library_file_list'")); }
-                if input.skip.is_some() { return Err(crate::error::invalid_params("field 'skip' is not used by action 'library_file_list'")); }
-                if input.filter.is_some() { return Err(crate::error::invalid_params("field 'filter' is not used by action 'library_file_list'")); }
-                self.ep_simple_get_as("/api/libraryfiles", PermissionCategory::ReadWriteNamed).await
+                if input.action_id.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'action_id' is not used by action 'library_file_list'",
+                    ));
+                }
+                if input.sha1.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'sha1' is not used by action 'library_file_list'",
+                    ));
+                }
+                if input.command_index.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'command_index' is not used by action 'library_file_list'",
+                    ));
+                }
+                if input.destination_dir.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'destination_dir' is not used by action 'library_file_list'",
+                    ));
+                }
+                if input.investigation_id.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'investigation_id' is not used by action 'library_file_list'",
+                    ));
+                }
+                if input.top.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'top' is not used by action 'library_file_list'",
+                    ));
+                }
+                if input.skip.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'skip' is not used by action 'library_file_list'",
+                    ));
+                }
+                if input.filter.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'filter' is not used by action 'library_file_list'",
+                    ));
+                }
+                self.ep_simple_get_as("/api/libraryfiles", PermissionCategory::ReadWriteNamed)
+                    .await
             }
             _ => Err(crate::error::unknown_action_error(
                 "defender_forensics",
@@ -4496,10 +4956,36 @@ impl DefenderServer {
             open_world_hint = true
         )
     )]
-            pub async fn defender_response(
+    pub async fn defender_response(
         &self,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(input): Parameters<ResponseInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let action = input.action.clone();
+        let justification = if action == "upload_library_file" {
+            input.description.clone()
+        } else {
+            input.comment.clone()
+        };
+        let result = self.response_action(context.clone(), input).await;
+        if !RESPONSE_ACTIONS.contains(&action.as_str()) {
+            return result;
+        }
+        self.audit_validation_error(
+            MutatingTool::Response,
+            &action,
+            PermissionCategory::LiveResponse,
+            justification.as_deref(),
+            &context,
+            result,
+        )
+        .await
+    }
+
+    async fn response_action(
+        &self,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        input: ResponseInput,
     ) -> Result<CallToolResult, McpError> {
         let action = input.action.as_str();
         if !RESPONSE_ACTIONS.contains(&action) {
@@ -4518,7 +5004,10 @@ impl DefenderServer {
                     action,
                 )?);
                 let comment_val = input.comment.as_deref().unwrap_or("");
-                let machine_id_str = machine_id_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                let machine_id_str = machine_id_res
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
                 let machine_enc = validation::encode_path_segment(&machine_id_str).to_string();
                 let comment_str = comment_val.to_string();
 
@@ -4567,7 +5056,10 @@ impl DefenderServer {
                 )?);
                 let sha1_res = validation::validate_sha1(required(&input.sha1, "sha1", action)?);
                 let comment_val = input.comment.as_deref().unwrap_or("");
-                let machine_id_str = machine_id_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                let machine_id_str = machine_id_res
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
                 let sha1_str = sha1_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
                 let machine_enc = validation::encode_path_segment(&machine_id_str).to_string();
                 let comment_str = comment_val.to_string();
@@ -4614,8 +5106,12 @@ impl DefenderServer {
             }
             "live_response_run" => {
                 let args = action_args(&input);
-                let p: LiveResponseRunInput = serde_json::from_value(Value::Object(args))
-                    .map_err(|e| crate::error::invalid_params(format!("invalid arguments for this action: {e}")))?;
+                let p: LiveResponseRunInput =
+                    serde_json::from_value(Value::Object(args)).map_err(|e| {
+                        crate::error::invalid_params(format!(
+                            "invalid arguments for this action: {e}"
+                        ))
+                    })?;
 
                 let machine_res = validation::validate_required_id(&p.machine_id, "machine_id");
                 let comment_val = p.comment.clone();
@@ -4623,7 +5119,10 @@ impl DefenderServer {
                     &p.commands,
                     self.config.live_response_allowed_commands.as_deref(),
                 );
-                let machine_id_str = machine_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                let machine_id_str = machine_res
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
                 let machine_enc = validation::encode_path_segment(&machine_id_str).to_string();
 
                 let val_res = match (machine_res, commands_res) {
@@ -4633,7 +5132,11 @@ impl DefenderServer {
                 };
 
                 let mut param_map = serde_json::Map::new();
-                let cmd_types: Vec<Value> = p.commands.iter().map(|c| Value::String(c.cmd_type.as_str().to_string())).collect();
+                let cmd_types: Vec<Value> = p
+                    .commands
+                    .iter()
+                    .map(|c| Value::String(c.cmd_type.as_str().to_string()))
+                    .collect();
                 param_map.insert("commands".to_string(), Value::Array(cmd_types));
 
                 let targets = if val_res.is_ok() {
@@ -4651,10 +5154,14 @@ impl DefenderServer {
                     justification: Some(&comment_val),
                     validation_result: val_res,
                     context: &context,
-                    extract_tracking: |resp: &MutationResponse| (
-                        resp.get("id").and_then(Value::as_str).map(str::to_owned),
-                        resp.get("status").and_then(Value::as_str).map(str::to_owned),
-                    ),
+                    extract_tracking: |resp: &MutationResponse| {
+                        (
+                            resp.get("id").and_then(Value::as_str).map(str::to_owned),
+                            resp.get("status")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                        )
+                    },
                     upstream: || async move {
                         tracing::info!(
                             machine_id = %machine_id_str,
@@ -4674,13 +5181,18 @@ impl DefenderServer {
                             )
                             .await
                     },
-                }).await
+                })
+                .await
             }
             "upload_library_file" => {
                 let mut args = action_args(&input);
                 args.remove("comment");
                 let p: LiveResponseLibraryUploadInput = serde_json::from_value(Value::Object(args))
-                    .map_err(|e| crate::error::invalid_params(format!("invalid arguments for this action: {e}")))?;
+                    .map_err(|e| {
+                        crate::error::invalid_params(format!(
+                            "invalid arguments for this action: {e}"
+                        ))
+                    })?;
 
                 let file_name_res = validation::validate_file_name(&p.file_name);
                 let desc_res = validation::validate_description(&p.description);
@@ -4710,7 +5222,10 @@ impl DefenderServer {
 
                 let mut param_map = serde_json::Map::new();
                 if let Some(pd) = &p.parameters_description {
-                    param_map.insert("parameters_description".to_string(), Value::String(pd.clone()));
+                    param_map.insert(
+                        "parameters_description".to_string(),
+                        Value::String(pd.clone()),
+                    );
                 }
                 if let Some(ov) = p.override_if_exists {
                     param_map.insert("override_if_exists".to_string(), Value::Bool(ov));
@@ -4734,10 +5249,12 @@ impl DefenderServer {
                     justification: input.comment.as_deref().or(Some(&description_str)),
                     validation_result: val_res,
                     context: &context,
-                    extract_tracking: |resp: &MutationResponse| (
-                        resp.get("id").and_then(Value::as_str).map(str::to_owned),
-                        None,
-                    ),
+                    extract_tracking: |resp: &MutationResponse| {
+                        (
+                            resp.get("id").and_then(Value::as_str).map(str::to_owned),
+                            None,
+                        )
+                    },
                     upstream: || async move {
                         tracing::info!(
                             file_name = %upstream_fn,
@@ -4755,16 +5272,45 @@ impl DefenderServer {
                             )
                             .await
                     },
-                }).await
+                })
+                .await
             }
             "library_file_delete" => {
-                if input.machine_id.is_some() { return Err(crate::error::invalid_params("field 'machine_id' is not used by action 'library_file_delete'")); }
-                if input.sha1.is_some() { return Err(crate::error::invalid_params("field 'sha1' is not used by action 'library_file_delete'")); }
-                if input.commands.is_some() { return Err(crate::error::invalid_params("field 'commands' is not used by action 'library_file_delete'")); }
-                if input.file_content.is_some() { return Err(crate::error::invalid_params("field 'file_content' is not used by action 'library_file_delete'")); }
-                if input.description.is_some() { return Err(crate::error::invalid_params("field 'description' is not used by action 'library_file_delete'")); }
-                if input.parameters_description.is_some() { return Err(crate::error::invalid_params("field 'parameters_description' is not used by action 'library_file_delete'")); }
-                if input.override_if_exists.is_some() { return Err(crate::error::invalid_params("field 'override_if_exists' is not used by action 'library_file_delete'")); }
+                if input.machine_id.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'machine_id' is not used by action 'library_file_delete'",
+                    ));
+                }
+                if input.sha1.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'sha1' is not used by action 'library_file_delete'",
+                    ));
+                }
+                if input.commands.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'commands' is not used by action 'library_file_delete'",
+                    ));
+                }
+                if input.file_content.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'file_content' is not used by action 'library_file_delete'",
+                    ));
+                }
+                if input.description.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'description' is not used by action 'library_file_delete'",
+                    ));
+                }
+                if input.parameters_description.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'parameters_description' is not used by action 'library_file_delete'",
+                    ));
+                }
+                if input.override_if_exists.is_some() {
+                    return Err(crate::error::invalid_params(
+                        "field 'override_if_exists' is not used by action 'library_file_delete'",
+                    ));
+                }
 
                 let fn_val = required(&input.file_name, "file_name", action)?;
                 let fn_res = validation::validate_file_name(fn_val);
@@ -4794,7 +5340,8 @@ impl DefenderServer {
                     context: &context,
                     extract_tracking: |_| (None, None),
                     upstream: || async move {
-                        let _ = self.endpoint
+                        let _ = self
+                            .endpoint
                             .endpoint_delete_as(
                                 &format!("/api/libraryfiles/{fn_enc}"),
                                 PermissionCategory::LiveResponse,
@@ -4805,15 +5352,15 @@ impl DefenderServer {
                             body: json!({ "status": "deleted", "file_name": fn_str }),
                         })
                     },
-                }).await
+                })
+                .await
             }
             _ => Err(crate::error::unknown_action_error(
                 "defender_response",
                 action,
                 RESPONSE_ACTIONS,
             )),
-    }
-
+        }
     }
     /// Consolidated device response and lifecycle actions dispatcher.
     #[tool(
@@ -4832,6 +5379,39 @@ impl DefenderServer {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(input): Parameters<DeviceResponseInput>,
     ) -> Result<CallToolResult, McpError> {
+        let action = input.action.clone();
+        let justification = input.comment.clone();
+        let known = if self.config.categories.offboarding {
+            DEVICE_RESPONSE_ACTIONS
+        } else {
+            DEVICE_RESPONSE_ACTIONS_WITHOUT_OFFBOARD
+        }
+        .contains(&action.as_str());
+        let result = self.device_response_action(context.clone(), input).await;
+        if !known {
+            return result;
+        }
+        let category = if action == "offboard" {
+            PermissionCategory::Offboarding
+        } else {
+            PermissionCategory::DeviceResponse
+        };
+        self.audit_validation_error(
+            MutatingTool::DeviceResponse,
+            &action,
+            category,
+            justification.as_deref(),
+            &context,
+            result,
+        )
+        .await
+    }
+
+    async fn device_response_action(
+        &self,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        input: DeviceResponseInput,
+    ) -> Result<CallToolResult, McpError> {
         let action = input.action.as_str();
         let valid_actions = if self.config.categories.offboarding {
             DEVICE_RESPONSE_ACTIONS
@@ -4845,73 +5425,123 @@ impl DefenderServer {
                 valid_actions,
             );
             if action == "offboard" && !self.config.categories.offboarding {
-                err.message = format!("{}. offboard requires --enable-offboarding", err.message).into();
+                err.message =
+                    format!("{}. offboard requires --enable-offboarding", err.message).into();
             }
             return Err(err);
         }
 
         let unused_field = match action {
             "isolate" => {
-                if input.action_id.is_some() { Some("action_id") }
-                else if input.scan_type.is_some() { Some("scan_type") }
-                else if input.tag.is_some() { Some("tag") }
-                else if input.device_value.is_some() { Some("device_value") }
-                else { None }
+                if input.action_id.is_some() {
+                    Some("action_id")
+                } else if input.scan_type.is_some() {
+                    Some("scan_type")
+                } else if input.tag.is_some() {
+                    Some("tag")
+                } else if input.device_value.is_some() {
+                    Some("device_value")
+                } else {
+                    None
+                }
             }
-            "unisolate" | "restrict_app_execution" | "unrestrict_app_execution" | "start_investigation" | "offboard" => {
-                if input.action_id.is_some() { Some("action_id") }
-                else if input.isolation_type.is_some() { Some("isolation_type") }
-                else if input.scan_type.is_some() { Some("scan_type") }
-                else if input.tag.is_some() { Some("tag") }
-                else if input.device_value.is_some() { Some("device_value") }
-                else { None }
+            "unisolate"
+            | "restrict_app_execution"
+            | "unrestrict_app_execution"
+            | "start_investigation"
+            | "offboard" => {
+                if input.action_id.is_some() {
+                    Some("action_id")
+                } else if input.isolation_type.is_some() {
+                    Some("isolation_type")
+                } else if input.scan_type.is_some() {
+                    Some("scan_type")
+                } else if input.tag.is_some() {
+                    Some("tag")
+                } else if input.device_value.is_some() {
+                    Some("device_value")
+                } else {
+                    None
+                }
             }
             "run_av_scan" => {
-                if input.action_id.is_some() { Some("action_id") }
-                else if input.isolation_type.is_some() { Some("isolation_type") }
-                else if input.tag.is_some() { Some("tag") }
-                else if input.device_value.is_some() { Some("device_value") }
-                else { None }
+                if input.action_id.is_some() {
+                    Some("action_id")
+                } else if input.isolation_type.is_some() {
+                    Some("isolation_type")
+                } else if input.tag.is_some() {
+                    Some("tag")
+                } else if input.device_value.is_some() {
+                    Some("device_value")
+                } else {
+                    None
+                }
             }
             "cancel_machine_action" => {
-                if input.machine_id.is_some() { Some("machine_id") }
-                else if input.isolation_type.is_some() { Some("isolation_type") }
-                else if input.scan_type.is_some() { Some("scan_type") }
-                else if input.tag.is_some() { Some("tag") }
-                else if input.device_value.is_some() { Some("device_value") }
-                else { None }
+                if input.machine_id.is_some() {
+                    Some("machine_id")
+                } else if input.isolation_type.is_some() {
+                    Some("isolation_type")
+                } else if input.scan_type.is_some() {
+                    Some("scan_type")
+                } else if input.tag.is_some() {
+                    Some("tag")
+                } else if input.device_value.is_some() {
+                    Some("device_value")
+                } else {
+                    None
+                }
             }
             "tag_add" | "tag_remove" => {
-                if input.action_id.is_some() { Some("action_id") }
-                else if input.isolation_type.is_some() { Some("isolation_type") }
-                else if input.scan_type.is_some() { Some("scan_type") }
-                else if input.device_value.is_some() { Some("device_value") }
-                else { None }
+                if input.action_id.is_some() {
+                    Some("action_id")
+                } else if input.isolation_type.is_some() {
+                    Some("isolation_type")
+                } else if input.scan_type.is_some() {
+                    Some("scan_type")
+                } else if input.device_value.is_some() {
+                    Some("device_value")
+                } else {
+                    None
+                }
             }
             "set_device_value" => {
-                if input.action_id.is_some() { Some("action_id") }
-                else if input.isolation_type.is_some() { Some("isolation_type") }
-                else if input.scan_type.is_some() { Some("scan_type") }
-                else if input.tag.is_some() { Some("tag") }
-                else { None }
+                if input.action_id.is_some() {
+                    Some("action_id")
+                } else if input.isolation_type.is_some() {
+                    Some("isolation_type")
+                } else if input.scan_type.is_some() {
+                    Some("scan_type")
+                } else if input.tag.is_some() {
+                    Some("tag")
+                } else {
+                    None
+                }
             }
             _ => None,
         };
 
         if let Some(f) = unused_field {
-            let val_err = crate::error::tool_error(format!("field '{f}' is not used by action '{action}'"));
-            return self.execute_mutation(MutationRequest {
-                tool: MutatingTool::DeviceResponse,
-                action,
-                category: if action == "offboard" { PermissionCategory::Offboarding } else { PermissionCategory::DeviceResponse },
-                targets: Vec::new(),
-                parameters: serde_json::Map::new(),
-                justification: input.comment.as_deref(),
-                validation_result: Err(val_err),
-                context: &context,
-                extract_tracking: |_| (None, None),
-                upstream: || async { unreachable!() },
-            }).await;
+            let val_err =
+                crate::error::tool_error(format!("field '{f}' is not used by action '{action}'"));
+            return self
+                .execute_mutation(MutationRequest {
+                    tool: MutatingTool::DeviceResponse,
+                    action,
+                    category: if action == "offboard" {
+                        PermissionCategory::Offboarding
+                    } else {
+                        PermissionCategory::DeviceResponse
+                    },
+                    targets: Vec::new(),
+                    parameters: serde_json::Map::new(),
+                    justification: input.comment.as_deref(),
+                    validation_result: Err(val_err),
+                    context: &context,
+                    extract_tracking: |_| (None, None),
+                    upstream: || async { unreachable!() },
+                })
+                .await;
         }
 
         let category = if action == "offboard" {
@@ -4923,20 +5553,36 @@ impl DefenderServer {
         let comment_val = input.comment.as_deref().unwrap_or("");
         let mut params = serde_json::Map::new();
 
-        let (targets, val_res, upstream_path, upstream_body) = if action == "cancel_machine_action" {
-            let aid_res = validation::validate_action_id(required(&input.action_id, "action_id", action)?);
+        let (targets, val_res, upstream_path, upstream_body) = if action == "cancel_machine_action"
+        {
+            let aid_res =
+                validation::validate_action_id(required(&input.action_id, "action_id", action)?);
             let aid_str = aid_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
             let enc = validation::encode_path_segment(&aid_str).to_string();
-            let t = if !aid_str.is_empty() { vec![crate::audit::AuditTarget::machine_action_id(&aid_str)] } else { vec![] };
-            let v = aid_res.map(|_| ()).map_err(|e| crate::error::tool_error(e.message));
+            let t = if !aid_str.is_empty() {
+                vec![crate::audit::AuditTarget::machine_action_id(&aid_str)]
+            } else {
+                vec![]
+            };
+            let v = aid_res
+                .map(|_| ())
+                .map_err(|e| crate::error::tool_error(e.message));
             let body = json!({ "Comment": comment_val });
             (t, v, format!("/api/machineactions/{enc}/cancel"), body)
         } else {
-            let mid_res = validation::validate_machine_id(required(&input.machine_id, "machine_id", action)?);
+            let mid_res =
+                validation::validate_machine_id(required(&input.machine_id, "machine_id", action)?);
             let mid_str = mid_res.as_ref().map(|s| s.to_string()).unwrap_or_default();
             let enc = validation::encode_path_segment(&mid_str).to_string();
-            let t = if !mid_str.is_empty() { vec![crate::audit::AuditTarget::machine_id(&mid_str)] } else { vec![] };
-            let v_mid = mid_res.as_ref().map(|_| ()).map_err(|e| crate::error::tool_error(e.message.clone()));
+            let t = if !mid_str.is_empty() {
+                vec![crate::audit::AuditTarget::machine_id(&mid_str)]
+            } else {
+                vec![]
+            };
+            let v_mid = mid_res
+                .as_ref()
+                .map(|_| ())
+                .map_err(|e| crate::error::tool_error(e.message.clone()));
 
             match action {
                 "isolate" => {
@@ -4945,24 +5591,43 @@ impl DefenderServer {
                     let body = json!({ "Comment": comment_val, "IsolationType": iso.as_str() });
                     (t, v_mid, format!("/api/machines/{enc}/isolate"), body)
                 }
-                "unisolate" => {
-                    (t, v_mid, format!("/api/machines/{enc}/unisolate"), json!({ "Comment": comment_val }))
-                }
-                "restrict_app_execution" => {
-                    (t, v_mid, format!("/api/machines/{enc}/restrictCodeExecution"), json!({ "Comment": comment_val }))
-                }
-                "unrestrict_app_execution" => {
-                    (t, v_mid, format!("/api/machines/{enc}/unrestrictCodeExecution"), json!({ "Comment": comment_val }))
-                }
+                "unisolate" => (
+                    t,
+                    v_mid,
+                    format!("/api/machines/{enc}/unisolate"),
+                    json!({ "Comment": comment_val }),
+                ),
+                "restrict_app_execution" => (
+                    t,
+                    v_mid,
+                    format!("/api/machines/{enc}/restrictCodeExecution"),
+                    json!({ "Comment": comment_val }),
+                ),
+                "unrestrict_app_execution" => (
+                    t,
+                    v_mid,
+                    format!("/api/machines/{enc}/unrestrictCodeExecution"),
+                    json!({ "Comment": comment_val }),
+                ),
                 "run_av_scan" => {
                     let scan_opt = input.scan_type;
-                    let scan = scan_opt.ok_or_else(|| crate::error::invalid_params("action 'run_av_scan' requires 'scan_type'"))?;
+                    let scan = scan_opt.ok_or_else(|| {
+                        crate::error::invalid_params("action 'run_av_scan' requires 'scan_type'")
+                    })?;
                     params.insert("scan_type".to_string(), json!(scan.as_str()));
-                    (t, v_mid, format!("/api/machines/{enc}/runAntiVirusScan"), json!({ "Comment": comment_val, "ScanType": scan.as_str() }))
+                    (
+                        t,
+                        v_mid,
+                        format!("/api/machines/{enc}/runAntiVirusScan"),
+                        json!({ "Comment": comment_val, "ScanType": scan.as_str() }),
+                    )
                 }
-                "start_investigation" => {
-                    (t, v_mid, format!("/api/machines/{enc}/startInvestigation"), json!({ "Comment": comment_val }))
-                }
+                "start_investigation" => (
+                    t,
+                    v_mid,
+                    format!("/api/machines/{enc}/startInvestigation"),
+                    json!({ "Comment": comment_val }),
+                ),
                 "tag_add" | "tag_remove" => {
                     let tag_val = required(&input.tag, "tag", action)?;
                     let tag_res = validation::validate_tag(tag_val);
@@ -4974,16 +5639,33 @@ impl DefenderServer {
                         (Err(e), _) => Err(crate::error::tool_error(e.message.clone())),
                         (_, Err(e)) => Err(crate::error::tool_error(e.message.clone())),
                     };
-                    (t, v, format!("/api/machines/{enc}/tags"), json!({ "Value": tag_str, "Action": act_str }))
+                    (
+                        t,
+                        v,
+                        format!("/api/machines/{enc}/tags"),
+                        json!({ "Value": tag_str, "Action": act_str }),
+                    )
                 }
                 "set_device_value" => {
-                    let dv = input.device_value.ok_or_else(|| crate::error::invalid_params("action 'set_device_value' requires 'device_value'"))?;
+                    let dv = input.device_value.ok_or_else(|| {
+                        crate::error::invalid_params(
+                            "action 'set_device_value' requires 'device_value'",
+                        )
+                    })?;
                     params.insert("device_value".to_string(), json!(dv.as_str()));
-                    (t, v_mid, format!("/api/machines/{enc}/setDeviceValue"), json!({ "DeviceValue": dv.as_str() }))
+                    (
+                        t,
+                        v_mid,
+                        format!("/api/machines/{enc}/setDeviceValue"),
+                        json!({ "DeviceValue": dv.as_str() }),
+                    )
                 }
-                "offboard" => {
-                    (t, v_mid, format!("/api/machines/{enc}/offboard"), json!({ "Comment": comment_val }))
-                }
+                "offboard" => (
+                    t,
+                    v_mid,
+                    format!("/api/machines/{enc}/offboard"),
+                    json!({ "Comment": comment_val }),
+                ),
                 _ => unreachable!(),
             }
         };
@@ -5047,6 +5729,28 @@ impl DefenderServer {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(input): Parameters<IndicatorsInput>,
     ) -> Result<CallToolResult, McpError> {
+        let action = input.action.clone();
+        let justification = input.comment.clone();
+        let result = self.indicators_action(context.clone(), input).await;
+        if !INDICATORS_ACTIONS.contains(&action.as_str()) {
+            return result;
+        }
+        self.audit_validation_error(
+            MutatingTool::Indicators,
+            &action,
+            PermissionCategory::Indicators,
+            justification.as_deref(),
+            &context,
+            result,
+        )
+        .await
+    }
+
+    async fn indicators_action(
+        &self,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        input: IndicatorsInput,
+    ) -> Result<CallToolResult, McpError> {
         let action = input.action.as_str();
         if !INDICATORS_ACTIONS.contains(&action) {
             return Err(crate::error::unknown_action_error(
@@ -5058,55 +5762,88 @@ impl DefenderServer {
 
         let unused_field = match action {
             "submit" => {
-                if input.indicator_id.is_some() { Some("indicator_id") }
-                else if input.indicator_ids.is_some() { Some("indicator_ids") }
-                else { None }
+                if input.indicator_id.is_some() {
+                    Some("indicator_id")
+                } else if input.indicator_ids.is_some() {
+                    Some("indicator_ids")
+                } else {
+                    None
+                }
             }
             "delete" => {
-                if input.indicator_value.is_some() { Some("indicator_value") }
-                else if input.indicator_type.is_some() { Some("indicator_type") }
-                else if input.indicator_action.is_some() { Some("indicator_action") }
-                else if input.title.is_some() { Some("title") }
-                else if input.description.is_some() { Some("description") }
-                else if input.severity.is_some() { Some("severity") }
-                else if input.expiration_time.is_some() { Some("expiration_time") }
-                else if input.rbac_group_names.is_some() { Some("rbac_group_names") }
-                else if input.recommended_actions.is_some() { Some("recommended_actions") }
-                else if input.generate_alert.is_some() { Some("generate_alert") }
-                else if input.indicator_ids.is_some() { Some("indicator_ids") }
-                else { None }
+                if input.indicator_value.is_some() {
+                    Some("indicator_value")
+                } else if input.indicator_type.is_some() {
+                    Some("indicator_type")
+                } else if input.indicator_action.is_some() {
+                    Some("indicator_action")
+                } else if input.title.is_some() {
+                    Some("title")
+                } else if input.description.is_some() {
+                    Some("description")
+                } else if input.severity.is_some() {
+                    Some("severity")
+                } else if input.expiration_time.is_some() {
+                    Some("expiration_time")
+                } else if input.rbac_group_names.is_some() {
+                    Some("rbac_group_names")
+                } else if input.recommended_actions.is_some() {
+                    Some("recommended_actions")
+                } else if input.generate_alert.is_some() {
+                    Some("generate_alert")
+                } else if input.indicator_ids.is_some() {
+                    Some("indicator_ids")
+                } else {
+                    None
+                }
             }
             "batch_delete" => {
-                if input.indicator_id.is_some() { Some("indicator_id") }
-                else if input.indicator_value.is_some() { Some("indicator_value") }
-                else if input.indicator_type.is_some() { Some("indicator_type") }
-                else if input.indicator_action.is_some() { Some("indicator_action") }
-                else if input.title.is_some() { Some("title") }
-                else if input.description.is_some() { Some("description") }
-                else if input.severity.is_some() { Some("severity") }
-                else if input.expiration_time.is_some() { Some("expiration_time") }
-                else if input.rbac_group_names.is_some() { Some("rbac_group_names") }
-                else if input.recommended_actions.is_some() { Some("recommended_actions") }
-                else if input.generate_alert.is_some() { Some("generate_alert") }
-                else { None }
+                if input.indicator_id.is_some() {
+                    Some("indicator_id")
+                } else if input.indicator_value.is_some() {
+                    Some("indicator_value")
+                } else if input.indicator_type.is_some() {
+                    Some("indicator_type")
+                } else if input.indicator_action.is_some() {
+                    Some("indicator_action")
+                } else if input.title.is_some() {
+                    Some("title")
+                } else if input.description.is_some() {
+                    Some("description")
+                } else if input.severity.is_some() {
+                    Some("severity")
+                } else if input.expiration_time.is_some() {
+                    Some("expiration_time")
+                } else if input.rbac_group_names.is_some() {
+                    Some("rbac_group_names")
+                } else if input.recommended_actions.is_some() {
+                    Some("recommended_actions")
+                } else if input.generate_alert.is_some() {
+                    Some("generate_alert")
+                } else {
+                    None
+                }
             }
             _ => None,
         };
 
         if let Some(f) = unused_field {
-            let val_err = crate::error::tool_error(format!("field '{f}' is not used by action '{action}'"));
-            return self.execute_mutation(MutationRequest {
-                tool: MutatingTool::Indicators,
-                action,
-                category: PermissionCategory::Indicators,
-                targets: Vec::new(),
-                parameters: serde_json::Map::new(),
-                justification: input.comment.as_deref(),
-                validation_result: Err(val_err),
-                context: &context,
-                extract_tracking: |_| (None, None),
-                upstream: || async { unreachable!() },
-            }).await;
+            let val_err =
+                crate::error::tool_error(format!("field '{f}' is not used by action '{action}'"));
+            return self
+                .execute_mutation(MutationRequest {
+                    tool: MutatingTool::Indicators,
+                    action,
+                    category: PermissionCategory::Indicators,
+                    targets: Vec::new(),
+                    parameters: serde_json::Map::new(),
+                    justification: input.comment.as_deref(),
+                    validation_result: Err(val_err),
+                    context: &context,
+                    extract_tracking: |_| (None, None),
+                    upstream: || async { unreachable!() },
+                })
+                .await;
         }
 
         let comment_val = input.comment.as_deref().unwrap_or("");
@@ -5119,20 +5856,35 @@ impl DefenderServer {
                 let desc = required(&input.description, "description", action)?;
                 let desc_res = validation::validate_description(desc);
                 let val_str = required(&input.indicator_value, "indicator_value", action)?;
-                let itype = input.indicator_type.ok_or_else(|| crate::error::invalid_params("action 'submit' requires 'indicator_type'"))?;
-                let iact = input.indicator_action.ok_or_else(|| crate::error::invalid_params("action 'submit' requires 'indicator_action'"))?;
+                let itype = input.indicator_type.ok_or_else(|| {
+                    crate::error::invalid_params("action 'submit' requires 'indicator_type'")
+                })?;
+                let iact = input.indicator_action.ok_or_else(|| {
+                    crate::error::invalid_params("action 'submit' requires 'indicator_action'")
+                })?;
 
                 let ival_res = validation::validate_indicator_value(itype, val_str);
-                let iact_res = validation::validate_indicator_action(itype, iact, input.generate_alert);
-                let exp_res = input.expiration_time.as_deref().map(|exp| validation::validate_future_rfc3339(exp, "expiration_time")).transpose();
-                let rbac_res: Result<Option<()>, McpError> = input.rbac_group_names.as_ref().map(|groups| {
-                    for g in groups {
-                        validation::validate_text(g, 128, "rbac_group_names")?;
-                    }
-                    Ok(())
-                }).transpose();
+                let iact_res =
+                    validation::validate_indicator_action(itype, iact, input.generate_alert);
+                let exp_res = input
+                    .expiration_time
+                    .as_deref()
+                    .map(|exp| validation::validate_future_rfc3339(exp, "expiration_time"))
+                    .transpose();
+                let rbac_res: Result<Option<()>, McpError> = input
+                    .rbac_group_names
+                    .as_ref()
+                    .map(|groups| {
+                        for g in groups {
+                            validation::validate_text(g, 128, "rbac_group_names")?;
+                        }
+                        Ok(())
+                    })
+                    .transpose();
 
-                let val_res = match (&title_res, &desc_res, &ival_res, &iact_res, &exp_res, &rbac_res) {
+                let val_res = match (
+                    &title_res, &desc_res, &ival_res, &iact_res, &exp_res, &rbac_res,
+                ) {
                     (Ok(_), Ok(_), Ok(_), Ok(_), Ok(_), Ok(_)) => Ok(()),
                     (Err(e), _, _, _, _, _) => Err(crate::error::tool_error(e.message.clone())),
                     (_, Err(e), _, _, _, _) => Err(crate::error::tool_error(e.message.clone())),
@@ -5188,16 +5940,23 @@ impl DefenderServer {
                     justification: Some(comment_val),
                     validation_result: val_res,
                     context: &context,
-                    extract_tracking: |resp: &MutationResponse| (
-                        resp.get("id").and_then(Value::as_str).map(str::to_owned),
-                        None,
-                    ),
+                    extract_tracking: |resp: &MutationResponse| {
+                        (
+                            resp.get("id").and_then(Value::as_str).map(str::to_owned),
+                            None,
+                        )
+                    },
                     upstream: || async move {
                         self.endpoint
-                            .endpoint_post_as("/api/indicators", &body, PermissionCategory::Indicators)
+                            .endpoint_post_as(
+                                "/api/indicators",
+                                &body,
+                                PermissionCategory::Indicators,
+                            )
                             .await
                     },
-                }).await
+                })
+                .await
             }
             "delete" => {
                 let id = required(&input.indicator_id, "indicator_id", action)?;
@@ -5209,7 +5968,9 @@ impl DefenderServer {
                 } else {
                     vec![]
                 };
-                let val_res = id_res.map(|_| ()).map_err(|e| crate::error::tool_error(e.message));
+                let val_res = id_res
+                    .map(|_| ())
+                    .map_err(|e| crate::error::tool_error(e.message));
 
                 self.execute_mutation(MutationRequest {
                     tool: MutatingTool::Indicators,
@@ -5222,21 +5983,35 @@ impl DefenderServer {
                     context: &context,
                     extract_tracking: |_| (None, None),
                     upstream: || async move {
-                        let _ = self.endpoint
-                            .endpoint_delete_as(&format!("/api/indicators/{enc}"), PermissionCategory::Indicators)
+                        let _ = self
+                            .endpoint
+                            .endpoint_delete_as(
+                                &format!("/api/indicators/{enc}"),
+                                PermissionCategory::Indicators,
+                            )
                             .await?;
                         Ok(MutationResponse {
                             http_status: 204,
                             body: json!({ "status": "deleted", "indicator_id": id_str }),
                         })
                     },
-                }).await
+                })
+                .await
             }
             "batch_delete" => {
                 let ids_opt = input.indicator_ids.as_ref();
-                let ids = ids_opt.ok_or_else(|| crate::error::invalid_params("action 'batch_delete' requires 'indicator_ids'"))?;
-                let batch_res = validation::validate_batch(ids, crate::constants::MAX_INDICATOR_BATCH, "indicator_ids");
-                let targets = ids.iter().map(|id| crate::audit::AuditTarget::indicator_id(id)).collect();
+                let ids = ids_opt.ok_or_else(|| {
+                    crate::error::invalid_params("action 'batch_delete' requires 'indicator_ids'")
+                })?;
+                let batch_res = validation::validate_batch(
+                    ids,
+                    crate::constants::MAX_INDICATOR_BATCH,
+                    "indicator_ids",
+                );
+                let targets = ids
+                    .iter()
+                    .map(crate::audit::AuditTarget::indicator_id)
+                    .collect();
                 params.insert("count".to_string(), json!(ids.len()));
                 let val_res = batch_res.map_err(|e| crate::error::tool_error(e.message));
                 let count = ids.len();
@@ -5253,15 +6028,21 @@ impl DefenderServer {
                     context: &context,
                     extract_tracking: |_| (None, None),
                     upstream: || async move {
-                        let _ = self.endpoint
-                            .endpoint_post_as("/api/indicators/BatchDelete", &body, PermissionCategory::Indicators)
+                        let _ = self
+                            .endpoint
+                            .endpoint_post_as(
+                                "/api/indicators/BatchDelete",
+                                &body,
+                                PermissionCategory::Indicators,
+                            )
                             .await?;
                         Ok(MutationResponse {
                             http_status: 204,
                             body: json!({ "status": "deleted", "count": count }),
                         })
                     },
-                }).await
+                })
+                .await
             }
             _ => unreachable!(),
         }
@@ -5283,6 +6064,28 @@ impl DefenderServer {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(input): Parameters<TriageInput>,
     ) -> Result<CallToolResult, McpError> {
+        let action = input.action.clone();
+        let justification = input.justification.clone();
+        let result = self.triage_action(context.clone(), input).await;
+        if !TRIAGE_ACTIONS.contains(&action.as_str()) {
+            return result;
+        }
+        self.audit_validation_error(
+            MutatingTool::Triage,
+            &action,
+            PermissionCategory::Triage,
+            justification.as_deref(),
+            &context,
+            result,
+        )
+        .await
+    }
+
+    async fn triage_action(
+        &self,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        input: TriageInput,
+    ) -> Result<CallToolResult, McpError> {
         let action = input.action.as_str();
         if !TRIAGE_ACTIONS.contains(&action) {
             return Err(crate::error::unknown_action_error(
@@ -5294,119 +6097,184 @@ impl DefenderServer {
 
         let unused_field = match action {
             "endpoint_alert_batch_update" => {
-                if input.id.is_some() { Some("id") }
-                else if input.tags.is_some() { Some("tags") }
-                else { None }
+                if input.id.is_some() {
+                    Some("id")
+                } else if input.tags.is_some() {
+                    Some("tags")
+                } else {
+                    None
+                }
             }
             "endpoint_alert_update" => {
-                if input.ids.is_some() { Some("ids") }
-                else if input.tags.is_some() { Some("tags") }
-                else { None }
+                if input.ids.is_some() {
+                    Some("ids")
+                } else if input.tags.is_some() {
+                    Some("tags")
+                } else {
+                    None
+                }
             }
             "endpoint_alert_comment" => {
-                if input.ids.is_some() { Some("ids") }
-                else if input.status.is_some() { Some("status") }
-                else if input.assigned_to.is_some() { Some("assigned_to") }
-                else if input.classification.is_some() { Some("classification") }
-                else if input.determination.is_some() { Some("determination") }
-                else if input.tags.is_some() { Some("tags") }
-                else { None }
+                if input.ids.is_some() {
+                    Some("ids")
+                } else if input.status.is_some() {
+                    Some("status")
+                } else if input.assigned_to.is_some() {
+                    Some("assigned_to")
+                } else if input.classification.is_some() {
+                    Some("classification")
+                } else if input.determination.is_some() {
+                    Some("determination")
+                } else if input.tags.is_some() {
+                    Some("tags")
+                } else {
+                    None
+                }
             }
             "xdr_alert_update" => {
-                if input.ids.is_some() { Some("ids") }
-                else if input.tags.is_some() { Some("tags") }
-                else if input.comment.is_some() { Some("comment") }
-                else { None }
+                if input.ids.is_some() {
+                    Some("ids")
+                } else if input.tags.is_some() {
+                    Some("tags")
+                } else if input.comment.is_some() {
+                    Some("comment")
+                } else {
+                    None
+                }
             }
             "xdr_alert_comment" => {
-                if input.ids.is_some() { Some("ids") }
-                else if input.status.is_some() { Some("status") }
-                else if input.assigned_to.is_some() { Some("assigned_to") }
-                else if input.classification.is_some() { Some("classification") }
-                else if input.determination.is_some() { Some("determination") }
-                else if input.tags.is_some() { Some("tags") }
-                else { None }
+                if input.ids.is_some() {
+                    Some("ids")
+                } else if input.status.is_some() {
+                    Some("status")
+                } else if input.assigned_to.is_some() {
+                    Some("assigned_to")
+                } else if input.classification.is_some() {
+                    Some("classification")
+                } else if input.determination.is_some() {
+                    Some("determination")
+                } else if input.tags.is_some() {
+                    Some("tags")
+                } else {
+                    None
+                }
             }
             "xdr_incident_update" => {
-                if input.ids.is_some() { Some("ids") }
-                else if input.comment.is_some() { Some("comment") }
-                else { None }
+                if input.ids.is_some() {
+                    Some("ids")
+                } else if input.comment.is_some() {
+                    Some("comment")
+                } else {
+                    None
+                }
             }
             "xdr_incident_comment" => {
-                if input.ids.is_some() { Some("ids") }
-                else if input.status.is_some() { Some("status") }
-                else if input.assigned_to.is_some() { Some("assigned_to") }
-                else if input.classification.is_some() { Some("classification") }
-                else if input.determination.is_some() { Some("determination") }
-                else if input.tags.is_some() { Some("tags") }
-                else { None }
+                if input.ids.is_some() {
+                    Some("ids")
+                } else if input.status.is_some() {
+                    Some("status")
+                } else if input.assigned_to.is_some() {
+                    Some("assigned_to")
+                } else if input.classification.is_some() {
+                    Some("classification")
+                } else if input.determination.is_some() {
+                    Some("determination")
+                } else if input.tags.is_some() {
+                    Some("tags")
+                } else {
+                    None
+                }
             }
             _ => None,
         };
 
         if let Some(f) = unused_field {
-            let val_err = crate::error::tool_error(format!("field '{f}' is not used by action '{action}'"));
-            return self.execute_mutation(MutationRequest {
-                tool: MutatingTool::Triage,
-                action,
-                category: PermissionCategory::Triage,
-                targets: Vec::new(),
-                parameters: serde_json::Map::new(),
-                justification: input.justification.as_deref(),
-                validation_result: Err(val_err),
-                context: &context,
-                extract_tracking: |_| (None, None),
-                upstream: || async { unreachable!() },
-            }).await;
+            let val_err =
+                crate::error::tool_error(format!("field '{f}' is not used by action '{action}'"));
+            return self
+                .execute_mutation(MutationRequest {
+                    tool: MutatingTool::Triage,
+                    action,
+                    category: PermissionCategory::Triage,
+                    targets: Vec::new(),
+                    parameters: serde_json::Map::new(),
+                    justification: input.justification.as_deref(),
+                    validation_result: Err(val_err),
+                    context: &context,
+                    extract_tracking: |_| (None, None),
+                    upstream: || async { unreachable!() },
+                })
+                .await;
         }
 
         // Enforce update actions have at least one change
         let has_change = match action {
             "endpoint_alert_update" | "endpoint_alert_batch_update" => {
-                input.status.is_some() || input.assigned_to.is_some() || input.classification.is_some() || input.comment.is_some()
+                input.status.is_some()
+                    || input.assigned_to.is_some()
+                    || input.classification.is_some()
+                    || input.comment.is_some()
             }
             "xdr_alert_update" => {
-                input.status.is_some() || input.assigned_to.is_some() || input.classification.is_some()
+                input.status.is_some()
+                    || input.assigned_to.is_some()
+                    || input.classification.is_some()
             }
             "xdr_incident_update" => {
-                input.status.is_some() || input.assigned_to.is_some() || input.classification.is_some() || input.tags.is_some()
+                input.status.is_some()
+                    || input.assigned_to.is_some()
+                    || input.classification.is_some()
+                    || input.tags.is_some()
             }
             _ => true,
         };
         if !has_change {
             let val_err = crate::error::tool_error("at least one update field must be specified");
-            return self.execute_mutation(MutationRequest {
-                tool: MutatingTool::Triage,
-                action,
-                category: PermissionCategory::Triage,
-                targets: Vec::new(),
-                parameters: serde_json::Map::new(),
-                justification: input.justification.as_deref(),
-                validation_result: Err(val_err),
-                context: &context,
-                extract_tracking: |_| (None, None),
-                upstream: || async { unreachable!() },
-            }).await;
+            return self
+                .execute_mutation(MutationRequest {
+                    tool: MutatingTool::Triage,
+                    action,
+                    category: PermissionCategory::Triage,
+                    targets: Vec::new(),
+                    parameters: serde_json::Map::new(),
+                    justification: input.justification.as_deref(),
+                    validation_result: Err(val_err),
+                    context: &context,
+                    extract_tracking: |_| (None, None),
+                    upstream: || async { unreachable!() },
+                })
+                .await;
         }
 
-        let pair_res = validation::validate_classification_pair(input.classification, input.determination);
-        let assigned_res = input.assigned_to.as_deref().map(|a| validation::validate_text(a, 256, "assigned_to")).transpose();
+        let pair_res =
+            validation::validate_classification_pair(input.classification, input.determination);
+        let assigned_res = input
+            .assigned_to
+            .as_deref()
+            .map(|a| validation::validate_text(a, 256, "assigned_to"))
+            .transpose();
         let comment_res = match action {
             "endpoint_alert_comment" | "xdr_alert_comment" | "xdr_incident_comment" => {
                 let c = required(&input.comment, "comment", action)?;
                 validation::validate_text(c, 1000, "comment").map(|_| ())
             }
-            "endpoint_alert_update" | "endpoint_alert_batch_update" => {
-                input.comment.as_deref().map(|c| validation::validate_text(c, 1000, "comment").map(|_| ())).unwrap_or(Ok(()))
-            }
+            "endpoint_alert_update" | "endpoint_alert_batch_update" => input
+                .comment
+                .as_deref()
+                .map(|c| validation::validate_text(c, 1000, "comment").map(|_| ()))
+                .unwrap_or(Ok(())),
             _ => Ok(()),
         };
-        let tags_res: Result<Option<()>, McpError> = input.tags.as_ref().map(|tags| {
-            for t in tags {
-                validation::validate_text(t, 128, "tags")?;
-            }
-            Ok(())
-        }).transpose();
+        let tags_res: Result<Option<()>, McpError> = input
+            .tags
+            .as_ref()
+            .map(|tags| {
+                for t in tags {
+                    validation::validate_text(t, 128, "tags")?;
+                }
+                Ok(())
+            })
+            .transpose();
 
         let target = match action {
             "endpoint_alert_batch_update" => TriageTarget::MdeAlertBatch,
@@ -5432,7 +6300,13 @@ impl DefenderServer {
             params.insert("determination".to_string(), json!(d.as_str()));
         }
 
-        let val_res = match (&pair_res, &assigned_res, &comment_res, &tags_res, &status_wire) {
+        let val_res = match (
+            &pair_res,
+            &assigned_res,
+            &comment_res,
+            &tags_res,
+            &status_wire,
+        ) {
             (Ok(_), Ok(_), Ok(_), Ok(_), Ok(_)) => Ok(()),
             (Err(e), _, _, _, _) => Err(crate::error::tool_error(e.message.clone())),
             (_, Err(e), _, _, _) => Err(crate::error::tool_error(e.message.clone())),
@@ -5443,9 +6317,15 @@ impl DefenderServer {
 
         if action == "endpoint_alert_batch_update" {
             let ids_opt = input.ids.as_ref();
-            let ids = ids_opt.ok_or_else(|| crate::error::invalid_params("action 'endpoint_alert_batch_update' requires 'ids'"))?;
-            let batch_res = validation::validate_batch(ids, crate::constants::MAX_ALERT_BATCH, "ids");
-            let targets = ids.iter().map(|id| crate::audit::AuditTarget::alert_id(id)).collect();
+            let ids = ids_opt.ok_or_else(|| {
+                crate::error::invalid_params("action 'endpoint_alert_batch_update' requires 'ids'")
+            })?;
+            let batch_res =
+                validation::validate_batch(ids, crate::constants::MAX_ALERT_BATCH, "ids");
+            let targets = ids
+                .iter()
+                .map(crate::audit::AuditTarget::alert_id)
+                .collect();
             let combined_val = match (val_res, batch_res) {
                 (Ok(_), Ok(_)) => Ok(()),
                 (Err(e), _) => Err(e),
@@ -5469,26 +6349,33 @@ impl DefenderServer {
                 body["comment"] = json!(cm);
             }
 
-            return self.execute_mutation(MutationRequest {
-                tool: MutatingTool::Triage,
-                action,
-                category: PermissionCategory::Triage,
-                targets,
-                parameters: params,
-                justification: input.justification.as_deref(),
-                validation_result: combined_val,
-                context: &context,
-                extract_tracking: |_| (None, None),
-                upstream: || async move {
-                    let _ = self.endpoint
-                        .endpoint_post_as("/api/alerts/batchUpdate", &body, PermissionCategory::Triage)
-                        .await?;
-                    Ok(MutationResponse {
-                        http_status: 200,
-                        body: json!({ "status": "ok", "count": count }),
-                    })
-                },
-            }).await;
+            return self
+                .execute_mutation(MutationRequest {
+                    tool: MutatingTool::Triage,
+                    action,
+                    category: PermissionCategory::Triage,
+                    targets,
+                    parameters: params,
+                    justification: input.justification.as_deref(),
+                    validation_result: combined_val,
+                    context: &context,
+                    extract_tracking: |_| (None, None),
+                    upstream: || async move {
+                        let _ = self
+                            .endpoint
+                            .endpoint_post_as(
+                                "/api/alerts/batchUpdate",
+                                &body,
+                                PermissionCategory::Triage,
+                            )
+                            .await?;
+                        Ok(MutationResponse {
+                            http_status: 200,
+                            body: json!({ "status": "ok", "count": count }),
+                        })
+                    },
+                })
+                .await;
         }
 
         let id = required(&input.id, "id", action)?;
@@ -5532,7 +6419,10 @@ impl DefenderServer {
             body.insert("customTags".to_string(), json!(tg));
         }
         if action == "xdr_alert_comment" || action == "xdr_incident_comment" {
-            body.insert("@odata.type".to_string(), json!("microsoft.graph.security.alertComment"));
+            body.insert(
+                "@odata.type".to_string(),
+                json!("microsoft.graph.security.alertComment"),
+            );
         }
         let body_val = Value::Object(body);
 
@@ -5551,40 +6441,69 @@ impl DefenderServer {
                 match action {
                     "endpoint_alert_update" => {
                         self.endpoint
-                            .endpoint_patch_as(&format!("/api/alerts/{enc}"), &body_val, PermissionCategory::Triage)
+                            .endpoint_patch_as(
+                                &format!("/api/alerts/{enc}"),
+                                &body_val,
+                                PermissionCategory::Triage,
+                            )
                             .await
                     }
                     "endpoint_alert_comment" => {
                         self.endpoint
-                            .endpoint_patch_as(&format!("/api/alerts/{enc}"), &body_val, PermissionCategory::Triage)
+                            .endpoint_patch_as(
+                                &format!("/api/alerts/{enc}"),
+                                &body_val,
+                                PermissionCategory::Triage,
+                            )
                             .await
                     }
                     "xdr_alert_update" => {
                         self.client
-                            .graph_patch_as(&format!("/security/alerts_v2/{enc}"), &body_val, PermissionCategory::Triage)
+                            .graph_patch_as(
+                                &format!("/security/alerts_v2/{enc}"),
+                                &body_val,
+                                PermissionCategory::Triage,
+                            )
                             .await
                     }
-                    "xdr_alert_comment" => {
-                        self.client
-                            .graph_post_as(&format!("/security/alerts_v2/{enc}/comments"), &body_val, PermissionCategory::Triage)
-                            .await
-                            .map(|v| MutationResponse { http_status: 201, body: v })
-                    }
+                    "xdr_alert_comment" => self
+                        .client
+                        .graph_post_as(
+                            &format!("/security/alerts_v2/{enc}/comments"),
+                            &body_val,
+                            PermissionCategory::Triage,
+                        )
+                        .await
+                        .map(|v| MutationResponse {
+                            http_status: 201,
+                            body: v,
+                        }),
                     "xdr_incident_update" => {
                         self.client
-                            .graph_patch_as(&format!("/security/incidents/{enc}"), &body_val, PermissionCategory::Triage)
+                            .graph_patch_as(
+                                &format!("/security/incidents/{enc}"),
+                                &body_val,
+                                PermissionCategory::Triage,
+                            )
                             .await
                     }
-                    "xdr_incident_comment" => {
-                        self.client
-                            .graph_post_as(&format!("/security/incidents/{enc}/comments"), &body_val, PermissionCategory::Triage)
-                            .await
-                            .map(|v| MutationResponse { http_status: 201, body: v })
-                    }
+                    "xdr_incident_comment" => self
+                        .client
+                        .graph_post_as(
+                            &format!("/security/incidents/{enc}/comments"),
+                            &body_val,
+                            PermissionCategory::Triage,
+                        )
+                        .await
+                        .map(|v| MutationResponse {
+                            http_status: 201,
+                            body: v,
+                        }),
                     _ => unreachable!(),
                 }
             },
-        }).await
+        })
+        .await
     }
 }
 
@@ -5621,7 +6540,10 @@ impl ServerHandler for DefenderServer {
         {
             let attempt_id = new_attempt_id();
             let (res, reason) = if self.config.read_only {
-                (crate::error::read_only_violation(tool_name), RejectReason::ReadOnly)
+                (
+                    crate::error::read_only_violation(tool_name),
+                    RejectReason::ReadOnly,
+                )
             } else {
                 (
                     crate::error::category_disabled(tool.enable_flag()),
@@ -5725,14 +6647,22 @@ mod tests {
             categories,
             live_response_allowed_commands: None,
             quarantine_dir: std::path::PathBuf::from("./quarantine_artifacts"),
-            audit_log: crate::cli::AuditLogSetting::Default(std::path::PathBuf::from("./audit.jsonl")),
+            audit_log: crate::cli::AuditLogSetting::Default(std::path::PathBuf::from(
+                "./audit.jsonl",
+            )),
             confirm_destructive: true,
             auth: crate::cli::AuthConfig::App,
         };
         DefenderServer::new_with_config(graph, endpoint, config, None)
     }
 
-    async fn create_test_server_with_sink(base_url: &str, live_response: bool) -> (DefenderServer, rmcp::service::RequestContext<rmcp::RoleServer>) {
+    async fn create_test_server_with_sink(
+        base_url: &str,
+        live_response: bool,
+    ) -> (
+        DefenderServer,
+        rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) {
         let http = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(5))
@@ -5745,7 +6675,10 @@ mod tests {
             live_response,
             ..Default::default()
         };
-        let audit_path = std::env::temp_dir().join(format!("mcp_test_audit_{}.jsonl", crate::audit::new_attempt_id()));
+        let audit_path = std::env::temp_dir().join(format!(
+            "mcp_test_audit_{}.jsonl",
+            crate::audit::new_attempt_id()
+        ));
         let sink = AuditSink::open(&audit_path).await.expect("scratch sink");
         let config = crate::cli::ServerConfig {
             transport: crate::cli::TransportMode::Stdio,
@@ -5758,10 +6691,18 @@ mod tests {
             confirm_destructive: false,
             auth: crate::cli::AuthConfig::App,
         };
-        let server = DefenderServer::new_with_config(graph, endpoint, config, Some(std::sync::Arc::new(sink)));
+        let server = DefenderServer::new_with_config(
+            graph,
+            endpoint,
+            config,
+            Some(std::sync::Arc::new(sink)),
+        );
         let (server_t, _client_t) = tokio::io::duplex(1024);
         let running = rmcp::service::serve_directly(server.clone(), server_t, None);
-        let ctx = rmcp::service::RequestContext::new(rmcp::model::RequestId::Number(1), running.peer().clone());
+        let ctx = rmcp::service::RequestContext::new(
+            rmcp::model::RequestId::Number(1),
+            running.peer().clone(),
+        );
         (server, ctx)
     }
 

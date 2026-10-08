@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use common::server_command;
 use microsoft_defender_mcp_server::cli::{
-    AuthConfig, Cli, MutationCategories, ServerConfig, SignInFlow, default_audit_path,
-    is_loopback_address,
+    AuthConfig, Cli, MutationCategories, ServerConfig, SignInFlow, is_loopback_address,
+    resolve_audit_path,
 };
 
 #[test]
@@ -57,7 +57,10 @@ fn test_help_lists_all_new_flags_and_env_vars_and_no_tool_mode() {
     ];
 
     for flag in expected_flags {
-        assert!(help.contains(flag), "--help is missing flag {flag}:\n{help}");
+        assert!(
+            help.contains(flag),
+            "--help is missing flag {flag}:\n{help}"
+        );
     }
 
     for env_var in expected_envs {
@@ -128,7 +131,10 @@ fn test_tombstone_empty_env_var_exits_nonzero_with_removal_message() {
 #[test]
 fn test_offboarding_without_device_response_fails_clap_validation() {
     let res = Cli::try_parse_from(["microsoft-defender-mcp-server", "--enable-offboarding"]);
-    assert!(res.is_err(), "clap must reject --enable-offboarding without device response");
+    assert!(
+        res.is_err(),
+        "clap must reject --enable-offboarding without device response"
+    );
     let err_str = res.unwrap_err().to_string();
     assert!(
         err_str.contains("--enable-device-response"),
@@ -138,12 +144,9 @@ fn test_offboarding_without_device_response_fails_clap_validation() {
 
 #[test]
 fn test_sign_in_flow_with_app_mode_exits_nonzero_at_startup() {
-    let out = server_command(
-        &["--auth-mode", "app", "--sign-in-flow", "browser"],
-        &[],
-    )
-    .output()
-    .expect("run with invalid sign-in-flow");
+    let out = server_command(&["--auth-mode", "app", "--sign-in-flow", "browser"], &[])
+        .output()
+        .expect("run with invalid sign-in-flow");
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -232,90 +235,51 @@ fn test_allowed_commands_are_trimmed_and_split() {
     );
 }
 
-struct EnvGuard {
-    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl EnvGuard {
-    fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
-        let mut saved = Vec::new();
-        for &(key, val) in vars {
-            saved.push((key, std::env::var_os(key)));
-            match val {
-                Some(v) => unsafe { std::env::set_var(key, v) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-        }
-        Self { saved }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, val) in &self.saved {
-            match val {
-                Some(v) => unsafe { std::env::set_var(key, v) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-        }
-    }
+/// Resolve the default audit path against a fixed set of environment values.
+fn audit_path_with(vars: &[(&str, &str)]) -> PathBuf {
+    resolve_audit_path(|key| {
+        vars.iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| std::ffi::OsString::from(v))
+    })
 }
 
 #[test]
 fn test_default_audit_path_resolution_order() {
-    // 1. XDG_STATE_HOME has highest priority
-    {
-        let _g = EnvGuard::set(&[
-            ("XDG_STATE_HOME", Some("/custom/xdg")),
-            ("HOME", Some("/custom/home")),
-            ("LOCALAPPDATA", Some("C:\\custom\\appdata")),
-        ]);
-        let path = default_audit_path();
-        assert_eq!(
-            path,
-            PathBuf::from("/custom/xdg/microsoft-defender-mcp/audit.jsonl")
-        );
-    }
+    let all = [
+        ("XDG_STATE_HOME", "/custom/xdg"),
+        ("HOME", "/custom/home"),
+        ("LOCALAPPDATA", "C:\\custom\\appdata"),
+    ];
+    assert_eq!(
+        audit_path_with(&all),
+        PathBuf::from("/custom/xdg/microsoft-defender-mcp/audit.jsonl")
+    );
+    assert_eq!(
+        audit_path_with(&all[1..]),
+        PathBuf::from("/custom/home/.local/state/microsoft-defender-mcp/audit.jsonl")
+    );
+    assert_eq!(
+        audit_path_with(&all[2..]),
+        PathBuf::from("C:\\custom\\appdata").join("microsoft-defender-mcp/audit.jsonl")
+    );
+    assert_eq!(
+        audit_path_with(&[]),
+        PathBuf::from("./microsoft-defender-mcp-audit.jsonl")
+    );
+    // Empty values count as unset.
+    assert_eq!(
+        audit_path_with(&[("XDG_STATE_HOME", ""), ("HOME", "/custom/home")]),
+        PathBuf::from("/custom/home/.local/state/microsoft-defender-mcp/audit.jsonl")
+    );
+}
 
-    // 2. HOME fallback when XDG_STATE_HOME is unset
-    {
-        let _g = EnvGuard::set(&[
-            ("XDG_STATE_HOME", None),
-            ("HOME", Some("/custom/home")),
-            ("LOCALAPPDATA", Some("C:\\custom\\appdata")),
-        ]);
-        let path = default_audit_path();
-        assert_eq!(
-            path,
-            PathBuf::from("/custom/home/.local/state/microsoft-defender-mcp/audit.jsonl")
-        );
-    }
-
-    // 3. LOCALAPPDATA fallback when XDG and HOME are unset
-    {
-        let _g = EnvGuard::set(&[
-            ("XDG_STATE_HOME", None),
-            ("HOME", None),
-            ("LOCALAPPDATA", Some("C:\\custom\\appdata")),
-        ]);
-        let path = default_audit_path();
-        assert_eq!(
-            path,
-            PathBuf::from("C:\\custom\\appdata/microsoft-defender-mcp/audit.jsonl")
-        );
-    }
-
-    // 4. Default current directory fallback when none are set
-    {
-        let _g = EnvGuard::set(&[
-            ("XDG_STATE_HOME", None),
-            ("HOME", None),
-            ("LOCALAPPDATA", None),
-        ]);
-        let path = default_audit_path();
-        assert_eq!(
-            path,
-            PathBuf::from("./microsoft-defender-mcp-audit.jsonl")
-        );
-    }
+#[test]
+fn test_loopback_detection() {
+    assert!(is_loopback_address("127.0.0.1:8000"));
+    assert!(is_loopback_address("[::1]:8000"));
+    assert!(is_loopback_address("localhost:8000"));
+    assert!(!is_loopback_address("0.0.0.0:8000"));
+    assert!(!is_loopback_address("10.1.2.3:8000"));
+    assert!(!is_loopback_address("example.com:8000"));
 }

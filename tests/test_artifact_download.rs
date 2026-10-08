@@ -75,13 +75,7 @@ fn forensics(action: &str) -> ForensicsInput {
 }
 
 fn expected_sha256() -> String {
-    use std::fmt::Write;
-    Sha256::digest(PAYLOAD)
-        .iter()
-        .fold(String::new(), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    format!("{:x}", Sha256::digest(PAYLOAD))
 }
 
 #[tokio::test]

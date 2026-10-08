@@ -159,11 +159,17 @@ impl TokenManager {
                     );
                 }
                 Err(err) => {
-                    if let Some(ep_err) = err.as_endpoint_error() {
-                        if ep_err.error == "invalid_grant" && ep_err.aadsts == Some(65001) {
-                            consent_map.insert(aud, ConsentState::Missing { aadsts: Some(65001) });
-                            continue;
-                        }
+                    if let Some(ep_err) = err.as_endpoint_error()
+                        && ep_err.error == "invalid_grant"
+                        && ep_err.aadsts == Some(65001)
+                    {
+                        consent_map.insert(
+                            aud,
+                            ConsentState::Missing {
+                                aadsts: Some(65001),
+                            },
+                        );
+                        continue;
                     }
                     return Err(anyhow::anyhow!("{err}"));
                 }
@@ -206,14 +212,21 @@ impl TokenManager {
     }
 
     /// Get a valid access token for the given audience, refreshing if necessary.
-    pub async fn get_token(&self, audience: Audience) -> Result<String, rmcp::model::CallToolResult> {
+    pub async fn get_token(
+        &self,
+        audience: Audience,
+    ) -> Result<String, rmcp::model::CallToolResult> {
         // Fast fail if session is reauth-required or consent is missing
         if let Credential::Delegated(session) = self.credential.as_ref() {
             if let Some(reason) = session.reauth.get() {
                 return Err(crate::error::reauthentication_required(reason.as_str()));
             }
             if let Some(ConsentState::Missing { .. }) = session.consent_state(&audience) {
-                let scopes = self.audience_scopes.get(&audience).cloned().unwrap_or_default();
+                let scopes = self
+                    .audience_scopes
+                    .get(&audience)
+                    .cloned()
+                    .unwrap_or_default();
                 return Err(crate::error::consent_missing(audience.as_str(), &scopes));
             }
         }
@@ -221,10 +234,10 @@ impl TokenManager {
         // Fast path: read from cache
         {
             let guard = self.cache.read().await;
-            if let Some(cached) = guard.get(&audience) {
-                if cached.is_valid() {
-                    return Ok(cached.token.clone());
-                }
+            if let Some(cached) = guard.get(&audience)
+                && cached.is_valid()
+            {
+                return Ok(cached.token.clone());
             }
         }
 
@@ -237,23 +250,29 @@ impl TokenManager {
                 return Err(crate::error::reauthentication_required(reason.as_str()));
             }
             if let Some(ConsentState::Missing { .. }) = session.consent_state(&audience) {
-                let scopes = self.audience_scopes.get(&audience).cloned().unwrap_or_default();
+                let scopes = self
+                    .audience_scopes
+                    .get(&audience)
+                    .cloned()
+                    .unwrap_or_default();
                 return Err(crate::error::consent_missing(audience.as_str(), &scopes));
             }
         }
 
         {
             let guard = self.cache.read().await;
-            if let Some(cached) = guard.get(&audience) {
-                if cached.is_valid() {
-                    return Ok(cached.token.clone());
-                }
+            if let Some(cached) = guard.get(&audience)
+                && cached.is_valid()
+            {
+                return Ok(cached.token.clone());
             }
         }
 
         match self.credential.as_ref() {
             Credential::ClientSecret(secret) => {
-                let token = self.fetch_app_token(audience, secret).await
+                let token = self
+                    .fetch_app_token(audience, secret)
+                    .await
                     .map_err(|e| crate::error::tool_error(format!("Auth error: {e}")))?;
                 let mut guard = self.cache.write().await;
                 guard.insert(audience, token.clone());
@@ -264,7 +283,11 @@ impl TokenManager {
                     let guard = session.refresh_token.lock().unwrap();
                     guard.expose().to_string()
                 };
-                let scopes = self.audience_scopes.get(&audience).cloned().unwrap_or_default();
+                let scopes = self
+                    .audience_scopes
+                    .get(&audience)
+                    .cloned()
+                    .unwrap_or_default();
                 let res = signin::refresh_token_grant(
                     &self.http_client,
                     &self.tenant_id,
@@ -308,7 +331,9 @@ impl TokenManager {
                                     Some(65001) => {
                                         session.set_consent(
                                             audience,
-                                            ConsentState::Missing { aadsts: Some(65001) },
+                                            ConsentState::Missing {
+                                                aadsts: Some(65001),
+                                            },
                                         );
                                         return Err(crate::error::consent_missing(
                                             audience.as_str(),
@@ -329,7 +354,9 @@ impl TokenManager {
                                 ));
                             }
                         }
-                        Err(crate::error::tool_error(format!("Token refresh failed: {err}")))
+                        Err(crate::error::tool_error(format!(
+                            "Token refresh failed: {err}"
+                        )))
                     }
                 }
             }
@@ -444,13 +471,8 @@ pub enum AuthKind {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IdentitySnapshot {
-    App {
-        client_id: String,
-    },
-    User {
-        account: String,
-        tenant_id: String,
-    },
+    App { client_id: String },
+    User { account: String, tenant_id: String },
 }
 
 impl IdentitySnapshot {
@@ -522,13 +544,23 @@ impl PermissionCategory {
     pub fn delegated_scope(&self) -> &'static str {
         match self {
             Self::ReadEndpoint => "the *.Read equivalents, plus User.Read.All",
-            Self::ReadGraph => "ThreatHunting.Read.All, ThreatIntelligence.Read.All, SecurityAlert.Read.All, SecurityIncident.Read.All",
-            Self::ReadWriteNamed => "Machine.ReadWrite, Alert.ReadWrite, Ti.ReadWrite, Library.Manage",
-            Self::LiveResponse => "Machine.LiveResponse, Machine.CollectForensics, Machine.StopAndQuarantine, Library.Manage",
-            Self::DeviceResponse => "Machine.Isolate, Machine.RestrictExecution, Machine.Scan, Machine.ReadWrite, Alert.ReadWrite",
+            Self::ReadGraph => {
+                "ThreatHunting.Read.All, ThreatIntelligence.Read.All, SecurityAlert.Read.All, SecurityIncident.Read.All"
+            }
+            Self::ReadWriteNamed => {
+                "Machine.ReadWrite, Alert.ReadWrite, Ti.ReadWrite, Library.Manage"
+            }
+            Self::LiveResponse => {
+                "Machine.LiveResponse, Machine.CollectForensics, Machine.StopAndQuarantine, Library.Manage"
+            }
+            Self::DeviceResponse => {
+                "Machine.Isolate, Machine.RestrictExecution, Machine.Scan, Machine.ReadWrite, Alert.ReadWrite"
+            }
             Self::Offboarding => "Machine.Offboard",
             Self::Indicators => "Ti.ReadWrite",
-            Self::Triage => "Alert.ReadWrite, SecurityAlert.ReadWrite.All, SecurityIncident.ReadWrite.All",
+            Self::Triage => {
+                "Alert.ReadWrite, SecurityAlert.ReadWrite.All, SecurityIncident.ReadWrite.All"
+            }
         }
     }
 
@@ -537,8 +569,12 @@ impl PermissionCategory {
             Self::ReadEndpoint => "View data",
             Self::ReadGraph => "Entra Security Reader, or a Unified RBAC role with equivalent read",
             Self::ReadWriteNamed => "View data",
-            Self::LiveResponse => "Live response capabilities; Alerts investigation; Active remediation actions",
-            Self::DeviceResponse => "Active remediation actions (isolate, restrict, scan, investigate); Manage security settings (tags, device value)",
+            Self::LiveResponse => {
+                "Live response capabilities; Alerts investigation; Active remediation actions"
+            }
+            Self::DeviceResponse => {
+                "Active remediation actions (isolate, restrict, scan, investigate); Manage security settings (tags, device value)"
+            }
             Self::Offboarding => "Per Permission options",
             Self::Indicators => "Active remediation actions (manage indicators)",
             Self::Triage => "Alerts investigation; Entra Security Operator",
@@ -637,7 +673,9 @@ impl TokenManager {
 }
 
 /// Compute requested scope sets per R-05 from ServerConfig.
-pub fn compute_audience_scopes(config: &crate::cli::ServerConfig) -> HashMap<Audience, Vec<String>> {
+pub fn compute_audience_scopes(
+    config: &crate::cli::ServerConfig,
+) -> HashMap<Audience, Vec<String>> {
     let mut endpoint_scopes = vec![
         "Machine.Read",
         "Alert.Read",
@@ -728,11 +766,11 @@ pub fn compute_audience_scopes(config: &crate::cli::ServerConfig) -> HashMap<Aud
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use axum::extract::State;
     use axum::routing::post;
     use axum::{Json, Router};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn parse_tool_error(err: &rmcp::model::CallToolResult) -> serde_json::Value {
         assert_eq!(err.is_error, Some(true));
@@ -768,16 +806,26 @@ mod tests {
         assert!(ep.iter().all(|s| !s.contains(".default")));
         assert!(ep.contains(&"https://api.securitycenter.microsoft.com/Machine.Read".to_string()));
         assert!(ep.contains(&"https://api.securitycenter.microsoft.com/User.Read.All".to_string()));
-        assert!(!ep.contains(&"https://api.securitycenter.microsoft.com/Machine.ReadWrite".to_string()));
-        assert!(!ep.contains(&"https://api.securitycenter.microsoft.com/Machine.Isolate".to_string()));
-        assert!(!ep.contains(&"https://api.securitycenter.microsoft.com/Machine.Offboard".to_string()));
+        assert!(
+            !ep.contains(&"https://api.securitycenter.microsoft.com/Machine.ReadWrite".to_string())
+        );
+        assert!(
+            !ep.contains(&"https://api.securitycenter.microsoft.com/Machine.Isolate".to_string())
+        );
+        assert!(
+            !ep.contains(&"https://api.securitycenter.microsoft.com/Machine.Offboard".to_string())
+        );
         assert!(!ep.contains(&"https://api.securitycenter.microsoft.com/Ti.ReadWrite".to_string()));
-        assert!(!ep.contains(&"https://api.securitycenter.microsoft.com/Library.Manage".to_string()));
+        assert!(
+            !ep.contains(&"https://api.securitycenter.microsoft.com/Library.Manage".to_string())
+        );
 
         assert_eq!(gr.len(), 4);
         assert!(gr.iter().all(|s| !s.contains(".default")));
         assert!(gr.contains(&"https://graph.microsoft.com/ThreatHunting.Read.All".to_string()));
-        assert!(!gr.contains(&"https://graph.microsoft.com/SecurityAlert.ReadWrite.All".to_string()));
+        assert!(
+            !gr.contains(&"https://graph.microsoft.com/SecurityAlert.ReadWrite.All".to_string())
+        );
     }
 
     #[test]
@@ -805,15 +853,29 @@ mod tests {
         let ep = scopes.get(&Audience::Endpoint).unwrap();
         let gr = scopes.get(&Audience::Graph).unwrap();
 
-        assert!(ep.contains(&"https://api.securitycenter.microsoft.com/Machine.ReadWrite".to_string()));
-        assert!(ep.contains(&"https://api.securitycenter.microsoft.com/Machine.LiveResponse".to_string()));
-        assert!(ep.contains(&"https://api.securitycenter.microsoft.com/Machine.Isolate".to_string()));
-        assert!(ep.contains(&"https://api.securitycenter.microsoft.com/Machine.Offboard".to_string()));
+        assert!(
+            ep.contains(&"https://api.securitycenter.microsoft.com/Machine.ReadWrite".to_string())
+        );
+        assert!(ep.contains(
+            &"https://api.securitycenter.microsoft.com/Machine.LiveResponse".to_string()
+        ));
+        assert!(
+            ep.contains(&"https://api.securitycenter.microsoft.com/Machine.Isolate".to_string())
+        );
+        assert!(
+            ep.contains(&"https://api.securitycenter.microsoft.com/Machine.Offboard".to_string())
+        );
         assert!(ep.contains(&"https://api.securitycenter.microsoft.com/Ti.ReadWrite".to_string()));
-        assert!(ep.contains(&"https://api.securitycenter.microsoft.com/Library.Manage".to_string()));
+        assert!(
+            ep.contains(&"https://api.securitycenter.microsoft.com/Library.Manage".to_string())
+        );
 
-        assert!(gr.contains(&"https://graph.microsoft.com/SecurityAlert.ReadWrite.All".to_string()));
-        assert!(gr.contains(&"https://graph.microsoft.com/SecurityIncident.ReadWrite.All".to_string()));
+        assert!(
+            gr.contains(&"https://graph.microsoft.com/SecurityAlert.ReadWrite.All".to_string())
+        );
+        assert!(
+            gr.contains(&"https://graph.microsoft.com/SecurityIncident.ReadWrite.All".to_string())
+        );
     }
 
     #[test]
@@ -838,7 +900,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_flight_refresh_concurrent() {
-        let _env_guard = crate::auth::signin::tests::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env_guard = crate::auth::signin::tests::TEST_ENV_LOCK.lock().await;
         #[derive(Clone)]
         struct MockState {
             refresh_hits: Arc<AtomicUsize>,
@@ -931,7 +993,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reauth_classification_table_and_fail_fast() {
-        let _env_guard = crate::auth::signin::tests::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env_guard = crate::auth::signin::tests::TEST_ENV_LOCK.lock().await;
         #[derive(Clone)]
         struct ErrorMockState {
             hits: Arc<AtomicUsize>,
@@ -1008,7 +1070,10 @@ mod tests {
 
             let http = reqwest::Client::new();
             let mut scopes = HashMap::new();
-            scopes.insert(Audience::Endpoint, vec!["https://api.securitycenter.microsoft.com/Machine.Read".to_string()]);
+            scopes.insert(
+                Audience::Endpoint,
+                vec!["https://api.securitycenter.microsoft.com/Machine.Read".to_string()],
+            );
             let consent = HashMap::new();
 
             let tm = TokenManager::for_test_user(
@@ -1031,7 +1096,11 @@ mod tests {
             let json2 = parse_tool_error(&res2);
             assert_eq!(json2["code"], "reauthentication_required");
             assert_eq!(json2["reason"], expected_reason);
-            assert_eq!(hits.load(Ordering::SeqCst), 1, "network must not be hit after reauth is set");
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "network must not be hit after reauth is set"
+            );
             unsafe {
                 std::env::remove_var(crate::constants::ENV_AUTHORITY_BASE_URL);
             }
@@ -1040,7 +1109,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_consent_missing_on_65001() {
-        let _env_guard = crate::auth::signin::tests::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env_guard = crate::auth::signin::tests::TEST_ENV_LOCK.lock().await;
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_clone = hits.clone();
 
@@ -1074,7 +1143,10 @@ mod tests {
 
         let http = reqwest::Client::new();
         let mut scopes = HashMap::new();
-        scopes.insert(Audience::Graph, vec!["https://graph.microsoft.com/ThreatHunting.Read.All".to_string()]);
+        scopes.insert(
+            Audience::Graph,
+            vec!["https://graph.microsoft.com/ThreatHunting.Read.All".to_string()],
+        );
         let consent = HashMap::new();
 
         let tm = TokenManager::for_test_user(

@@ -102,24 +102,22 @@ async fn main() -> anyhow::Result<()> {
         AuthConfig::App => {
             TokenManager::from_env(http).map_err(|e| anyhow::anyhow!("Configuration error: {e}"))?
         }
-        AuthConfig::User { flow } => {
-            match TokenManager::sign_in_user(&config, flow, http).await {
-                Ok(tm) => {
-                    if config.transport == TransportMode::Http {
-                        if let IdentitySnapshot::User { account, .. } = tm.identity() {
-                            eprintln!(
-                                "SECURITY WARNING: every HTTP client connected to this server acts as {account} with that user's Defender rights; run one server per analyst for per-person attribution."
-                            );
-                        }
-                    }
-                    tm
+        AuthConfig::User { flow } => match TokenManager::sign_in_user(&config, flow, http).await {
+            Ok(tm) => {
+                if config.transport == TransportMode::Http
+                    && let IdentitySnapshot::User { account, .. } = tm.identity()
+                {
+                    eprintln!(
+                        "SECURITY WARNING: every HTTP client connected to this server acts as {account} with that user's Defender rights; run one server per analyst for per-person attribution."
+                    );
                 }
-                Err(e) => {
-                    eprintln!("Sign-in not completed: {e}. The server did not start.");
-                    std::process::exit(1);
-                }
+                tm
             }
-        }
+            Err(e) => {
+                eprintln!("Sign-in not completed: {e}. The server did not start.");
+                std::process::exit(1);
+            }
+        },
     };
 
     let graph_client = GraphClient::new(token_manager.clone());
@@ -139,9 +137,10 @@ async fn run_stdio(
     config: ServerConfig,
     audit_sink: Option<Arc<AuditSink>>,
 ) -> anyhow::Result<()> {
-    let service = DefenderServer::new_with_config(graph_client, endpoint_client, config, audit_sink)
-        .serve(rmcp::transport::io::stdio())
-        .await?;
+    let service =
+        DefenderServer::new_with_config(graph_client, endpoint_client, config, audit_sink)
+            .serve(rmcp::transport::io::stdio())
+            .await?;
     tracing::info!("Defender MCP server running on stdio");
     service.waiting().await?;
     Ok(())

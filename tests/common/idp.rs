@@ -10,18 +10,18 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use microsoft_defender_mcp_server::auth::Audience;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 pub const SENTINEL_CODE: &str = "SENTINEL-CODE-0001";
 pub const SENTINEL_DC: &str = "SENTINEL-DC-0001";
@@ -146,7 +146,9 @@ impl Default for MockIdpInner {
             authorize_error: None,
             device_code_sequence: VecDeque::new(),
             device_code_interval: 0,
-            device_code_message: format!("To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code {SENTINEL_UC} to authenticate."),
+            device_code_message: format!(
+                "To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code {SENTINEL_UC} to authenticate."
+            ),
             endpoint_responses: VecDeque::new(),
             graph_responses: VecDeque::new(),
             rt_seq: 0,
@@ -193,8 +195,8 @@ impl MockIdp {
 
     /// Spawn a new mock Entra ID authority on an ephemeral loopback port.
     pub async fn start() -> Self {
-        let std_listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("bind loopback port for mock idp");
+        let std_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback port for mock idp");
         let base_url = format!("http://{}", std_listener.local_addr().expect("local addr"));
         std_listener.set_nonblocking(true).expect("set nonblocking");
 
@@ -341,7 +343,12 @@ impl MockIdp {
 
     /// Most recent recorded authorize request.
     pub fn last_authorize(&self) -> Option<RecordedAuthorize> {
-        self.inner.lock().unwrap().recorded_authorizes.last().cloned()
+        self.inner
+            .lock()
+            .unwrap()
+            .recorded_authorizes
+            .last()
+            .cloned()
     }
 
     /// Most recent recorded token request.
@@ -476,7 +483,11 @@ async fn handle_token(
 
     match grant_type.as_str() {
         "authorization_code" => {
-            let id_token = make_id_token(&inner.preferred_username, &inner.tenant_id, &inner.object_id);
+            let id_token = make_id_token(
+                &inner.preferred_username,
+                &inner.tenant_id,
+                &inner.object_id,
+            );
             inner.rt_seq += 1;
             let rt = format!("SENTINEL-RT-{:04}", inner.rt_seq);
             inner.at_seq += 1;

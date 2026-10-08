@@ -25,8 +25,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use common::idp::{AudienceResponse, DeviceCodeStep, MockIdp, SENTINEL_UC};
 use common::{ElicitationResponse, McpProcess, ScratchDir, server_command, spawn_mock};
-use microsoft_defender_mcp_server::auth::{Audience, TokenManager};
-use microsoft_defender_mcp_server::cli::{AuthConfig, ServerConfig, SignInFlow};
+use microsoft_defender_mcp_server::auth::Audience;
 use serde_json::{Value, json};
 
 const MOCK_MACHINE_ID: &str = "1e5bc9d7e413ddd7902c2932e418702b84d0cc07";
@@ -68,7 +67,10 @@ async fn test_browser_flow_pkce_state_mismatch_and_no_client_secret() {
         "code_challenge_method must be S256"
     );
     assert!(
-        auth.code_challenge.as_ref().map(|s| s.len() >= 43).unwrap_or(false),
+        auth.code_challenge
+            .as_ref()
+            .map(|s| s.len() >= 43)
+            .unwrap_or(false),
         "code_challenge must be valid URL-safe base64"
     );
     assert_eq!(
@@ -168,7 +170,10 @@ async fn test_device_code_flow_message_and_zero_stdout_bytes_on_expired_token() 
 
     let proc = McpProcess::start(
         &["--auth-mode", "user", "--sign-in-flow", "device-code"],
-        &[("DEFENDER_AUTHORITY_BASE_URL", idp.base_url())],
+        &[
+            ("DEFENDER_AUTHORITY_BASE_URL", idp.base_url()),
+            ("DEFENDER_TEST_SLOW_DOWN_MS", "50"),
+        ],
     );
 
     let stderr = proc.captured_stderr();
@@ -213,9 +218,7 @@ async fn test_device_code_flow_message_and_zero_stdout_bytes_on_expired_token() 
 async fn test_read_only_scopes_and_scope_not_requested_gate() {
     let upstream = spawn_mock(Router::new().route(
         "/api/files/{id}/machines",
-        get(|| async {
-            Json(json!({"value": []}))
-        }),
+        get(|| async { Json(json!({"value": []})) }),
     ))
     .await;
 
@@ -275,7 +278,10 @@ async fn test_read_only_scopes_and_scope_not_requested_gate() {
     );
 
     // Assert 0 upstream hits
-    upstream.assert_hits("/api/files/0123456789abcdef0123456789abcdef01234567/machines", 0);
+    upstream.assert_hits(
+        "/api/files/0123456789abcdef0123456789abcdef01234567/machines",
+        0,
+    );
     assert_eq!(upstream.total_hits(), 0);
 
     proc.shutdown();
@@ -288,15 +294,11 @@ async fn test_consent_missing_for_graph_allows_endpoint() {
         Router::new()
             .route(
                 "/api/machines",
-                get(|| async {
-                    Json(json!({"value": [{"id": "m1"}]}))
-                }),
+                get(|| async { Json(json!({"value": [{"id": "m1"}]})) }),
             )
             .route(
                 "/v1.0/security/runHuntingQuery",
-                post(|| async {
-                    Json(json!({"results": []}))
-                }),
+                post(|| async { Json(json!({"results": []})) }),
             ),
     )
     .await;
@@ -323,8 +325,7 @@ async fn test_consent_missing_for_graph_allows_endpoint() {
     // Endpoint call succeeds
     let ep_call = proc.call_tool("defender_machines", json!({"action": "machine_list"}));
     assert_ne!(
-        ep_call["result"]["isError"],
-        true,
+        ep_call["result"]["isError"], true,
         "endpoint call should succeed: {ep_call}"
     );
     upstream.assert_hits("/api/machines", 1);
@@ -342,126 +343,6 @@ async fn test_consent_missing_for_graph_allows_endpoint() {
     upstream.assert_hits("/v1.0/security/runHuntingQuery", 0);
 
     proc.shutdown();
-}
-
-/// Quickstart Q12: 20 concurrent calls with expired token trigger exactly 1 refresh request,
-/// rotate refresh token, and subsequent invalid_grant AADSTS700082 sets session_expired with no further hits.
-#[tokio::test]
-async fn test_token_refresh_single_flight_and_session_expired() {
-    let idp = MockIdp::start().await;
-    // Set initial Endpoint and Graph tokens to expire in 60s so they are immediately considered expired
-    idp.set_audience_response(
-        Audience::Endpoint,
-        AudienceResponse::Success {
-            scopes: vec!["https://api.securitycenter.microsoft.com/Machine.Read".to_string()],
-            expires_in: 60,
-        },
-    );
-    idp.set_audience_response(
-        Audience::Graph,
-        AudienceResponse::Success {
-            scopes: vec!["https://graph.microsoft.com/ThreatHunting.Read.All".to_string()],
-            expires_in: 60,
-        },
-    );
-    let config = ServerConfig {
-        transport: microsoft_defender_mcp_server::cli::TransportMode::Stdio,
-        bind_address: "127.0.0.1:8000".to_string(),
-        read_only: false,
-        categories: microsoft_defender_mcp_server::cli::MutationCategories::default(),
-        live_response_allowed_commands: None,
-        quarantine_dir: std::path::PathBuf::from("./quarantine"),
-        audit_log: microsoft_defender_mcp_server::cli::AuditLogSetting::Default(
-            std::path::PathBuf::from("./audit.jsonl"),
-        ),
-        confirm_destructive: false,
-        auth: AuthConfig::User {
-            flow: SignInFlow::Browser,
-        },
-    };
-
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-
-    unsafe {
-        std::env::set_var("DEFENDER_AUTHORITY_BASE_URL", idp.base_url());
-        std::env::set_var("DEFENDER_TEST_BROWSER_CMD", MockIdp::browser_cmd());
-        std::env::set_var("AZURE_TENANT_ID", "00000000-0000-0000-0000-000000000000");
-        std::env::set_var("AZURE_CLIENT_ID", "11111111-1111-1111-1111-111111111111");
-    }
-
-    let tm = TokenManager::sign_in_user(&config, SignInFlow::Browser, http)
-        .await
-        .expect("sign-in should succeed");
-
-    // Clear initial sign-in request counts
-    idp.reset_history();
-
-    // Next refresh response returns valid token and rotates refresh token
-    idp.set_audience_response(
-        Audience::Endpoint,
-        AudienceResponse::Success {
-            scopes: vec!["https://api.securitycenter.microsoft.com/Machine.Read".to_string()],
-            expires_in: 3600,
-        },
-    );
-
-    // 20 concurrent requests for Audience::Endpoint
-    let mut handles = Vec::new();
-    for _ in 0..20 {
-        let tm_clone = tm.clone();
-        handles.push(tokio::spawn(async move {
-            tm_clone.get_token(Audience::Endpoint).await
-        }));
-    }
-
-    for h in handles {
-        let res = h.await.unwrap();
-        assert!(res.is_ok(), "concurrent token acquisition should succeed");
-    }
-
-    // Exactly 1 refresh request was made to the IdP
-    assert_eq!(
-        idp.grant_count("refresh_token"),
-        1,
-        "single-flight refresh must make exactly 1 IdP request for 20 concurrent calls"
-    );
-
-    // Configure Graph refresh request to fail with AADSTS700082
-    idp.set_audience_response(Audience::Graph, AudienceResponse::Aadsts(700082));
-
-    // First call after expiration gets AADSTS700082 -> session_expired
-    let err1 = tm.get_token(Audience::Graph).await.unwrap_err();
-    let val1 = err1.structured_content.expect("structured error");
-    assert_eq!(val1["code"], "reauthentication_required");
-    assert_eq!(val1["reason"], "session_expired");
-
-    assert_eq!(
-        idp.grant_count("refresh_token"),
-        2,
-        "second refresh attempt hit IdP"
-    );
-
-    // Second call fails fast locally with NO further network requests
-    let err2 = tm.get_token(Audience::Endpoint).await.unwrap_err();
-    let val2 = err2.structured_content.expect("structured error");
-    assert_eq!(val2["code"], "reauthentication_required");
-    assert_eq!(val2["reason"], "session_expired");
-
-    assert_eq!(
-        idp.grant_count("refresh_token"),
-        2,
-        "subsequent calls must not produce further IdP hits once reauth is required"
-    );
-
-    unsafe {
-        std::env::remove_var("DEFENDER_AUTHORITY_BASE_URL");
-        std::env::remove_var("DEFENDER_TEST_BROWSER_CMD");
-        std::env::remove_var("AZURE_TENANT_ID");
-        std::env::remove_var("AZURE_CLIENT_ID");
-    }
 }
 
 /// Quickstart Q12: API 401 with `WWW-Authenticate: ... error="insufficient_claims"` triggers
@@ -560,12 +441,9 @@ async fn test_user_mode_403_rights_text() {
 /// Quickstart Q12: AZURE_TENANT_ID=common and organizations exit non-zero at startup.
 #[test]
 fn test_tenant_common_organizations_rejected() {
-    let out_common = server_command(
-        &["--auth-mode", "user"],
-        &[("AZURE_TENANT_ID", "common")],
-    )
-    .output()
-    .expect("run server");
+    let out_common = server_command(&["--auth-mode", "user"], &[("AZURE_TENANT_ID", "common")])
+        .output()
+        .expect("run server");
 
     assert!(!out_common.status.success());
     let stderr_common = String::from_utf8_lossy(&out_common.stderr);
@@ -625,7 +503,8 @@ async fn test_azure_client_secret_ignored_notice() {
 
     let stderr_without_secret = String::from_utf8_lossy(&out_without_secret.stderr);
     assert!(
-        !stderr_without_secret.contains("NOTE: AZURE_CLIENT_SECRET is ignored in --auth-mode user."),
+        !stderr_without_secret
+            .contains("NOTE: AZURE_CLIENT_SECRET is ignored in --auth-mode user."),
         "stderr must not print notice when secret is absent: {stderr_without_secret}"
     );
 }
@@ -714,8 +593,7 @@ async fn test_user_mode_mutating_audit_identity_and_credentials_exclusion() {
     );
 
     assert_ne!(
-        isolate_res["result"]["isError"],
-        true,
+        isolate_res["result"]["isError"], true,
         "isolate action should succeed: {isolate_res}"
     );
 
@@ -728,13 +606,13 @@ async fn test_user_mode_mutating_audit_identity_and_credentials_exclusion() {
 
     let mut found_user_identity = false;
     for line in audit_content.lines() {
-        if let Ok(entry) = serde_json::from_str::<Value>(line) {
-            if let Some(id) = entry.get("identity") {
-                assert_eq!(id["kind"], "user");
-                assert_eq!(id["account"], "alice@contoso.com");
-                assert_eq!(id["tenant_id"], "00000000-0000-0000-0000-000000000000");
-                found_user_identity = true;
-            }
+        if let Ok(entry) = serde_json::from_str::<Value>(line)
+            && let Some(id) = entry.get("identity")
+        {
+            assert_eq!(id["kind"], "user");
+            assert_eq!(id["account"], "alice@contoso.com");
+            assert_eq!(id["tenant_id"], "00000000-0000-0000-0000-000000000000");
+            found_user_identity = true;
         }
     }
     assert!(

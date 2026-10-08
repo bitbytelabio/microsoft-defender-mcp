@@ -288,7 +288,10 @@ mod tests {
 
     #[test]
     fn test_consent_missing_contract_shape() {
-        let scopes = vec!["ThreatHunting.Read.All".to_string(), "SecurityAlert.Read.All".to_string()];
+        let scopes = vec![
+            "ThreatHunting.Read.All".to_string(),
+            "SecurityAlert.Read.All".to_string(),
+        ];
         let err = consent_missing("graph", &scopes);
         let json = parse_structured(&err);
         assert_eq!(json["code"], "consent_missing");

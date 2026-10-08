@@ -223,7 +223,9 @@ Credentials come from environment variables. Every server option is a CLI flag w
 
 * `GRAPH_BASE_URL`: Overrides `https://graph.microsoft.com/v1.0` (used for mock server testing).
 * `DEFENDER_ENDPOINT_BASE_URL`: Overrides `https://api.securitycenter.microsoft.com` (used for mock server testing).
-* `DEFENDER_AUTHORITY_BASE_URL`: Overrides `https://login.microsoftonline.com` for token, devicecode, and authorize endpoints.
+* `DEFENDER_AUTHORITY_BASE_URL`: Overrides `https://login.microsoftonline.com` for the token, devicecode, and authorize endpoints in both auth modes.
+* Debug builds only (ignored in release builds): `DEFENDER_TEST_ELICITATION_TIMEOUT_MS` shortens the 300-second confirmation timeout, `DEFENDER_TEST_SLOW_DOWN_MS` replaces the 5-second device-code `slow_down` back-off, and `DEFENDER_TEST_BROWSER_CMD` replaces the browser launcher for the sign-in URL.
+
 ---
 
 ## Running the Server

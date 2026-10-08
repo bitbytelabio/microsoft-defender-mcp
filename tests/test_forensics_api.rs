@@ -37,7 +37,9 @@ fn fixture(seen: Seen) -> Router {
             }
 
             match (method.as_str(), path.as_str()) {
-                ("POST", p) if p == format!("/api/machines/{MACHINE}/collectInvestigationPackage") => {
+                ("POST", p)
+                    if p == format!("/api/machines/{MACHINE}/collectInvestigationPackage") =>
+                {
                     Json(json!({
                         "id": ACTION,
                         "type": "CollectInvestigationPackage",
@@ -65,14 +67,12 @@ fn fixture(seen: Seen) -> Router {
                 ("DELETE", p) if p.starts_with("/api/libraryfiles/") => {
                     StatusCode::NO_CONTENT.into_response()
                 }
-                ("POST", p) if p.ends_with("/oauth2/v2.0/token") => {
-                    Json(json!({
-                        "token_type": "Bearer",
-                        "access_token": common::SENTINEL_APP_TOKEN,
-                        "expires_in": 3600
-                    }))
-                    .into_response()
-                }
+                ("POST", p) if p.ends_with("/oauth2/v2.0/token") => Json(json!({
+                    "token_type": "Bearer",
+                    "access_token": common::SENTINEL_APP_TOKEN,
+                    "expires_in": 3600
+                }))
+                .into_response(),
                 _ => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))).into_response(),
             }
         }
@@ -349,7 +349,10 @@ async fn test_library_file_delete_traversal_rejected_locally() {
         err_str.contains("traversal") || err_str.contains("file_name"),
         "error must mention traversal or file_name: {err_str}"
     );
-    assert!(seen.lock().await.is_empty(), "local rejection must make 0 hits");
+    assert!(
+        seen.lock().await.is_empty(),
+        "local rejection must make 0 hits"
+    );
     assert!(proc.shutdown().success());
 }
 
@@ -382,6 +385,9 @@ async fn test_library_file_delete_declined_prompt_makes_zero_hits() {
         json!("not_confirmed")
     );
 
-    assert!(seen.lock().await.is_empty(), "declined confirmation must make 0 hits");
+    assert!(
+        seen.lock().await.is_empty(),
+        "declined confirmation must make 0 hits"
+    );
     assert!(proc.shutdown().success());
 }
