@@ -46,10 +46,6 @@ pub const REQUEST_TIMEOUT_SECS: u64 = 210;
 /// Token cache safety margin in seconds.
 pub const TOKEN_EXPIRY_BUFFER_SECS: i64 = 60;
 
-/// Maximum response size in characters before truncation (future use).
-#[allow(dead_code)]
-pub const CHARACTER_LIMIT: usize = 50_000;
-
 /// Transport selection environment variable.
 pub const ENV_TRANSPORT: &str = "TRANSPORT";
 

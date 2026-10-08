@@ -1064,6 +1064,11 @@ fn http_status_of(result: &CallToolResult) -> Option<u64> {
         .and_then(serde_json::Value::as_u64)
 }
 
+/// Upstream JSON as structured content; upstream failures are already tool errors.
+fn tool_result(result: Result<serde_json::Value, CallToolResult>) -> CallToolResult {
+    result.map_or_else(|e| e, CallToolResult::structured)
+}
+
 fn required<'a>(value: &'a Option<String>, name: &str, action: &str) -> Result<&'a str, McpError> {
     value
         .as_deref()
@@ -1144,116 +1149,102 @@ impl DefenderServer {
     // ---- Shared helpers ----
 
     /// Build ODataParams from an ODataListInput.
-    fn from_odata_list(i: &ODataListInput) -> ODataParams {
+    fn from_odata_list(i: &ODataListInput) -> ODataParams<'_> {
         ODataParams {
             top: Some(i.top),
             skip: Some(i.skip),
-            filter: i.filter.clone(),
-            select: i.select.clone(),
-            expand: i.expand.clone(),
-            search: i.search.clone(),
+            filter: i.filter.as_deref(),
+            select: i.select.as_deref(),
+            expand: i.expand.as_deref(),
+            search: i.search.as_deref(),
             count: i.count,
         }
     }
 
     /// Build ODataParams from a HostnameODataInput.
-    fn from_hostname_odata(i: &HostnameODataInput) -> ODataParams {
+    fn from_hostname_odata(i: &HostnameODataInput) -> ODataParams<'_> {
         ODataParams {
             top: Some(i.top),
             skip: Some(i.skip),
-            filter: i.filter.clone(),
-            select: i.select.clone(),
-            expand: i.expand.clone(),
-            search: None,
+            filter: i.filter.as_deref(),
+            select: i.select.as_deref(),
+            expand: i.expand.as_deref(),
             count: i.count,
+            ..ODataParams::default()
         }
     }
 
     /// Build ODataParams from an IntelProfileIdODataInput.
-    fn from_intel_profile_odata(i: &IntelProfileIdODataInput) -> ODataParams {
+    fn from_intel_profile_odata(i: &IntelProfileIdODataInput) -> ODataParams<'_> {
         ODataParams {
             top: Some(i.top),
             skip: Some(i.skip),
-            filter: i.filter.clone(),
-            select: i.select.clone(),
-            expand: i.expand.clone(),
-            search: None,
-            count: None,
+            filter: i.filter.as_deref(),
+            select: i.select.as_deref(),
+            expand: i.expand.as_deref(),
+            ..ODataParams::default()
         }
     }
 
     /// Build ODataParams from an ArticleIdODataInput.
-    fn from_article_odata(i: &ArticleIdODataInput) -> ODataParams {
+    fn from_article_odata(i: &ArticleIdODataInput) -> ODataParams<'_> {
         ODataParams {
             top: Some(i.top),
             skip: Some(i.skip),
-            select: i.select.clone(),
-            filter: None,
-            expand: None,
-            search: None,
-            count: None,
+            select: i.select.as_deref(),
+            ..ODataParams::default()
         }
     }
 
     /// Build ODataParams from a CertRelatedHostsInput.
-    fn from_cert_related_odata(i: &CertRelatedHostsInput) -> ODataParams {
+    fn from_cert_related_odata(i: &CertRelatedHostsInput) -> ODataParams<'_> {
         ODataParams {
             top: Some(i.top),
             skip: Some(i.skip),
             count: i.count,
-            filter: None,
-            select: None,
-            expand: None,
-            search: None,
+            ..ODataParams::default()
         }
     }
 
     /// Convenience: perform a simple GET and return the raw JSON as structured content.
     async fn simple_get(&self, path: &str) -> Result<CallToolResult, McpError> {
-        match self.client.graph_get(path, &[]).await {
-            Ok(value) => Ok(CallToolResult::structured(value)),
-            Err(e) => Ok(e),
-        }
+        Ok(tool_result(self.client.graph_get(path, &[]).await))
     }
 
     /// Convenience: GET with OData params, return raw JSON as structured content.
-    async fn odata_get(&self, path: &str, odata: &ODataParams) -> Result<CallToolResult, McpError> {
-        match self.client.graph_get_with_odata(path, odata).await {
-            Ok(value) => Ok(CallToolResult::structured(value)),
-            Err(e) => Ok(e),
-        }
+    async fn odata_get(
+        &self,
+        path: &str,
+        odata: &ODataParams<'_>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(tool_result(
+            self.client.graph_get_with_odata(path, odata).await,
+        ))
     }
 
     // ---- Endpoint helpers ----
 
     async fn ep_simple_get(&self, path: &str) -> Result<CallToolResult, McpError> {
-        match self.endpoint.endpoint_get(path, &[]).await {
-            Ok(value) => Ok(CallToolResult::structured(value)),
-            Err(e) => Ok(e),
-        }
+        Ok(tool_result(self.endpoint.endpoint_get(path, &[]).await))
     }
 
     async fn ep_odata_get(
         &self,
         path: &str,
-        odata: &ODataParams,
+        odata: &ODataParams<'_>,
     ) -> Result<CallToolResult, McpError> {
-        match self.endpoint.endpoint_get_with_odata(path, odata).await {
-            Ok(value) => Ok(CallToolResult::structured(value)),
-            Err(e) => Ok(e),
-        }
+        Ok(tool_result(
+            self.endpoint.endpoint_get_with_odata(path, odata).await,
+        ))
     }
 
     /// Build ODataParams with endpoint max top.
-    fn ep_odata(filter: Option<String>, top: i32, skip: i32) -> ODataParams {
+    fn ep_odata(filter: Option<&str>, top: i32, skip: i32) -> ODataParams<'_> {
         ODataParams {
             top: Some(top),
             skip: Some(skip),
             filter,
-            select: None,
-            expand: None,
-            search: None,
-            count: None,
+            ..ODataParams::default()
         }
     }
 }
@@ -1303,14 +1294,11 @@ impl DefenderServer {
             "Timespan": params.timespan,
         });
 
-        match self
-            .client
-            .graph_post("/security/runHuntingQuery", &body)
-            .await
-        {
-            Ok(value) => Ok(CallToolResult::structured(value)),
-            Err(e) => Ok(e),
-        }
+        Ok(tool_result(
+            self.client
+                .graph_post("/security/runHuntingQuery", &body)
+                .await,
+        ))
     }
 
     // ============================================================
@@ -2568,11 +2556,8 @@ impl DefenderServer {
         let odata = ODataParams {
             top: Some(params.top),
             skip: Some(params.skip),
-            select: params.select.clone(),
-            filter: None,
-            expand: None,
-            search: None,
-            count: None,
+            select: params.select.as_deref(),
+            ..ODataParams::default()
         };
         self.odata_get(
             &format!(
@@ -2640,7 +2625,7 @@ impl DefenderServer {
         Parameters(params): Parameters<EndpointODataInput>,
     ) -> Result<CallToolResult, McpError> {
         validation::validate_endpoint_odata_params(Some(params.top), Some(params.skip))?;
-        let odata = Self::ep_odata(params.filter, params.top, params.skip);
+        let odata = Self::ep_odata(params.filter.as_deref(), params.top, params.skip);
         self.ep_odata_get("/api/machines", &odata).await
     }
 
@@ -2720,23 +2705,17 @@ impl DefenderServer {
         Parameters(params): Parameters<FindByTagInput>,
     ) -> Result<CallToolResult, McpError> {
         let tag_name = validation::validate_tag_name(&params.tag_name)?;
-        let usw = if params.use_starts_with {
+        let use_starts_with = if params.use_starts_with {
             "true"
         } else {
             "false"
         };
-        let q = vec![
-            ("tag", tag_name.to_owned()),
-            ("useStartsWithFilter", usw.to_string()),
-        ];
-        match self
-            .endpoint
-            .endpoint_get("/api/machines/findByTag", &q)
-            .await
-        {
-            Ok(v) => Ok(CallToolResult::structured(v)),
-            Err(e) => Ok(e),
-        }
+        let q = [("tag", tag_name), ("useStartsWithFilter", use_starts_with)];
+        Ok(tool_result(
+            self.endpoint
+                .endpoint_get("/api/machines/findByTag", &q)
+                .await,
+        ))
     }
 
     /// List all installed software on a specific machine.
@@ -2819,7 +2798,7 @@ impl DefenderServer {
         Parameters(params): Parameters<EndpointODataInput>,
     ) -> Result<CallToolResult, McpError> {
         validation::validate_endpoint_odata_params(Some(params.top), Some(params.skip))?;
-        let odata = Self::ep_odata(params.filter, params.top, params.skip);
+        let odata = Self::ep_odata(params.filter.as_deref(), params.top, params.skip);
         self.ep_odata_get("/api/Software", &odata).await
     }
 
@@ -2873,7 +2852,7 @@ impl DefenderServer {
     ) -> Result<CallToolResult, McpError> {
         let software_id = validation::validate_required_id(&params.software_id, "software_id")?;
         validation::validate_endpoint_odata_params(Some(params.top), Some(params.skip))?;
-        let odata = Self::ep_odata(params.filter, params.top, params.skip);
+        let odata = Self::ep_odata(params.filter.as_deref(), params.top, params.skip);
         self.ep_odata_get(
             &format!(
                 "/api/Software/{}/machineReferences",
@@ -2991,7 +2970,7 @@ impl DefenderServer {
         Parameters(params): Parameters<EndpointODataInput>,
     ) -> Result<CallToolResult, McpError> {
         validation::validate_endpoint_odata_params(Some(params.top), Some(params.skip))?;
-        let odata = Self::ep_odata(params.filter, params.top, params.skip);
+        let odata = Self::ep_odata(params.filter.as_deref(), params.top, params.skip);
         self.ep_odata_get("/api/vulnerabilities", &odata).await
     }
 
@@ -3045,7 +3024,7 @@ impl DefenderServer {
     ) -> Result<CallToolResult, McpError> {
         let cve_id = validation::validate_cve_id(&params.cve_id)?;
         validation::validate_endpoint_odata_params(Some(params.top), Some(params.skip))?;
-        let odata = Self::ep_odata(params.filter, params.top, params.skip);
+        let odata = Self::ep_odata(params.filter.as_deref(), params.top, params.skip);
         self.ep_odata_get(
             &format!(
                 "/api/vulnerabilities/{}/machineReferences",
@@ -3078,7 +3057,7 @@ impl DefenderServer {
         Parameters(params): Parameters<EndpointODataInput>,
     ) -> Result<CallToolResult, McpError> {
         validation::validate_endpoint_odata_params(Some(params.top), Some(params.skip))?;
-        let odata = Self::ep_odata(params.filter, params.top, params.skip);
+        let odata = Self::ep_odata(params.filter.as_deref(), params.top, params.skip);
         self.ep_odata_get("/api/vulnerabilities/machinesVulnerabilities", &odata)
             .await
     }
@@ -3109,7 +3088,7 @@ impl DefenderServer {
         Parameters(params): Parameters<EndpointODataInput>,
     ) -> Result<CallToolResult, McpError> {
         validation::validate_endpoint_odata_params(Some(params.top), Some(params.skip))?;
-        let odata = Self::ep_odata(params.filter, params.top, params.skip);
+        let odata = Self::ep_odata(params.filter.as_deref(), params.top, params.skip);
         self.ep_odata_get("/api/recommendations", &odata).await
     }
 
@@ -3251,7 +3230,7 @@ impl DefenderServer {
         Parameters(params): Parameters<EndpointODataInput>,
     ) -> Result<CallToolResult, McpError> {
         validation::validate_endpoint_odata_params(Some(params.top), Some(params.skip))?;
-        let odata = Self::ep_odata(params.filter, params.top, params.skip);
+        let odata = Self::ep_odata(params.filter.as_deref(), params.top, params.skip);
         self.ep_odata_get("/api/remediationTasks", &odata).await
     }
 
@@ -3307,7 +3286,7 @@ impl DefenderServer {
         let remediation_id =
             validation::validate_required_id(&params.remediation_id, "remediation_id")?;
         validation::validate_endpoint_odata_params(Some(params.top), Some(params.skip))?;
-        let odata = Self::ep_odata(params.filter, params.top, params.skip);
+        let odata = Self::ep_odata(params.filter.as_deref(), params.top, params.skip);
         self.ep_odata_get(
             &format!(
                 "/api/remediationTasks/{}/machinereferences",
@@ -3391,22 +3370,19 @@ impl DefenderServer {
         validation::validate_look_back_hours(params.look_back_hours)?;
         let lh = params
             .look_back_hours
-            .unwrap_or(crate::constants::DEFAULT_LOOK_BACK_HOURS);
-        let q = vec![("lookBackHours", lh.to_string())];
-        match self
-            .endpoint
-            .endpoint_get(
-                &format!(
-                    "/api/ips/{}/stats",
-                    validation::encode_path_segment(ip_address)
-                ),
-                &q,
-            )
-            .await
-        {
-            Ok(v) => Ok(CallToolResult::structured(v)),
-            Err(e) => Ok(e),
-        }
+            .unwrap_or(crate::constants::DEFAULT_LOOK_BACK_HOURS)
+            .to_string();
+        Ok(tool_result(
+            self.endpoint
+                .endpoint_get(
+                    &format!(
+                        "/api/ips/{}/stats",
+                        validation::encode_path_segment(ip_address)
+                    ),
+                    &[("lookBackHours", lh.as_str())],
+                )
+                .await,
+        ))
     }
 
     /// Get alerts related to a specific IP address.
@@ -3464,22 +3440,19 @@ impl DefenderServer {
         validation::validate_look_back_hours(params.look_back_hours)?;
         let lh = params
             .look_back_hours
-            .unwrap_or(crate::constants::DEFAULT_LOOK_BACK_HOURS);
-        let q = vec![("lookBackHours", lh.to_string())];
-        match self
-            .endpoint
-            .endpoint_get(
-                &format!(
-                    "/api/domains/{}/stats",
-                    validation::encode_path_segment(domain_name)
-                ),
-                &q,
-            )
-            .await
-        {
-            Ok(v) => Ok(CallToolResult::structured(v)),
-            Err(e) => Ok(e),
-        }
+            .unwrap_or(crate::constants::DEFAULT_LOOK_BACK_HOURS)
+            .to_string();
+        Ok(tool_result(
+            self.endpoint
+                .endpoint_get(
+                    &format!(
+                        "/api/domains/{}/stats",
+                        validation::encode_path_segment(domain_name)
+                    ),
+                    &[("lookBackHours", lh.as_str())],
+                )
+                .await,
+        ))
     }
 
     /// List machines that have communicated with a specific domain.
@@ -3590,22 +3563,19 @@ impl DefenderServer {
         validation::validate_look_back_hours(params.look_back_hours)?;
         let lh = params
             .look_back_hours
-            .unwrap_or(crate::constants::DEFAULT_LOOK_BACK_HOURS);
-        let q = vec![("lookBackHours", lh.to_string())];
-        match self
-            .endpoint
-            .endpoint_get(
-                &format!(
-                    "/api/files/{}/stats",
-                    validation::encode_path_segment(file_sha1)
-                ),
-                &q,
-            )
-            .await
-        {
-            Ok(v) => Ok(CallToolResult::structured(v)),
-            Err(e) => Ok(e),
-        }
+            .unwrap_or(crate::constants::DEFAULT_LOOK_BACK_HOURS)
+            .to_string();
+        Ok(tool_result(
+            self.endpoint
+                .endpoint_get(
+                    &format!(
+                        "/api/files/{}/stats",
+                        validation::encode_path_segment(file_sha1)
+                    ),
+                    &[("lookBackHours", lh.as_str())],
+                )
+                .await,
+        ))
     }
 
     /// List machines where a specific file (by SHA1) has been observed.
@@ -3743,7 +3713,7 @@ impl DefenderServer {
         Parameters(params): Parameters<EndpointODataInput>,
     ) -> Result<CallToolResult, McpError> {
         validation::validate_endpoint_odata_params(Some(params.top), Some(params.skip))?;
-        let odata = Self::ep_odata(params.filter, params.top, params.skip);
+        let odata = Self::ep_odata(params.filter.as_deref(), params.top, params.skip);
         self.ep_odata_get("/api/alerts", &odata).await
     }
 
@@ -3800,7 +3770,7 @@ impl DefenderServer {
         Parameters(params): Parameters<EndpointODataInput>,
     ) -> Result<CallToolResult, McpError> {
         validation::validate_endpoint_odata_params(Some(params.top), Some(params.skip))?;
-        let odata = Self::ep_odata(params.filter, params.top, params.skip);
+        let odata = Self::ep_odata(params.filter.as_deref(), params.top, params.skip);
         self.ep_odata_get("/api/machineactions", &odata).await
     }
 
@@ -3939,29 +3909,18 @@ impl DefenderServer {
         Parameters(params): Parameters<XdrIncidentIdInput>,
     ) -> Result<CallToolResult, McpError> {
         let incident_id = validation::validate_required_id(&params.incident_id, "incident_id")?;
-        let q: Vec<(&str, String)> = if let Some(ref expand) = params.expand {
-            if !expand.is_empty() {
-                vec![("$expand", expand.clone())]
-            } else {
-                vec![]
-            }
-        } else {
-            vec![]
+        let odata = ODataParams {
+            expand: params.expand.as_deref(),
+            ..ODataParams::default()
         };
-        match self
-            .client
-            .graph_get(
-                &format!(
-                    "/security/incidents/{}",
-                    validation::encode_path_segment(incident_id)
-                ),
-                &q,
-            )
-            .await
-        {
-            Ok(v) => Ok(CallToolResult::structured(v)),
-            Err(e) => Ok(e),
-        }
+        self.odata_get(
+            &format!(
+                "/security/incidents/{}",
+                validation::encode_path_segment(incident_id)
+            ),
+            &odata,
+        )
+        .await
     }
 
     // ============================================================
@@ -4004,39 +3963,36 @@ impl DefenderServer {
         let file_name = validation::validate_file_name(&params.file_name)?;
         let description = validation::validate_description(&params.description)?;
 
-        let content_bytes = params.file_content.as_bytes();
-        if content_bytes.is_empty() {
+        let content = params.file_content.into_bytes();
+        if content.is_empty() {
             return Ok(crate::error::tool_error("file_content cannot be empty"));
         }
-        if content_bytes.len() > crate::constants::MAX_LIBRARY_FILE_SIZE {
+        if content.len() > crate::constants::MAX_LIBRARY_FILE_SIZE {
             return Ok(crate::error::tool_error(format!(
                 "File size {} bytes exceeds maximum of {} bytes (20 MB)",
-                content_bytes.len(),
+                content.len(),
                 crate::constants::MAX_LIBRARY_FILE_SIZE
             )));
         }
 
         tracing::info!(
             file_name = %file_name,
-            size = content_bytes.len(),
+            size = content.len(),
             "Library file upload initiated"
         );
 
-        match self
-            .endpoint
-            .endpoint_multipart_upload(
-                crate::constants::LIBRARY_FILES_PATH,
-                file_name,
-                content_bytes,
-                description,
-                params.parameters_description.as_deref(),
-                params.override_if_exists,
-            )
-            .await
-        {
-            Ok(v) => Ok(CallToolResult::structured(v)),
-            Err(e) => Ok(e),
-        }
+        Ok(tool_result(
+            self.endpoint
+                .endpoint_multipart_upload(
+                    crate::constants::LIBRARY_FILES_PATH,
+                    file_name,
+                    content,
+                    description,
+                    params.parameters_description.as_deref(),
+                    params.override_if_exists,
+                )
+                .await,
+        ))
     }
 
     /// Run a sequence of live response commands on a specific machine.
@@ -4093,20 +4049,17 @@ impl DefenderServer {
             "Comment": comment,
         });
 
-        match self
-            .endpoint
-            .endpoint_post(
-                &format!(
-                    "/api/machines/{}/runliveresponse",
-                    validation::encode_path_segment(machine_id)
-                ),
-                &body,
-            )
-            .await
-        {
-            Ok(v) => Ok(CallToolResult::structured(v)),
-            Err(e) => Ok(e),
-        }
+        Ok(tool_result(
+            self.endpoint
+                .endpoint_post(
+                    &format!(
+                        "/api/machines/{}/runliveresponse",
+                        validation::encode_path_segment(machine_id)
+                    ),
+                    &body,
+                )
+                .await,
+        ))
     }
 
     /// Retrieve the downloadable result link for a specific live response command.
@@ -4250,10 +4203,7 @@ impl DefenderServer {
     }
 
     async fn ep_post(&self, path: &str, body: &serde_json::Value) -> CallToolResult {
-        match self.endpoint.endpoint_post(path, body).await {
-            Ok(v) => CallToolResult::structured(v),
-            Err(e) => e,
-        }
+        tool_result(self.endpoint.endpoint_post(path, body).await)
     }
 }
 

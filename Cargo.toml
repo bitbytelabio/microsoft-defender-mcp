@@ -1,6 +1,6 @@
 [package]
 name = "microsoft-defender-mcp-server"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Rust MCP server for Microsoft Defender XDR and Defender for Endpoint APIs"
 license = "MIT"

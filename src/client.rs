@@ -1,16 +1,28 @@
 //! API clients with authentication for both Microsoft Graph and Defender for Endpoint.
 
+use std::borrow::Cow;
+use std::path::Path;
+
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use rmcp::model::CallToolResult;
+use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 use crate::auth::TokenManager;
 use crate::constants::{
     ENDPOINT_BASE_URL, ENDPOINT_SCOPE, ENV_ENDPOINT_BASE_URL, ENV_GRAPH_BASE_URL, GRAPH_BASE_URL,
     GRAPH_SCOPE,
 };
-use crate::error::{http_error, network_error};
-use sha2::{Digest, Sha256};
-use std::path::Path;
-use tokio::io::AsyncWriteExt;
+use crate::error::{http_error, network_error, staging_filesystem_error, tool_error};
+
+/// Empty query string for requests without parameters.
+const NO_QUERY: &[(&str, &str)] = &[];
+
+/// Write-buffer size for artifact downloads; batches small network chunks into fewer
+/// blocking-pool file writes.
+const ARTIFACT_WRITE_BUFFER: usize = 256 * 1024;
 
 /// Downloaded investigation or quarantine artifact details.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -27,131 +39,133 @@ pub struct DownloadedArtifact {
 
 /// Ensure the staging directory exists. On Unix every directory created here gets mode
 /// `0700`, and the leaf directory is re-restricted to `0700` if it already existed.
-pub fn ensure_staging_directory(dir: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
+async fn ensure_staging_directory(dir: &Path) -> std::io::Result<()> {
+    let mut builder = tokio::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
         builder.mode(0o700);
-        builder.create(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        builder.create(dir).await?;
+        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
     }
     #[cfg(not(unix))]
-    builder.create(dir)?;
+    builder.create(dir).await?;
     Ok(())
 }
 
-/// OData query parameters for list endpoints.
-#[derive(Debug, Default, Clone)]
-pub struct ODataParams {
+/// OData query parameters for list endpoints, borrowing string values from the tool input.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ODataParams<'a> {
     pub top: Option<i32>,
     pub skip: Option<i32>,
-    pub filter: Option<String>,
-    pub select: Option<String>,
-    pub expand: Option<String>,
-    pub search: Option<String>,
+    pub filter: Option<&'a str>,
+    pub select: Option<&'a str>,
+    pub expand: Option<&'a str>,
+    pub search: Option<&'a str>,
     pub count: Option<bool>,
 }
 
-impl ODataParams {
-    pub fn to_query_vec(&self) -> Vec<(&'static str, String)> {
-        let mut params = Vec::new();
+impl<'a> ODataParams<'a> {
+    /// Query pairs in `$top, $skip, $filter, $select, $expand, $search, $count` order; empty
+    /// strings are omitted.
+    pub fn to_query_vec(&self) -> Vec<(&'static str, Cow<'a, str>)> {
+        let mut params = Vec::with_capacity(7);
         if let Some(top) = self.top {
-            params.push(("$top", top.to_string()));
+            params.push(("$top", Cow::Owned(top.to_string())));
         }
         if let Some(skip) = self.skip {
-            params.push(("$skip", skip.to_string()));
+            params.push(("$skip", Cow::Owned(skip.to_string())));
         }
-        if let Some(ref filter) = self.filter
-            && !filter.is_empty()
-        {
-            params.push(("$filter", filter.clone()));
-        }
-        if let Some(ref select) = self.select
-            && !select.is_empty()
-        {
-            params.push(("$select", select.clone()));
-        }
-        if let Some(ref expand) = self.expand
-            && !expand.is_empty()
-        {
-            params.push(("$expand", expand.clone()));
-        }
-        if let Some(ref search) = self.search
-            && !search.is_empty()
-        {
-            params.push(("$search", search.clone()));
+        for (key, value) in [
+            ("$filter", self.filter),
+            ("$select", self.select),
+            ("$expand", self.expand),
+            ("$search", self.search),
+        ] {
+            if let Some(value) = value.filter(|v| !v.is_empty()) {
+                params.push((key, Cow::Borrowed(value)));
+            }
         }
         if self.count == Some(true) {
-            params.push(("$count", "true".to_string()));
+            params.push(("$count", Cow::Borrowed("true")));
         }
         params
     }
 }
 
 // ---------------------------------------------------------------------------
-// Internal: generic HTTP helper
+// Internal: authenticated JSON client shared by GraphClient and EndpointClient
 // ---------------------------------------------------------------------------
 
-/// Perform an authenticated HTTP request and return deserialized JSON.
-/// Used by both GraphClient and EndpointClient.
-#[allow(clippy::too_many_arguments)]
-async fn api_request(
-    http: &reqwest::Client,
-    token_manager: &TokenManager,
-    scope: &str,
-    base_url: &str,
-    method: reqwest::Method,
-    path: &str,
-    query: &[(&str, String)],
-    body: Option<&Value>,
-) -> Result<Value, rmcp::model::CallToolResult> {
-    let url = format!("{base_url}{path}");
-    let token = token_manager
-        .get_token(scope)
-        .await
-        .map_err(|e| crate::error::tool_error(format!("Auth error: {e}")))?;
+/// Authenticated JSON client bound to one upstream base URL and OAuth scope.
+#[derive(Clone)]
+struct ApiClient {
+    http: reqwest::Client,
+    token_manager: TokenManager,
+    base_url: String,
+    scope: &'static str,
+}
 
-    let query_pairs: Vec<(&str, &str)> = query.iter().map(|(k, v)| (*k, v.as_str())).collect();
-
-    let req = match method {
-        reqwest::Method::GET => http.get(&url).query(&query_pairs),
-        reqwest::Method::POST => http
-            .post(&url)
-            .query(&query_pairs)
-            .header("Content-Type", "application/json; charset=utf-8"),
-        _ => {
-            return Err(crate::error::tool_error(format!(
-                "Unsupported HTTP method: {method}"
-            )));
+impl ApiClient {
+    fn new(token_manager: TokenManager, base_url: String, scope: &'static str) -> Self {
+        Self {
+            http: token_manager.http_client.clone(),
+            token_manager,
+            base_url,
+            scope,
         }
-    };
-
-    let req = req.bearer_auth(&token).header("Accept", "application/json");
-
-    let resp = if let Some(b) = body {
-        req.json(b).send().await
-    } else {
-        req.send().await
     }
-    .map_err(|e| network_error(&e, path))?;
 
+    async fn token(&self) -> Result<String, CallToolResult> {
+        self.token_manager
+            .get_token(self.scope)
+            .await
+            .map_err(|e| tool_error(format!("Auth error: {e}")))
+    }
+
+    /// Authenticated GET (no body) or JSON POST (with body); returns the decoded JSON response.
+    async fn request<Q: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        query: &Q,
+        body: Option<&Value>,
+    ) -> Result<Value, CallToolResult> {
+        let token = self.token().await?;
+        let url = format!("{}{path}", self.base_url);
+        let req = match body {
+            Some(body) => self
+                .http
+                .post(url)
+                .header(CONTENT_TYPE, "application/json; charset=utf-8")
+                .json(body),
+            None => self.http.get(url),
+        };
+        let resp = req
+            .query(query)
+            .bearer_auth(&token)
+            .header(ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|e| network_error(&e, path))?;
+        // 201 Created is acceptable for POST (Live Response).
+        read_json(resp, path, body.is_some()).await
+    }
+}
+
+/// Reject non-success statuses with `http_error`, otherwise decode the JSON body.
+async fn read_json(
+    resp: reqwest::Response,
+    path: &str,
+    accept_created: bool,
+) -> Result<Value, CallToolResult> {
     let status = resp.status().as_u16();
-
-    // 201 Created is acceptable for POST (Live Response)
-    let ok = status == 200 || (method == reqwest::Method::POST && status == 201);
-
-    if !ok {
+    if status != 200 && !(accept_created && status == 201) {
         return Err(http_error(status, path));
     }
-
-    let response_body: Value = resp
-        .json()
+    resp.json()
         .await
-        .map_err(|e| crate::error::tool_error(format!("Invalid JSON response: {e}")))?;
-
-    Ok(response_body)
+        .map_err(|e| tool_error(format!("Invalid JSON response: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -159,66 +173,38 @@ async fn api_request(
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct GraphClient {
-    http: reqwest::Client,
-    token_manager: TokenManager,
-    base_url: String,
-}
+pub struct GraphClient(ApiClient);
 
 impl GraphClient {
     pub fn new(token_manager: TokenManager) -> Self {
         let base_url =
             std::env::var(ENV_GRAPH_BASE_URL).unwrap_or_else(|_| GRAPH_BASE_URL.to_string());
-        Self {
-            http: token_manager.http_client.clone(),
-            token_manager,
-            base_url,
-        }
+        Self(ApiClient::new(token_manager, base_url, GRAPH_SCOPE))
+    }
+
+    /// Constructor with an explicit base URL (loopback fixture endpoints in tests).
+    pub fn for_test(token_manager: TokenManager, base_url: String) -> Self {
+        Self(ApiClient::new(token_manager, base_url, GRAPH_SCOPE))
     }
 
     pub async fn graph_get(
         &self,
         path: &str,
-        query: &[(&str, String)],
-    ) -> Result<Value, rmcp::model::CallToolResult> {
-        api_request(
-            &self.http,
-            &self.token_manager,
-            GRAPH_SCOPE,
-            &self.base_url,
-            reqwest::Method::GET,
-            path,
-            query,
-            None,
-        )
-        .await
+        query: &[(&str, &str)],
+    ) -> Result<Value, CallToolResult> {
+        self.0.request(path, query, None).await
     }
 
-    pub async fn graph_post(
-        &self,
-        path: &str,
-        body: &Value,
-    ) -> Result<Value, rmcp::model::CallToolResult> {
-        api_request(
-            &self.http,
-            &self.token_manager,
-            GRAPH_SCOPE,
-            &self.base_url,
-            reqwest::Method::POST,
-            path,
-            &[],
-            Some(body),
-        )
-        .await
+    pub async fn graph_post(&self, path: &str, body: &Value) -> Result<Value, CallToolResult> {
+        self.0.request(path, NO_QUERY, Some(body)).await
     }
 
     pub async fn graph_get_with_odata(
         &self,
         path: &str,
-        odata: &ODataParams,
-    ) -> Result<Value, rmcp::model::CallToolResult> {
-        let query = odata.to_query_vec();
-        self.graph_get(path, &query).await
+        odata: &ODataParams<'_>,
+    ) -> Result<Value, CallToolResult> {
+        self.0.request(path, &odata.to_query_vec(), None).await
     }
 }
 
@@ -227,66 +213,38 @@ impl GraphClient {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct EndpointClient {
-    http: reqwest::Client,
-    token_manager: TokenManager,
-    base_url: String,
-}
+pub struct EndpointClient(ApiClient);
 
 impl EndpointClient {
     pub fn new(token_manager: TokenManager) -> Self {
         let base_url =
             std::env::var(ENV_ENDPOINT_BASE_URL).unwrap_or_else(|_| ENDPOINT_BASE_URL.to_string());
-        Self {
-            http: token_manager.http_client.clone(),
-            token_manager,
-            base_url,
-        }
+        Self(ApiClient::new(token_manager, base_url, ENDPOINT_SCOPE))
+    }
+
+    /// Constructor with an explicit base URL (loopback fixture endpoints in tests).
+    pub fn for_test(token_manager: TokenManager, base_url: String) -> Self {
+        Self(ApiClient::new(token_manager, base_url, ENDPOINT_SCOPE))
     }
 
     pub async fn endpoint_get(
         &self,
         path: &str,
-        query: &[(&str, String)],
-    ) -> Result<Value, rmcp::model::CallToolResult> {
-        api_request(
-            &self.http,
-            &self.token_manager,
-            ENDPOINT_SCOPE,
-            &self.base_url,
-            reqwest::Method::GET,
-            path,
-            query,
-            None,
-        )
-        .await
+        query: &[(&str, &str)],
+    ) -> Result<Value, CallToolResult> {
+        self.0.request(path, query, None).await
     }
 
-    pub async fn endpoint_post(
-        &self,
-        path: &str,
-        body: &Value,
-    ) -> Result<Value, rmcp::model::CallToolResult> {
-        api_request(
-            &self.http,
-            &self.token_manager,
-            ENDPOINT_SCOPE,
-            &self.base_url,
-            reqwest::Method::POST,
-            path,
-            &[],
-            Some(body),
-        )
-        .await
+    pub async fn endpoint_post(&self, path: &str, body: &Value) -> Result<Value, CallToolResult> {
+        self.0.request(path, NO_QUERY, Some(body)).await
     }
 
     pub async fn endpoint_get_with_odata(
         &self,
         path: &str,
-        odata: &ODataParams,
-    ) -> Result<Value, rmcp::model::CallToolResult> {
-        let query = odata.to_query_vec();
-        self.endpoint_get(path, &query).await
+        odata: &ODataParams<'_>,
+    ) -> Result<Value, CallToolResult> {
+        self.0.request(path, &odata.to_query_vec(), None).await
     }
 
     /// Upload a file to the live response library via multipart/form-data.
@@ -294,56 +252,39 @@ impl EndpointClient {
         &self,
         path: &str,
         file_name: &str,
-        file_content: &[u8],
+        file_content: Vec<u8>,
         description: &str,
         parameters_description: Option<&str>,
         override_if_exists: Option<bool>,
-    ) -> Result<Value, rmcp::model::CallToolResult> {
-        let url = format!("{}{}", self.base_url, path);
-        let token = self
-            .token_manager
-            .get_token(crate::constants::ENDPOINT_SCOPE)
-            .await
-            .map_err(|e| crate::error::tool_error(format!("Auth error: {e}")))?;
+    ) -> Result<Value, CallToolResult> {
+        let token = self.0.token().await?;
 
-        let content = Vec::from(file_content);
-        let file_part = reqwest::multipart::Part::bytes(content)
-            .file_name(file_name.to_string())
+        let file_part = reqwest::multipart::Part::bytes(file_content)
+            .file_name(file_name.to_owned())
             .mime_str("application/octet-stream")
-            .map_err(|e| crate::error::tool_error(format!("Invalid MIME type: {e}")))?;
+            .map_err(|e| tool_error(format!("Invalid MIME type: {e}")))?;
 
         let mut form = reqwest::multipart::Form::new()
             .part("file", file_part)
-            .text("Description", description.to_string());
-
+            .text("Description", description.to_owned());
         if let Some(pd) = parameters_description {
-            form = form.text("ParametersDescription", pd.to_string());
+            form = form.text("ParametersDescription", pd.to_owned());
         }
         if let Some(ov) = override_if_exists {
             form = form.text("OverrideIfExists", ov.to_string());
         }
 
         let resp = self
+            .0
             .http
-            .post(&url)
+            .post(format!("{}{path}", self.0.base_url))
             .bearer_auth(&token)
-            .header("Accept", "application/json")
+            .header(ACCEPT, "application/json")
             .multipart(form)
             .send()
             .await
-            .map_err(|e| crate::error::network_error(&e, path))?;
-
-        let status = resp.status().as_u16();
-        if status != 200 {
-            return Err(crate::error::http_error(status, path));
-        }
-
-        let response_body: Value = resp
-            .json()
-            .await
-            .map_err(|e| crate::error::tool_error(format!("Invalid JSON response: {e}")))?;
-
-        Ok(response_body)
+            .map_err(|e| network_error(&e, path))?;
+        read_json(resp, path, false).await
     }
 
     /// Stream a pre-authenticated (SAS) artifact URL into `dest_dir/dest_filename`.
@@ -358,15 +299,16 @@ impl EndpointClient {
         dest_filename: &str,
         source_action_id: Option<String>,
         source_sha1: Option<String>,
-    ) -> Result<DownloadedArtifact, rmcp::model::CallToolResult> {
-        ensure_staging_directory(dest_dir).map_err(|e| {
-            crate::error::staging_filesystem_error(format!(
+    ) -> Result<DownloadedArtifact, CallToolResult> {
+        ensure_staging_directory(dest_dir).await.map_err(|e| {
+            staging_filesystem_error(format!(
                 "failed to create staging directory {}: {e}",
                 dest_dir.display()
             ))
         })?;
 
         let resp = self
+            .0
             .http
             .get(download_url)
             .send()
@@ -383,7 +325,7 @@ impl EndpointClient {
         #[cfg(unix)]
         options.mode(0o600);
         let file = options.open(&file_path).await.map_err(|e| {
-            crate::error::staging_filesystem_error(format!(
+            staging_filesystem_error(format!(
                 "failed to create artifact file {}: {e}",
                 file_path.display()
             ))
@@ -397,7 +339,10 @@ impl EndpointClient {
             }
         };
 
-        let file_path = std::fs::canonicalize(&file_path).unwrap_or(file_path);
+        let file_path = match tokio::fs::canonicalize(&file_path).await {
+            Ok(canonical) => canonical,
+            Err(_) => file_path,
+        };
         Ok(DownloadedArtifact {
             status: "Downloaded".to_string(),
             file_path: file_path.to_string_lossy().into_owned(),
@@ -412,8 +357,9 @@ impl EndpointClient {
 /// Copy a response body into `file`, returning the byte count and lowercase hex SHA-256.
 async fn stream_to_file(
     mut resp: reqwest::Response,
-    mut file: tokio::fs::File,
-) -> Result<(u64, String), rmcp::model::CallToolResult> {
+    file: tokio::fs::File,
+) -> Result<(u64, String), CallToolResult> {
+    let mut file = tokio::io::BufWriter::with_capacity(ARTIFACT_WRITE_BUFFER, file);
     let mut hasher = Sha256::new();
     let mut total: u64 = 0;
     while let Some(chunk) = resp
@@ -422,36 +368,15 @@ async fn stream_to_file(
         .map_err(|e| network_error(&e, "artifact download streaming"))?
     {
         hasher.update(&chunk);
-        file.write_all(&chunk).await.map_err(|e| {
-            crate::error::staging_filesystem_error(format!("failed to write artifact file: {e}"))
-        })?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| staging_filesystem_error(format!("failed to write artifact file: {e}")))?;
         total += chunk.len() as u64;
     }
-    file.flush().await.map_err(|e| {
-        crate::error::staging_filesystem_error(format!("failed to flush artifact file: {e}"))
-    })?;
+    file.flush()
+        .await
+        .map_err(|e| staging_filesystem_error(format!("failed to flush artifact file: {e}")))?;
     Ok((total, format!("{:x}", hasher.finalize())))
-}
-
-impl GraphClient {
-    /// Test constructor supporting loopback fixture endpoints.
-    pub fn for_test(token_manager: TokenManager, base_url: String) -> Self {
-        Self {
-            http: token_manager.http_client.clone(),
-            token_manager,
-            base_url,
-        }
-    }
-}
-impl EndpointClient {
-    /// Test constructor supporting loopback fixture endpoints.
-    pub fn for_test(token_manager: TokenManager, base_url: String) -> Self {
-        Self {
-            http: token_manager.http_client.clone(),
-            token_manager,
-            base_url,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -667,7 +592,7 @@ mod tests {
             .endpoint_multipart_upload(
                 "/upload-err",
                 "script.ps1",
-                b"write-host test",
+                b"write-host test".to_vec(),
                 "sample description",
                 None,
                 None,
@@ -695,7 +620,7 @@ mod tests {
             .endpoint_multipart_upload(
                 "/upload-ok",
                 "script.ps1",
-                b"write-host test",
+                b"write-host test".to_vec(),
                 "sample description",
                 None,
                 None,
