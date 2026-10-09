@@ -615,7 +615,13 @@ async fn stream_to_file(
     file.flush()
         .await
         .map_err(|e| staging_filesystem_error(format!("failed to flush artifact file: {e}")))?;
-    Ok((total, format!("{:x}", hasher.finalize())))
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{:02x}", b);
+    }
+    Ok((total, hex))
 }
 
 #[cfg(test)]

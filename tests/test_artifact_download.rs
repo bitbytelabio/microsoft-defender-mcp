@@ -75,7 +75,13 @@ fn forensics(action: &str) -> ForensicsInput {
 }
 
 fn expected_sha256() -> String {
-    format!("{:x}", Sha256::digest(PAYLOAD))
+    let digest = Sha256::digest(PAYLOAD);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{:02x}", b);
+    }
+    hex
 }
 
 #[tokio::test]
