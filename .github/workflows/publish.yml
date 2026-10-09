@@ -1,6 +1,8 @@
 name: Publish crate
 
 on:
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions: {}
@@ -27,20 +29,32 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install --profile minimal
 
-      - name: Validate release branch and package version
+      - name: Validate release and package version
         shell: bash
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GIT_REF: ${{ github.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          if [[ "${GIT_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]]; then
-            echo "Publication is restricted to the default branch" >&2
-            exit 1
-          fi
           package_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          echo "Publishing microsoft-defender-mcp-server ${package_version}"
+          echo "Package version: ${package_version}"
 
+          if [[ "${EVENT_NAME}" == "release" ]]; then
+            expected_tag="v${package_version}"
+            if [[ "${RELEASE_TAG}" != "${expected_tag}" && "${RELEASE_TAG}" != "${package_version}" ]]; then
+              echo "Release tag '${RELEASE_TAG}' does not match package version '${package_version}'" >&2
+              exit 1
+            fi
+          elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ "${GIT_REF}" != "refs/heads/${DEFAULT_BRANCH}" && "${GIT_REF}" != refs/tags/v* ]]; then
+              echo "Manual publication is restricted to default branch (${DEFAULT_BRANCH}) or release tags" >&2
+              exit 1
+            fi
+          fi
+
+          echo "Publishing microsoft-defender-mcp-server ${package_version}"
       - name: Verify package
         run: cargo package --locked
 
