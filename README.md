@@ -206,6 +206,7 @@ Credentials come from environment variables. Every server option is a CLI flag w
 |---|---|:---:|---|
 | `--transport <stdio\|http>` | `TRANSPORT` | `stdio` | MCP transport. |
 | `--bind-address <ADDR>` | `BIND_ADDRESS` | `127.0.0.1:8000` | Socket address for HTTP transport. A non-loopback address prints a security warning to `stderr`. |
+| `--allowed-hosts <HOSTS>` | `DEFENDER_ALLOWED_HOSTS` | loopback names | Comma-separated `Host` header values the HTTP transport accepts (DNS-rebinding protection), e.g. `mcp-defender,mcp-defender:8000` behind a Kubernetes Service. `*` turns the check off; use it only behind an authenticated proxy. |
 | `--read-only` | `DEFENDER_READ_ONLY` | `false` | Hide all mutating tools from discovery and reject mutating calls locally. In user mode, requests only read scopes. Overrides all enablement flags. |
 | `--enable-live-response` | `DEFENDER_ENABLE_LIVE_RESPONSE` | `false` | Enable `defender_response` (Live Response, library file upload/delete, investigation packages, quarantine). |
 | `--allowed-commands <LIST>` | `DEFENDER_LIVE_RESPONSE_ALLOWED_COMMANDS` | *(all)* | Comma-separated Live Response command allowlist: `PutFile`, `RunScript`, `GetFile`. |

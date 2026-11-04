@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `--allowed-hosts` (`DEFENDER_ALLOWED_HOSTS`): `Host` header values the HTTP transport accepts. The default stays loopback only. Needed to serve behind a Kubernetes Service or a gateway that calls the server by its service name.
+
+### Fixed
+
+- The HTTP transport also shuts down on SIGTERM, not only on Ctrl+C, so container orchestrators stop it promptly.
+
 ## [1.0.0] - 2026-10-08
 
 ### Breaking Changes

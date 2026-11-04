@@ -782,6 +782,7 @@ mod tests {
         let cli = crate::cli::Cli {
             transport: crate::cli::TransportMode::Stdio,
             bind_address: "127.0.0.1:8000".to_string(),
+            allowed_hosts: Vec::new(),
             read_only: true,
             enable_live_response: true,
             allowed_commands: None,
@@ -833,6 +834,7 @@ mod tests {
         let cli = crate::cli::Cli {
             transport: crate::cli::TransportMode::Stdio,
             bind_address: "127.0.0.1:8000".to_string(),
+            allowed_hosts: Vec::new(),
             read_only: false,
             enable_live_response: true,
             allowed_commands: None,
