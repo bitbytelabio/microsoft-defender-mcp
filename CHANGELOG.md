@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Investigation skills as MCP prompts: `kql_hunting_skill`, `ioc_sweep_skill`, `incident_investigation_skill`, `compromised_user_skill` and `persistence_hunt_skill`. They return read-only playbooks with KQL for the existing tools; `ioc_sweep_skill` refangs and classifies indicators into a ready-to-run sweep query. The server now advertises the `prompts` capability.
 - `--allowed-hosts` (`DEFENDER_ALLOWED_HOSTS`): `Host` header values the HTTP transport accepts. The default stays loopback only. Needed to serve behind a Kubernetes Service or a gateway that calls the server by its service name.
 
 ### Fixed

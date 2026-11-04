@@ -1,8 +1,8 @@
 //! Defender MCP server: tool router, tool implementations, and server handler.
 
 use rmcp::{
-    ErrorData as McpError, ServerHandler, handler::server::wrapper::Parameters, model::*, tool,
-    tool_handler, tool_router,
+    ErrorData as McpError, ServerHandler, handler::server::wrapper::Parameters, model::*,
+    prompt_handler, tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -6526,8 +6526,12 @@ impl DefenderServer {
                     signed-in user's own Defender rights apply and permission errors name the missing scope or role. \
                     Tool results preserve upstream JSON; OData collections are objects with a value array and optional \
                     metadata, not flattened arrays. Pagination is not followed automatically. HTTP transport has no \
-                    bundled client authentication: use an authenticated, trusted boundary for remote access."
+                    bundled client authentication: use an authenticated, trusted boundary for remote access. \
+                    Investigation skills are MCP prompts: kql_hunting_skill, ioc_sweep_skill, \
+                    incident_investigation_skill, compromised_user_skill and persistence_hunt_skill return \
+                    read-only playbooks (KQL included) to follow with these tools."
 )]
+#[prompt_handler(router = Self::skill_prompt_router())]
 impl ServerHandler for DefenderServer {
     async fn call_tool(
         &self,

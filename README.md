@@ -52,6 +52,20 @@ flowchart TD
 
 Under `--read-only`, tools 7–10 are hidden from `tools/list` and rejected locally.
 
+### Investigation Skills (MCP Prompts)
+
+The server also publishes five investigation playbooks as MCP prompts (`prompts/list`, `prompts/get`). Each returns read-only guidance, with KQL, for the tools above. Prompts never call Defender themselves, and they are available in every mode, including `--read-only`. Clients usually surface them as slash commands, for example `/ms_defender:ioc_sweep_skill`.
+
+| Prompt | Arguments | What it returns |
+|---|---|---|
+| `kql_hunting_skill` | `goal` (optional) | Advanced hunting workflow, table cheat sheet, performance and correctness rules, examples, and pivots to the other tools |
+| `ioc_sweep_skill` | `indicators` (required), `lookback` | Indicators refanged and classified (SHA256/SHA1/MD5, IP, domain, URL) into a ready-to-run `union` sweep, then a drill-down and correlation plan |
+| `incident_investigation_skill` | `incident_id` (required) | Evidence, device timelines, entry point, scope and report for one XDR incident |
+| `compromised_user_skill` | `account` (required), `lookback` | Alerts, sign-ins, phishing, cloud-app activity (inbox rules, consents, MFA changes) and endpoint logons for one account |
+| `persistence_hunt_skill` | `device`, `lookback` | Run keys, scheduled tasks, services, WMI subscriptions, startup folders and LOLBin abuse, ranked by prevalence |
+
+`lookback` takes values such as `24h` or `7d` (default `7d`, at most `30d`). Arguments are validated before they are placed in KQL; a value that does not fit returns `invalid_params`.
+
 > **Authoritative Schemas:**
 > Every tool publishes its complete JSON schema, parameter constraints, and security annotations via the standard MCP `tools/list` protocol endpoint.
 ---

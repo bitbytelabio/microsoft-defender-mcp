@@ -7,5 +7,6 @@ pub mod client;
 pub mod confirm;
 pub mod constants;
 pub mod error;
+pub mod prompts;
 pub mod server;
 pub mod validation;
