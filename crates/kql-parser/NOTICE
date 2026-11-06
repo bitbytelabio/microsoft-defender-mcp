@@ -1,5 +1,5 @@
 kql-parser
-Copyright OPSWAT, Inc.
+Copyright (c) 2026 BIT / BYTE / LAB
 
 src/kql.pest is a pest grammar derived from the Kusto Query Language parser in
 Kusto.Language (https://github.com/microsoft/Kusto-Query-Language, commit
