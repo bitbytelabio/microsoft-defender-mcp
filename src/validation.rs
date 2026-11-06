@@ -356,25 +356,16 @@ pub fn validate_look_back_hours(hours: Option<i32>) -> Result<(), rmcp::ErrorDat
 // KQL (Advanced Hunting)
 // ---------------------------------------------------------------------------
 
-/// Validate a KQL Advanced Hunting query.
+/// Validate the size of a KQL Advanced Hunting query: non-empty, at most 128KB.
 ///
-/// Enforces basic client-side boundaries: non-empty query, maximum size limit of 128KB,
-/// and rejection of obvious leading-dot management commands (e.g., `.drop`, `.create`).
-///
-/// Note: Full KQL syntax and semantic validation is the responsibility of Microsoft Graph;
-/// this local check is not a security boundary.
+/// Syntax, management commands (`.drop`, `.create`) and the rest of the policy are checked on the
+/// parse tree by [`crate::hunting::validate`], which reports them as structured problems.
 pub fn validate_kql_query(query: &str) -> Result<(), rmcp::ErrorData> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
+    if query.trim().is_empty() {
         return Err(invalid_params("KQL query cannot be empty"));
     }
     if query.len() > 128_000 {
         return Err(invalid_params("KQL query exceeds maximum length of 128KB"));
-    }
-    if trimmed.starts_with('.') {
-        return Err(invalid_params(
-            "KQL management commands starting with '.' are not allowed. Only read-only KQL queries are supported.",
-        ));
     }
     Ok(())
 }
@@ -1067,13 +1058,6 @@ mod tests {
             validate_kql_query(r#"DeviceNetworkEvents | where RemoteUrl contains "delete from""#)
                 .is_ok()
         );
-    }
-
-    #[test]
-    fn test_kql_leading_dot_management_rejected() {
-        assert!(validate_kql_query(".drop table foo").is_err());
-        assert!(validate_kql_query("  .alter cluster foo  ").is_err());
-        assert!(validate_kql_query(".create table bar (x: string)").is_err());
     }
 
     #[test]

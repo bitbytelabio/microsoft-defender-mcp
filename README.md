@@ -39,7 +39,7 @@ flowchart TD
 
 | # | Tool | Kind | Listed when | Annotations (`readOnly` / `destructive`) | Key Actions |
 |---|------|------|-------------|------------------------------------------|-------------|
-| 1 | `defender_hunting` | Read-only | Always | `true` / `false` | `run` (KQL queries) |
+| 1 | `defender_hunting` | Read-only | Always | `true` / `false` | `validate`, `run` (KQL queries, checked by `kql-parser`), `schema`, `tables` |
 | 2 | `defender_ti` | Read-only | Always | `true` / `false` | 39 TI lookups (profiles, articles, hosts, SSL, WHOIS, CVEs), plus `custom_indicator_list` |
 | 3 | `defender_incidents_alerts` | Read-only | Always | `true` / `false` | `xdr_alert_*`, `xdr_incident_*`, `endpoint_alert_*`, `*_related_alerts` |
 | 4 | `defender_machines` | Read-only | Always | `true` / `false` | `machine_*`, `find_by_tag`, `find_by_ip`, `machine_alerts`, `machine_vulnerabilities`, `machine_missing_kbs`, statistics |
@@ -65,6 +65,10 @@ The server also publishes five investigation playbooks as MCP prompts (`prompts/
 | `persistence_hunt_skill` | `device`, `lookback` | Run keys, scheduled tasks, services, WMI subscriptions, startup folders and LOLBin abuse, ranked by prevalence |
 
 `lookback` takes values such as `24h` or `7d` (default `7d`, at most `30d`). Arguments are validated before they are placed in KQL; a value that does not fit returns `invalid_params`.
+
+### KQL Hunting Skill (MCP Resource)
+
+For agents, the full hunting skill is an MCP resource: `skill://ms-defender/kql-hunting` (`resources/list`, `resources/read`, markdown). It covers the `defender_hunting` actions, the query policy, `maxRows` and truncation, `timespan` against time filters, entity columns, hunting shapes (stacking, first seen, process-to-network joins, host timelines) and common Defender pitfalls. The server instructions stay short and point agents to it before their first query; agent runtimes that resolve `skill://` URIs from MCP resources load it by name.
 
 > **Authoritative Schemas:**
 > Every tool publishes its complete JSON schema, parameter constraints, and security annotations via the standard MCP `tools/list` protocol endpoint.
@@ -401,7 +405,7 @@ The parent directory is created with permissions `0700` and the audit file is op
 
 The following objects are the `params` portion of MCP `tools/call` requests. Tool responses use structured JSON.
 
-### 1. Advanced Hunting (`defender_hunting`, action `run`)
+### 1. Advanced Hunting (`defender_hunting`, actions `validate`, `run`, `schema`, `tables`)
 
 Executes read-only KQL queries across Microsoft Defender XDR unified event tables (`DeviceProcessEvents`, `DeviceNetworkEvents`, `EmailEvents`, `IdentityLogonEvents`, etc.).
 
@@ -410,14 +414,30 @@ Executes read-only KQL queries across Microsoft Defender XDR unified event table
   "name": "defender_hunting",
   "arguments": {
     "action": "run",
-    "query": "DeviceProcessEvents | where Timestamp > ago(7d) | where FileName =~ 'powershell.exe' | project Timestamp, DeviceName, AccountName, ProcessCommandLine | take 50",
-    "timespan": "P7D"
+    "query": "DeviceProcessEvents | where Timestamp > ago(7d) | where FileName =~ 'powershell.exe' | project Timestamp, DeviceName, AccountName, ProcessCommandLine",
+    "timespan": "P7D",
+    "maxRows": 200
   }
 }
 ```
 
-- **Timespan:** Defaults to `P30D` (30 days). Accepts ISO 8601 duration/interval representations (e.g., `P7D`, `P90D`, or explicit start/end ISO intervals). Queryable history depends on tenant event retention policies.
-- **Client Limits:** Queries are locally validated (non-empty, <= 128 KB, cannot begin with management dot `.`). Upstream limits enforce a maximum of 100,000 rows, 50 MB response payload, and approximately 3-minute execution limit. The server HTTP client uses a 210-second timeout to accommodate long-running analytical queries.
+The answer is compact: column names and types once, rows as arrays.
+
+```json
+{
+  "columns": [{ "name": "Timestamp", "type": "DateTime" }, { "name": "DeviceName", "type": "String" }],
+  "rows": [["2026-11-05T10:01:02Z", "host-1"]],
+  "rowCount": 1,
+  "truncated": false,
+  "maxRows": 200
+}
+```
+
+- **Actions:** `validate` (query) parses the query and applies the policy without calling Defender, and returns the tables, columns and operators read, `rowLimited`, `timeNarrowed`, `ungroupedAggregate` and `problems` (code, severity, message, line and column). `run` validates first and refuses with the same problems. `schema` (table) returns a table's columns (`T | getschema`), cached in the process for an hour. `tables` (optional `filter` by kind or tag) lists the known Advanced Hunting tables with their kind (`raw_event`, `alert`, `inventory`), time column and entity columns.
+- **Policy:** queries are parsed with the [`kql-parser`](crates/kql-parser) crate (a pest grammar derived from Microsoft's Kusto.Language). Refused: `externaldata`/`external_table()`, `cluster()`/`database()`, outbound plugins (`http_request`, `sql_request`...), `set` statements, `search`/`find` without `in (...)`, wildcard table names, management commands, queries that do not parse or do not end with a tabular expression, and queries that read no table. Tables outside the catalog are a warning (`unknown_table`): a tenant can have custom tables.
+- **Rows:** `maxRows` defaults to 1,000 and may be at most 99,999. `run` appends `| take <maxRows + 1>`; when more than `maxRows` rows come back, the extra row is dropped and `truncated` is `true`: the answer is cut, not complete.
+- **Timespan:** Defaults to `P30D` (30 days). Accepts ISO 8601 duration/interval representations (e.g., `P7D`, `P90D`, or explicit start/end ISO intervals). A time filter in the query narrows it further. Queryable history depends on tenant event retention policies.
+- **Client Limits:** Queries must be non-empty and at most 128 KB. Upstream limits enforce a maximum of 100,000 rows, 50 MB response payload, and approximately 3-minute execution limit. The server HTTP client uses a 210-second timeout to accommodate long-running analytical queries. On HTTP 400, Graph's own message (for example a KQL error) is returned as `upstreamMessage`.
 
 ### 2. XDR Incidents Listing (`defender_incidents_alerts`, action `xdr_incident_list`)
 
@@ -558,7 +578,7 @@ The download response reports the staged file:
 - **Look-back Hours:** Statistics endpoints accept `look_back_hours` between 1 and 720 hours (up to 30 days; default 720).
 
 ### Response Structure & Error Mapping
-- **Success:** Returns the upstream JSON in MCP `structuredContent`; `rmcp` also supplies a JSON text content item for compatible clients.
+- **Success:** Returns the upstream JSON in MCP `structuredContent` (the compact columns-and-rows form for `defender_hunting`); `rmcp` also supplies the same JSON as a text content item for compatible clients.
 - **Client/Input Validation Failures:** Emits standard MCP protocol errors (`invalid_params`) containing the specific validation failure message.
 - **API & Service Errors:** Emits tool-level errors (`isError: true`) with structured problem details:
   ```json
@@ -592,7 +612,7 @@ cargo build --release --locked
 The test matrix exercises:
 - OData serialization and Graph/MDE parameter bounds.
 - RFC 3986 path-segment encoding and traversal defenses.
-- KQL, IP, hostname, hash, filename, and Unicode-boundary validation.
+- KQL parsing, the query policy, row bounding and compact answers (`kql-parser` corpus and policy tests, `defender_hunting` against a loopback Graph fixture); IP, hostname, hash, filename, and Unicode-boundary validation.
 - Mutation category gating (`live_response`, `device_response`, `offboarding`, `indicators`, `triage`).
 - Interactive human confirmation via MCP elicitation and `--disable-human-confirmation`.
 - Append-only mutation audit logging, mode 0600 file creation, and fail-closed guarantees.
@@ -724,4 +744,4 @@ The test matrix exercises:
 
 ## License
 
-Licensed under the MIT license declared in `Cargo.toml`.
+Licensed under the MIT license declared in `Cargo.toml`. The `kql-parser` crate in `crates/kql-parser` is licensed under Apache-2.0 (see its `LICENSE` and `NOTICE`).

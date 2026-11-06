@@ -39,50 +39,317 @@ fn structured(res: CallToolResult) -> serde_json::Value {
     res.structured_content.expect("structured content")
 }
 
-#[tokio::test]
-async fn test_defender_hunting_parametric_dispatch() {
-    let app = Router::new().route(
+fn hunting(action: &str, query: Option<&str>) -> HuntingInput {
+    HuntingInput {
+        action: action.to_string(),
+        query: query.map(str::to_string),
+        ..Default::default()
+    }
+}
+
+/// A `runHuntingQuery` fixture that records each request body and answers with `rows` rows.
+fn hunting_upstream(
+    rows: usize,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) -> Router {
+    Router::new().route(
         "/security/runHuntingQuery",
-        post(|Json(body): Json<serde_json::Value>| async move {
-            assert_eq!(body["Query"], "DeviceProcessEvents | take 5");
-            assert_eq!(body["Timespan"], "P7D");
-            Json(json!({ "results": [{ "FileName": "powershell.exe" }] }))
+        post(move |Json(body): Json<serde_json::Value>| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(body);
+                let results: Vec<_> = (0..rows)
+                    .map(|i| json!({ "DeviceName": format!("host-{i}"), "Count": i }))
+                    .collect();
+                Json(json!({
+                    "schema": [{ "name": "DeviceName", "type": "String" }, { "name": "Count", "type": "Int64" }],
+                    "results": results,
+                }))
+            }
         }),
-    );
-    let guard = spawn_test_server(app).await;
-    let server = create_test_server(&guard.base_url);
-
-    let res = server
-        .defender_hunting(Parameters(HuntingInput {
-            action: "run".to_string(),
-            query: "DeviceProcessEvents | take 5".to_string(),
-            timespan: Some("P7D".to_string()),
-        }))
-        .await
-        .expect("hunting query succeeded");
-
-    assert_eq!(structured(res)["results"][0]["FileName"], "powershell.exe");
+    )
 }
 
 #[tokio::test]
-async fn test_defender_hunting_defaults_timespan_to_p30d() {
-    let app = Router::new().route(
-        "/security/runHuntingQuery",
-        post(|Json(body): Json<serde_json::Value>| async move { Json(body) }),
-    );
-    let guard = spawn_test_server(app).await;
+async fn test_defender_hunting_run_bounds_rows_and_compacts() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let guard = spawn_test_server(hunting_upstream(2, seen.clone())).await;
     let server = create_test_server(&guard.base_url);
 
     let res = server
         .defender_hunting(Parameters(HuntingInput {
-            action: "run".to_string(),
-            query: "DeviceInfo | take 1".to_string(),
-            timespan: None,
+            timespan: Some("P7D".to_string()),
+            max_rows: Some(5),
+            ..hunting(
+                "run",
+                Some("DeviceProcessEvents | summarize Count = count() by DeviceName;"),
+            )
         }))
         .await
         .expect("hunting query succeeded");
 
-    assert_eq!(structured(res)["Timespan"], "P30D");
+    let body = seen.lock().unwrap()[0].clone();
+    assert_eq!(
+        body["Query"],
+        "DeviceProcessEvents | summarize Count = count() by DeviceName\n| take 6"
+    );
+    assert_eq!(body["Timespan"], "P7D");
+    let text = res.content[0].as_text().expect("text content").text.clone();
+    let out = structured(res);
+    // The text is the structured answer itself, compact: no repeated keys.
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        out
+    );
+    assert!(!text.contains("\"DeviceName\":\"host-0\""), "{text}");
+    assert_eq!(
+        out["columns"],
+        json!([{ "name": "DeviceName", "type": "String" }, { "name": "Count", "type": "Int64" }])
+    );
+    assert_eq!(out["rows"], json!([["host-0", 0], ["host-1", 1]]));
+    assert_eq!(out["rowCount"], 2);
+    assert_eq!(out["truncated"], false);
+}
+
+#[tokio::test]
+async fn test_defender_hunting_run_marks_truncation_and_defaults() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let guard = spawn_test_server(hunting_upstream(3, seen.clone())).await;
+    let server = create_test_server(&guard.base_url);
+
+    let out = structured(
+        server
+            .defender_hunting(Parameters(HuntingInput {
+                max_rows: Some(2),
+                ..hunting("run", Some("DeviceInfo | project DeviceName"))
+            }))
+            .await
+            .expect("hunting query succeeded"),
+    );
+    assert_eq!(out["rowCount"], 2);
+    assert_eq!(out["truncated"], true);
+    assert!(
+        out["note"]
+            .as_str()
+            .unwrap()
+            .contains("not the complete result")
+    );
+    assert!(out.get("warnings").is_none());
+
+    server
+        .defender_hunting(Parameters(hunting("run", Some("DeviceInfo"))))
+        .await
+        .expect("hunting query succeeded");
+    let body = seen.lock().unwrap()[1].clone();
+    assert_eq!(body["Query"], "DeviceInfo\n| take 1001");
+    assert_eq!(body["Timespan"], "P30D");
+
+    // Warnings do not stop `run`; they come back with the rows.
+    let out = structured(
+        server
+            .defender_hunting(Parameters(hunting(
+                "run",
+                Some("deviceinfo | summarize count()"),
+            )))
+            .await
+            .expect("warnings do not stop run"),
+    );
+    let warnings: Vec<&str> = out["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert_eq!(warnings, ["unknown_table", "ungrouped_aggregate"]);
+}
+
+#[tokio::test]
+async fn test_defender_hunting_refuses_without_calling_defender() {
+    let upstream = spawn_test_server(hunting_upstream(1, Default::default())).await;
+    let server = create_test_server(&upstream.base_url);
+
+    for q in [
+        ".drop table DeviceInfo",
+        "externaldata (x:string) [@'https://e.example/x.csv']",
+        "set notruncation;\nDeviceInfo | take 1",
+        "DeviceInfo | frobnicate",
+        "let x = 1;",
+    ] {
+        let res = server
+            .defender_hunting(Parameters(hunting("run", Some(q))))
+            .await
+            .expect("refusal is a tool result");
+        assert_eq!(res.is_error, Some(true), "{q}");
+        let s = res.structured_content.expect("structured refusal");
+        assert!(
+            s["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("The query was not run"),
+            "{s}"
+        );
+        assert_eq!(s["problems"][0]["severity"], "error", "{s}");
+    }
+    let err = server
+        .defender_hunting(Parameters(HuntingInput {
+            max_rows: Some(100_000),
+            ..hunting("run", Some("DeviceInfo"))
+        }))
+        .await
+        .expect_err("maxRows out of range");
+    assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    upstream.assert_hits("/security/runHuntingQuery", 0);
+}
+
+#[tokio::test]
+async fn test_defender_hunting_validate_reports_without_calling_defender() {
+    let upstream = spawn_test_server(hunting_upstream(1, Default::default())).await;
+    let server = create_test_server(&upstream.base_url);
+
+    let out = structured(
+        server
+            .defender_hunting(Parameters(hunting(
+                "validate",
+                Some("DeviceProcessEvents | where Timestamp > ago(1d) | summarize count()"),
+            )))
+            .await
+            .expect("validate succeeded"),
+    );
+    assert_eq!(out["valid"], true);
+    assert_eq!(out["tables"], json!(["DeviceProcessEvents"]));
+    assert_eq!(out["timeNarrowed"], true);
+    assert_eq!(out["ungroupedAggregate"], true);
+    assert_eq!(out["problems"][0]["code"], "ungrouped_aggregate");
+
+    let out = structured(
+        server
+            .defender_hunting(Parameters(hunting(
+                "validate",
+                Some("cluster('c').database('d').T | take 1"),
+            )))
+            .await
+            .expect("validate succeeded"),
+    );
+    assert_eq!(out["valid"], false);
+    assert_eq!(out["problems"][0]["code"], "cross_cluster");
+
+    let err = server
+        .defender_hunting(Parameters(hunting("validate", None)))
+        .await
+        .expect_err("query is required");
+    assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    upstream.assert_hits("/security/runHuntingQuery", 0);
+}
+
+#[tokio::test]
+async fn test_defender_hunting_schema_is_cached() {
+    let app = Router::new().route(
+        "/security/runHuntingQuery",
+        post(|Json(body): Json<serde_json::Value>| async move {
+            assert_eq!(
+                body["Query"],
+                "DeviceInfo\n| getschema\n| project ColumnName, ColumnType"
+            );
+            Json(json!({ "results": [
+                { "ColumnName": "Timestamp", "ColumnType": "datetime" },
+                { "ColumnName": "DeviceName", "ColumnType": "string" },
+            ] }))
+        }),
+    );
+    let upstream = spawn_test_server(app).await;
+    let server = create_test_server(&upstream.base_url);
+    let input = HuntingInput {
+        table: Some("DeviceInfo".to_string()),
+        ..hunting("schema", None)
+    };
+
+    for _ in 0..2 {
+        let out = structured(
+            server
+                .defender_hunting(Parameters(input.clone()))
+                .await
+                .expect("schema succeeded"),
+        );
+        assert_eq!(out["name"], "DeviceInfo");
+        assert_eq!(out["kind"], "inventory");
+        assert_eq!(
+            out["columns"][1],
+            json!({ "name": "DeviceName", "type": "string" })
+        );
+    }
+    upstream.assert_hits("/security/runHuntingQuery", 1);
+
+    let err = server
+        .defender_hunting(Parameters(HuntingInput {
+            table: Some("DeviceInfo | take 1".to_string()),
+            ..hunting("schema", None)
+        }))
+        .await
+        .expect_err("not a table name");
+    assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn test_defender_hunting_tables_and_unknown_action() {
+    let server = create_test_server("http://127.0.0.1:9");
+    let out = structured(
+        server
+            .defender_hunting(Parameters(HuntingInput {
+                filter: Some("alert".to_string()),
+                ..hunting("tables", None)
+            }))
+            .await
+            .expect("tables succeeded"),
+    );
+    let tables = out["tables"].as_array().unwrap();
+    assert!(tables.iter().any(|t| t["name"] == "AlertEvidence"));
+    assert!(tables.iter().all(|t| t["kind"] == "alert"));
+
+    let err = server
+        .defender_hunting(Parameters(hunting("explain", Some("DeviceInfo"))))
+        .await
+        .expect_err("unknown action");
+    assert!(
+        err.message.contains("validate, run, schema, tables"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_defender_hunting_reports_graph_kql_errors() {
+    let app = Router::new().route(
+        "/security/runHuntingQuery",
+        post(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": {
+                    "code": "BadRequest",
+                    "message": "Failed to resolve scalar expression named 'Nope'",
+                } })),
+            )
+        }),
+    );
+    let upstream = spawn_test_server(app).await;
+    let server = create_test_server(&upstream.base_url);
+
+    let res = server
+        .defender_hunting(Parameters(hunting(
+            "run",
+            Some("DeviceInfo | where Nope == 1"),
+        )))
+        .await
+        .expect("upstream error is a tool result");
+    assert_eq!(res.is_error, Some(true));
+    let s = res.structured_content.expect("structured error");
+    assert_eq!(s["httpStatus"], 400);
+    assert_eq!(
+        s["upstreamMessage"],
+        "Failed to resolve scalar expression named 'Nope'"
+    );
+    assert!(
+        s["error"].as_str().unwrap().contains("Failed to resolve"),
+        "{s}"
+    );
 }
 
 #[tokio::test]

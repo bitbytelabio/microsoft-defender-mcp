@@ -91,3 +91,74 @@ fn test_kql_hunting_skill_needs_no_arguments() {
     assert!(prompt_text(&resp).contains("DeviceProcessEvents"));
     assert!(server.shutdown().success());
 }
+
+#[test]
+fn test_hunting_skill_is_a_resource() {
+    let mut server = McpProcess::start(&["--read-only"], &[]);
+    let resp = server.request("resources/list", json!({}));
+    let resources = resp["result"]["resources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no resources in {resp}"));
+    let skill = resources
+        .iter()
+        .find(|r| r["uri"] == "skill://ms-defender/kql-hunting")
+        .unwrap_or_else(|| panic!("skill not listed: {resp}"));
+    assert_eq!(skill["mimeType"], "text/markdown");
+
+    let resp = server.request(
+        "resources/read",
+        json!({ "uri": "skill://ms-defender/kql-hunting" }),
+    );
+    let text = resp["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no skill text in {resp}"));
+    for needle in [
+        "defender_hunting",
+        "validate",
+        "maxRows",
+        "truncated",
+        "timespan",
+        "arg_min",
+        "dcount(DeviceName)",
+    ] {
+        assert!(text.contains(needle), "skill lacks {needle}");
+    }
+
+    let resp = server.request(
+        "resources/read",
+        json!({ "uri": "skill://ms-defender/other" }),
+    );
+    assert!(resp.get("error").is_some(), "expected an error: {resp}");
+    assert!(server.shutdown().success());
+}
+
+#[test]
+fn test_instructions_are_short_and_point_to_the_skill() {
+    let server = common::test_server("http://127.0.0.1:9", common::base_config());
+    let info = rmcp::ServerHandler::get_info(&server);
+    let instructions = info.instructions.expect("instructions");
+    // Agent runtimes truncate longer instructions (omp keeps 4000 characters).
+    assert!(
+        instructions.chars().count() < 4000,
+        "instructions are {} characters",
+        instructions.chars().count()
+    );
+    assert!(instructions.contains("skill://ms-defender/kql-hunting"));
+    for tool in [
+        "defender_hunting",
+        "defender_ti",
+        "defender_incidents_alerts",
+        "defender_machines",
+        "defender_vulnerabilities",
+        "defender_forensics",
+        "defender_response",
+        "defender_device_response",
+        "defender_indicators",
+        "defender_triage",
+    ] {
+        assert!(instructions.contains(tool), "instructions lack {tool}");
+    }
+    let caps = info.capabilities;
+    assert!(caps.tools.is_some() && caps.prompts.is_some() && caps.resources.is_some());
+    assert_eq!(info.server_info.name, "microsoft-defender-mcp");
+}

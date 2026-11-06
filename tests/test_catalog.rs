@@ -581,3 +581,38 @@ fn test_all_categories_enabled_lists_ten_tools_full_annotations_and_server_info(
 
     assert!(server.shutdown().success());
 }
+
+#[test]
+fn test_hunting_schema_offers_every_action_input() {
+    let mut server = McpProcess::start(&["--read-only"], &[]);
+    let tools = server.tools();
+    let hunting = tools
+        .iter()
+        .find(|t| t["name"] == "defender_hunting")
+        .expect("defender_hunting listed");
+    let props = &hunting["inputSchema"]["properties"];
+    for p in ["action", "query", "timespan", "maxRows", "table", "filter"] {
+        assert!(props.get(p).is_some(), "no {p} in {props}");
+    }
+    let required: Vec<&str> = hunting["inputSchema"]["required"]
+        .as_array()
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(
+        required.is_empty(),
+        "every input is per action: {required:?}"
+    );
+    let description = hunting["description"].as_str().unwrap();
+    for needle in [
+        "skill://ms-defender/kql-hunting",
+        "'validate'",
+        "'run'",
+        "'schema'",
+        "'tables'",
+        "maxRows",
+        "truncated",
+    ] {
+        assert!(description.contains(needle), "description lacks {needle}");
+    }
+    assert!(server.shutdown().success());
+}

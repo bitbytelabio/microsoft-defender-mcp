@@ -1,0 +1,15 @@
+kql-parser
+Copyright OPSWAT, Inc.
+
+src/kql.pest is a pest grammar derived from the Kusto Query Language parser in
+Kusto.Language (https://github.com/microsoft/Kusto-Query-Language, commit
+7e658f73457320fea8fde24c5f1b5a7e2a87ca59), Copyright (c) Microsoft Corporation,
+licensed under the Apache License, Version 2.0. The grammar follows the
+expression precedence and operator families of
+src/Kusto.Language/Parser/QueryParser.cs, the operator parameters of
+src/Kusto.Language/QueryOperatorParameters.cs and the literal forms of
+src/Kusto.Language/Parser/TokenParser.cs. No source code was copied; the
+grammar is a translation into pest notation and covers a subset of KQL.
+
+Licensed under the Apache License, Version 2.0:
+http://www.apache.org/licenses/LICENSE-2.0

@@ -13,7 +13,12 @@ categories = ["command-line-utilities", "network-programming"]
 publish = ["crates-io"]
 include = ["src/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
+[workspace]
+members = ["crates/kql-parser"]
+resolver = "3"
+
 [dependencies]
+kql-parser = { version = "0.1.0", path = "crates/kql-parser" }
 rmcp = { version = "3", features = [
     "server",
     "macros",

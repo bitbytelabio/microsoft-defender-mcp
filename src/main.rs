@@ -20,6 +20,7 @@ use microsoft_defender_mcp_server::cli::{
 };
 use microsoft_defender_mcp_server::client::{EndpointClient, GraphClient};
 use microsoft_defender_mcp_server::constants::{ENV_REMOVED_TOOL_MODE, REQUEST_TIMEOUT_SECS};
+use microsoft_defender_mcp_server::hunting::SchemaCache;
 use microsoft_defender_mcp_server::server::DefenderServer;
 
 #[tokio::main]
@@ -186,13 +187,15 @@ async fn run_http(
         http_config = http_config.with_allowed_hosts(allowed_hosts);
     }
 
+    // One server per HTTP session; Advanced Hunting schemas are cached for all of them.
+    let schema_cache = SchemaCache::default();
     let service = StreamableHttpService::new(
         move || {
             let g = graph_client.clone();
             let e = endpoint_client.clone();
             let c = config.clone();
             let a = audit_sink.clone();
-            Ok(DefenderServer::new_with_config(g, e, c, a))
+            Ok(DefenderServer::new_with_config(g, e, c, a).with_schema_cache(schema_cache.clone()))
         },
         LocalSessionManager::default().into(),
         http_config,

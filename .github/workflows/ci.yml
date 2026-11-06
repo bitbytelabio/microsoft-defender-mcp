@@ -106,5 +106,6 @@ jobs:
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Package and verify crate
-        run: cargo package --locked
+      - name: Package and verify crates
+        # The server depends on the unpublished kql-parser; packaging the workspace verifies both.
+        run: cargo package --workspace --locked
