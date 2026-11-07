@@ -57,6 +57,9 @@ pub const ENV_READ_ONLY: &str = "DEFENDER_READ_ONLY";
 /// Environment variable for HTTP bind address.
 pub const ENV_BIND_ADDRESS: &str = "BIND_ADDRESS";
 
+/// Environment variable for the HTTP transport's allowed `Host` values (comma-separated).
+pub const ENV_ALLOWED_HOSTS: &str = "DEFENDER_ALLOWED_HOSTS";
+
 /// Environment variable for quarantine directory.
 pub const ENV_QUARANTINE_DIR: &str = "DEFENDER_QUARANTINE_DIR";
 

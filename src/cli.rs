@@ -9,11 +9,11 @@ use std::path::PathBuf;
 use clap::{Parser, ValueEnum};
 
 use crate::constants::{
-    DEFAULT_BIND_ADDRESS, DEFAULT_QUARANTINE_DIR, ENV_AUDIT_LOG, ENV_AUTH_MODE, ENV_BIND_ADDRESS,
-    ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_DEVICE_RESPONSE_ENABLED, ENV_DISABLE_HUMAN_CONFIRMATION,
-    ENV_INDICATORS_ENABLED, ENV_LIVE_RESPONSE_ALLOWED_COMMANDS, ENV_LIVE_RESPONSE_ENABLED,
-    ENV_OFFBOARDING_ENABLED, ENV_QUARANTINE_DIR, ENV_READ_ONLY, ENV_SIGN_IN_FLOW, ENV_TENANT_ID,
-    ENV_TRANSPORT, ENV_TRIAGE_ENABLED,
+    DEFAULT_BIND_ADDRESS, DEFAULT_QUARANTINE_DIR, ENV_ALLOWED_HOSTS, ENV_AUDIT_LOG, ENV_AUTH_MODE,
+    ENV_BIND_ADDRESS, ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_DEVICE_RESPONSE_ENABLED,
+    ENV_DISABLE_HUMAN_CONFIRMATION, ENV_INDICATORS_ENABLED, ENV_LIVE_RESPONSE_ALLOWED_COMMANDS,
+    ENV_LIVE_RESPONSE_ENABLED, ENV_OFFBOARDING_ENABLED, ENV_QUARANTINE_DIR, ENV_READ_ONLY,
+    ENV_SIGN_IN_FLOW, ENV_TENANT_ID, ENV_TRANSPORT, ENV_TRIAGE_ENABLED,
 };
 
 /// MCP transport.
@@ -232,6 +232,12 @@ pub struct Cli {
     /// Socket address for the streamable HTTP transport
     #[arg(long, default_value = DEFAULT_BIND_ADDRESS, env = ENV_BIND_ADDRESS)]
     pub bind_address: String,
+
+    /// `Host` header values the HTTP transport accepts (comma-separated, e.g. `mcp-defender,mcp-defender:8000`).
+    /// Default: loopback names only (DNS-rebinding protection). `*` turns the check off; only do that
+    /// behind an authenticated proxy that sets its own Host.
+    #[arg(long, env = ENV_ALLOWED_HOSTS, value_delimiter = ',')]
+    pub allowed_hosts: Vec<String>,
 
     /// Hide mutating tools from discovery and reject mutating calls locally before any network request
     #[arg(long, env = ENV_READ_ONLY)]
@@ -470,6 +476,7 @@ mod tests {
         let cli = Cli {
             transport: TransportMode::Stdio,
             bind_address: "127.0.0.1:8000".to_string(),
+            allowed_hosts: Vec::new(),
             read_only: false,
             enable_live_response: true,
             allowed_commands: Some("PutFile,RunScript".to_string()),

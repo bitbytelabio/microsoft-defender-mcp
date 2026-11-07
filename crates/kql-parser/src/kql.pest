@@ -1,0 +1,325 @@
+// KQL queries (not management commands) as a pest grammar.
+//
+// Derived from Microsoft's Kusto.Language parser (github.com/microsoft/Kusto-Query-Language,
+// Apache-2.0, commit 7e658f73): expression precedence and the string/`in` operator families follow
+// src/Kusto.Language/Parser/QueryParser.cs, operator parameters QueryOperatorParameters.cs, literal
+// forms and timespan suffixes TokenParser.cs. See NOTICE.
+//
+// Scope: the query statements and operators used in Advanced Hunting. Constructs that are not covered
+// fail to parse, on purpose: a caller that bounds what a query may read cannot accept text it did not
+// understand. Management commands (`.show ...`) are not queries and never parse.
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" | "\u{feff}" | "\u{a0}" }
+COMMENT    = _{ "//" ~ (!("\n" | "\r") ~ ANY)* }
+
+// ---------------------------------------------------------------- statements
+
+query = { SOI ~ (statement ~ ";")* ~ statement? ~ EOI }
+
+statement = _{ let_stmt | set_stmt | pipe_expr }
+
+let_stmt  = { kw_let ~ name_decl ~ "=" ~ let_value }
+let_value = _{ function_decl | (kw_view ~ function_decl) | pipe_expr }
+
+function_decl = { "(" ~ (fn_param ~ ("," ~ fn_param)*)? ~ ")" ~ "{" ~ fn_body ~ "}" }
+fn_param      = { name_decl ~ ":" ~ (type_name | tabular_type) ~ ("=" ~ literal)? }
+tabular_type  = { "(" ~ ("*" | col_type_list) ~ ")" }
+fn_body       = { (statement ~ ";")* ~ statement? }
+
+set_stmt    = { kw_set ~ option_name ~ ("=" ~ (literal | ident))? }
+option_name = @{ ident ~ ("." ~ ident)* }
+
+// ---------------------------------------------------------------- pipe expressions
+
+// A tabular (or scalar) expression followed by piped operators (QueryParser.ParsePipeExpression).
+pipe_expr = { pipe_head ~ ("|" ~ query_operator)* }
+pipe_head = { unpiped_operator | expr }
+// Operators after `on (` in mv-apply: no source, they apply to the row's expanded values.
+sub_pipe  = { query_operator ~ ("|" ~ query_operator)* }
+
+unpiped_operator = _{
+    union_op | print_op | range_op | find_op | search_op | datatable_op | externaldata_op | evaluate_op
+}
+
+query_operator = _{
+    where_op
+  | project_away_op | project_keep_op | project_rename_op | project_reorder_op | project_op
+  | extend_op | summarize_op | take_op | top_hitters_op | top_op | sort_op | distinct_op | count_op
+  | join_op | lookup_op | union_op | mv_expand_op | mv_apply_op
+  | parse_kv_op | parse_where_op | parse_op
+  | evaluate_op | invoke_op | as_op | serialize_op | getschema_op | render_op | make_series_op
+  | sample_distinct_op | sample_op | search_op | consume_op
+}
+
+where_op           = { (kw_where | kw_filter) ~ expr }
+project_op         = { kw_project ~ named_expr_list }
+project_away_op    = { kw_project_away ~ col_pattern_list }
+project_keep_op    = { kw_project_keep ~ col_pattern_list }
+project_rename_op  = { kw_project_rename ~ rename ~ ("," ~ rename)* }
+rename             = { name_decl ~ "=" ~ name_ref }
+project_reorder_op = { kw_project_reorder ~ reorder_item ~ ("," ~ reorder_item)* }
+reorder_item       = { col_pattern ~ (kw_granny_asc | kw_granny_desc | kw_asc | kw_desc)? }
+extend_op          = { kw_extend ~ named_expr_list }
+summarize_op       = { kw_summarize ~ hint_param* ~ named_expr_list? ~ (kw_by ~ named_expr_list)? }
+take_op            = { (kw_take | kw_limit) ~ hint_param* ~ expr }
+top_op             = { kw_top ~ expr ~ kw_by ~ sort_expr }
+top_hitters_op     = { kw_top_hitters ~ expr ~ kw_of ~ expr ~ (kw_by ~ expr)? }
+sort_op            = { (kw_sort | kw_order) ~ hint_param* ~ kw_by ~ sort_expr ~ ("," ~ sort_expr)* }
+sort_expr          = { expr ~ (kw_asc | kw_desc)? ~ (kw_nulls ~ (kw_first | kw_last))? }
+distinct_op        = { kw_distinct ~ hint_param* ~ ("*" | expr_list) }
+count_op           = { kw_count }
+join_op            = { kw_join ~ join_param* ~ tabular_operand ~ (kw_on ~ expr_list)? ~ (kw_where ~ expr)? }
+lookup_op          = { kw_lookup ~ join_param* ~ tabular_operand ~ kw_on ~ expr_list }
+union_op           = { kw_union ~ union_param* ~ union_operand ~ ("," ~ union_operand)* }
+union_operand      = _{ paren_pipe | table_pattern | tabular_operand }
+// A join/lookup/union operand that is not parenthesized: a table name, `table('x')`, a function call.
+tabular_operand    = { paren_pipe | postfix }
+mv_expand_op       = { (kw_mv_expand | kw_mvexpand) ~ mv_param* ~ mv_item ~ ("," ~ mv_item)* ~ (kw_limit ~ expr)? }
+mv_apply_op        = { (kw_mv_apply | kw_mvapply) ~ mv_param* ~ mv_item ~ ("," ~ mv_item)* ~ (kw_limit ~ expr)? ~ kw_on ~ "(" ~ sub_pipe ~ ")" }
+mv_item            = { named_expr ~ (kw_to ~ kw_typeof ~ "(" ~ type_name ~ ")")? }
+parse_op           = { kw_parse ~ parse_param* ~ expr ~ kw_with ~ parse_pattern }
+parse_where_op     = { kw_parse_where ~ parse_param* ~ expr ~ kw_with ~ parse_pattern }
+parse_pattern      = { parse_item+ }
+parse_item         = { "*" | string_lit | (name_decl ~ (":" ~ type_name)?) }
+parse_kv_op        = { kw_parse_kv ~ expr ~ kw_as ~ "(" ~ col_type_list ~ ")" ~ (kw_with ~ "(" ~ kv_option ~ ("," ~ kv_option)* ~ ")")? }
+kv_option          = { ident ~ "=" ~ literal }
+evaluate_op        = { kw_evaluate ~ evaluate_param* ~ plugin_call ~ (":" ~ "(" ~ col_type_list ~ ")")? }
+plugin_call        = { name_ref ~ call_args }
+invoke_op          = { kw_invoke ~ postfix }
+as_op              = { kw_as ~ hint_param* ~ name_decl }
+serialize_op       = { kw_serialize ~ named_expr_list? }
+getschema_op       = { kw_getschema }
+render_op          = { kw_render ~ ident ~ (kw_with ~ "(" ~ render_prop ~ ("," ~ render_prop)* ~ ")")? }
+render_prop        = { ident ~ "=" ~ expr }
+make_series_op     = {
+    kw_make_series ~ make_series_param* ~ series_aggr ~ ("," ~ series_aggr)* ~ kw_on ~ expr
+  ~ ((kw_in ~ kw_range ~ "(" ~ expr ~ "," ~ expr ~ "," ~ expr ~ ")") | ((kw_from ~ expr)? ~ (kw_to ~ expr)? ~ kw_step ~ expr))
+  ~ (kw_by ~ named_expr_list)?
+}
+series_aggr        = { named_expr ~ (kw_default ~ "=" ~ expr)? }
+sample_op          = { kw_sample ~ hint_param* ~ expr }
+sample_distinct_op = { kw_sample_distinct ~ hint_param* ~ expr ~ kw_of ~ expr }
+consume_op         = { kw_consume ~ (ident ~ "=" ~ literal)* }
+
+// Operators that can start a query.
+print_op        = { kw_print ~ named_expr_list }
+range_op        = { kw_range ~ name_decl ~ kw_from ~ expr ~ kw_to ~ expr ~ kw_step ~ expr }
+find_op         = { kw_find ~ find_param* ~ (kw_in ~ "(" ~ find_source ~ ("," ~ find_source)* ~ ")")? ~ kw_where? ~ expr ~ find_projection? }
+find_source     = { table_pattern | tabular_operand }
+find_projection = { kw_project_smart | (kw_project ~ col_pattern_list) }
+search_op       = { kw_search ~ find_param* ~ (kw_in ~ "(" ~ find_source ~ ("," ~ find_source)* ~ ")")? ~ expr }
+datatable_op    = { kw_datatable ~ "(" ~ col_type_list ~ ")" ~ "[" ~ (expr ~ ("," ~ expr)* ~ ","?)? ~ "]" }
+externaldata_op = { (kw_externaldata | kw_external_data) ~ "(" ~ col_type_list ~ ")" ~ "[" ~ string_lit ~ ("," ~ string_lit)* ~ "]" ~ (kw_with ~ "(" ~ kv_option ~ ("," ~ kv_option)* ~ ")")? }
+
+// Operator parameters: known names only, per operator (QueryOperatorParameters.cs), so a column
+// alias such as `kind = count()` is never taken for a parameter.
+hint_name          = @{ "hint." ~ ident }
+param_value        = @{ (literal | ident) ~ !("(" | "." | "[") }
+hint_param         = { hint_name ~ "=" ~ param_value }
+join_param         = { (hint_name | kw_kind) ~ "=" ~ param_value }
+union_param        = { (hint_name | kw_kind | kw_withsource | kw_with_source | kw_isfuzzy) ~ "=" ~ param_value }
+mv_param           = { (kw_kind | kw_bagexpansion | kw_with_itemindex) ~ "=" ~ param_value }
+parse_param        = { (kw_kind | kw_flags) ~ "=" ~ param_value }
+evaluate_param     = { hint_name ~ "=" ~ param_value }
+make_series_param  = { (hint_name | kw_kind) ~ "=" ~ param_value }
+find_param         = { (kw_withsource | kw_with_source | kw_datascope | kw_kind) ~ "=" ~ param_value }
+
+// ---------------------------------------------------------------- expressions (QueryParser.cs precedence)
+
+expr          = { or_expr }
+or_expr       = { and_expr ~ (kw_or ~ and_expr)* }
+and_expr      = { equality ~ (kw_and ~ equality)* }
+equality      = { (star ~ eq_op ~ relational) | (relational ~ (eq_tail)?) }
+eq_tail       = _{ (eq_op ~ relational) | (in_op ~ in_list) | (between_op ~ between_pair) }
+in_list       = { "(" ~ pipe_expr ~ ("," ~ pipe_expr)* ~ ")" }
+between_pair  = { "(" ~ expr ~ ".." ~ expr ~ ")" }
+relational    = { additive ~ (rel_op ~ additive)? }
+additive      = { multiplicative ~ (add_op ~ multiplicative)* }
+multiplicative = { string_op_expr ~ (mul_op ~ string_op_expr)* }
+string_op_expr = { (star ~ str_op ~ unary) | (unary ~ (str_op ~ unary)?) }
+unary         = { unary_op? ~ postfix }
+postfix       = { primary ~ (member | element | call_args)* }
+member        = { "." ~ (bracket_name | ident) }
+element       = { "[" ~ expr ~ "]" }
+call_args     = { "(" ~ (call_arg ~ ("," ~ call_arg)*)? ~ ")" }
+call_arg      = _{ star | named_arg | pipe_expr }
+named_arg     = { name_decl ~ "=" ~ !("=" | "~") ~ expr }
+
+primary = _{
+    typed_literal | dynamic_lit | typeof_lit | literal | paren_pipe | name_ref
+}
+paren_pipe = { "(" ~ pipe_expr ~ ")" }
+
+named_expr      = { (paren_names ~ "=" ~ !("=" | "~") ~ expr) | (name_decl ~ "=" ~ !("=" | "~") ~ expr) | expr }
+paren_names     = { "(" ~ name_decl ~ ("," ~ name_decl)* ~ ")" }
+named_expr_list = { named_expr ~ ("," ~ named_expr)* }
+expr_list       = { expr ~ ("," ~ expr)* }
+
+star     = { "*" }
+eq_op    = @{ "==" | "!=" | "<>" }
+rel_op   = @{ "<=" | ">=" | ("<" ~ !">") | ">" }
+add_op   = @{ "+" | "-" }
+mul_op   = @{ "*" | "/" | "%" }
+unary_op = @{ "-" | "+" }
+
+in_op = @{
+    ("!in~") | ("!in" ~ !ident_char) | ("in~") | ("in" ~ !ident_char) | ("has_any" ~ !ident_char) | ("has_all" ~ !ident_char)
+}
+between_op = @{ "!"? ~ "between" ~ !ident_char }
+
+// String operators (QueryParser.GetStringOperationKind); `:` is the search-predicate operator.
+str_op = @{
+    "=~" | "!~"
+  | (("!" | "not")? ~ ("contains_cs" | "contains") ~ !ident_char)
+  | ("contains_cs" ~ !ident_char)
+  | ("!"? ~ ("startswith_cs" | "startswith" | "endswith_cs" | "endswith") ~ !ident_char)
+  | ("!"? ~ ("hasprefix_cs" | "hasprefix" | "hassuffix_cs" | "hassuffix" | "has_cs") ~ !ident_char)
+  | ("!"? ~ "has" ~ !ident_char)
+  | ("!"? ~ ("like_cs" | "like") ~ !ident_char)
+  | ("notlike_cs" | "notlike") ~ !ident_char
+  | ("matches" ~ WHITESPACE+ ~ "regex" ~ !ident_char)
+  | ":"
+}
+
+// ---------------------------------------------------------------- names
+
+ident_char   = _{ ASCII_ALPHANUMERIC | "_" }
+ident        = @{ ("_" | "$" | ASCII_ALPHA) ~ ident_char* }
+bracket_name = ${ "[" ~ (regular_string) ~ "]" }
+// `by` is the only word an expression cannot start with (`summarize by X`).
+name_ref     = ${ bracket_name | (!(kw_by) ~ ident) }
+name_decl    = ${ bracket_name | ident }
+// A column or table name with `*` wildcards: project-away Col*, union Device*.
+col_pattern      = @{ ("_" | "$" | ASCII_ALPHA | "*") ~ (ident_char | "*")* }
+col_pattern_list = { col_pattern ~ ("," ~ col_pattern)* }
+table_pattern    = @{ (ident_char)* ~ "*" ~ (ident_char | "*")* }
+
+type_name     = @{
+    ("boolean" | "bool" | "datetime" | "date" | "decimal" | "double" | "dynamic" | "guid" | "uuid" | "uniqueid"
+     | "int" | "long" | "real" | "float" | "string" | "timespan" | "time") ~ !ident_char
+}
+col_type_list = { col_type ~ ("," ~ col_type)* }
+col_type      = { name_decl ~ ":" ~ type_name }
+
+// ---------------------------------------------------------------- literals (TokenParser.cs)
+
+literal = _{ timespan_lit | real_lit | long_lit | string_lit | bool_lit | null_lit }
+
+bool_lit = @{ ("true" | "false" | "True" | "False" | "TRUE" | "FALSE") ~ !ident_char }
+null_lit = @{ "null" ~ !ident_char }
+long_lit = @{ (("0x" | "0X") ~ ASCII_HEX_DIGIT+ | ASCII_DIGIT+) ~ !(ident_char | ("." ~ ASCII_DIGIT)) }
+real_lit = @{
+    ((ASCII_DIGIT+ ~ "." ~ !"." ~ ASCII_DIGIT* ~ exponent?) | ("." ~ ASCII_DIGIT+ ~ exponent?) | (ASCII_DIGIT+ ~ exponent))
+  ~ !ident_char
+}
+exponent = _{ ("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+ }
+timespan_lit = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ timespan_suffix ~ !ident_char }
+timespan_suffix = _{
+    "milliseconds" | "millisecond" | "millisec" | "millis" | "milli"
+  | "microseconds" | "microsecond" | "microsec" | "micros" | "micro"
+  | "nanoseconds" | "nanosecond" | "nanosec" | "nanos" | "nano"
+  | "minutes" | "minute" | "min" | "ms"
+  | "seconds" | "second" | "sec"
+  | "hours" | "hour" | "hrs" | "hr"
+  | "days" | "day" | "ticks" | "tick"
+  | "d" | "h" | "m" | "s"
+}
+
+// 'x', "x" with escapes; @'x' and @"x" verbatim (a doubled quote is a quote); h/H obfuscated;
+// ```x``` and ~~~x~~~ multi-line.
+string_lit       = ${ ("h" | "H")? ~ (verbatim_string | regular_string | multiline_string) }
+regular_string   = @{ ("'" ~ ("\\" ~ ANY | !("'" | "\n" | "\r") ~ ANY)* ~ "'") | ("\"" ~ ("\\" ~ ANY | !("\"" | "\n" | "\r") ~ ANY)* ~ "\"") }
+verbatim_string  = @{ "@" ~ (("'" ~ ("''" | !"'" ~ ANY)* ~ "'") | ("\"" ~ ("\"\"" | !"\"" ~ ANY)* ~ "\"")) }
+multiline_string = @{ ("```" ~ (!"```" ~ ANY)* ~ "```") | ("~~~" ~ (!"~~~" ~ ANY)* ~ "~~~") }
+
+// datetime(2026-01-01), timespan(1d), guid(...), long(null), ...: the text up to `)` is the value.
+typed_literal = @{
+    ("datetime" | "date" | "timespan" | "time" | "guid" | "uuid" | "uniqueid" | "bool" | "boolean"
+     | "int" | "long" | "real" | "double" | "decimal")
+  ~ "(" ~ (!(")" | "\n") ~ ANY)* ~ ")"
+}
+typeof_lit  = { kw_typeof ~ "(" ~ (col_type_list | type_name) ~ ")" }
+dynamic_lit = { kw_dynamic ~ "(" ~ dynamic_value ~ ")" }
+dynamic_value = { dyn_array | dyn_object | typed_literal | literal }
+dyn_array   = { "[" ~ (dynamic_value ~ ("," ~ dynamic_value)*)? ~ ","? ~ "]" }
+dyn_object  = { "{" ~ (dyn_pair ~ ("," ~ dyn_pair)*)? ~ ","? ~ "}" }
+dyn_pair    = { string_lit ~ ":" ~ dynamic_value }
+
+// ---------------------------------------------------------------- keywords
+
+kw_and = @{ "and" ~ !ident_char }
+kw_as = @{ "as" ~ !ident_char }
+kw_asc = @{ "asc" ~ !ident_char }
+kw_bagexpansion = @{ "bagexpansion" ~ !ident_char }
+kw_by = @{ "by" ~ !ident_char }
+kw_consume = @{ "consume" ~ !ident_char }
+kw_count = @{ "count" ~ !ident_char }
+kw_datascope = @{ "datascope" ~ !ident_char }
+kw_datatable = @{ "datatable" ~ !ident_char }
+kw_default = @{ "default" ~ !ident_char }
+kw_desc = @{ "desc" ~ !ident_char }
+kw_distinct = @{ "distinct" ~ !ident_char }
+kw_dynamic = @{ "dynamic" ~ !ident_char }
+kw_evaluate = @{ "evaluate" ~ !ident_char }
+kw_extend = @{ "extend" ~ !ident_char }
+kw_external_data = @{ "external_data" ~ !ident_char }
+kw_externaldata = @{ "externaldata" ~ !ident_char }
+kw_filter = @{ "filter" ~ !ident_char }
+kw_find = @{ "find" ~ !ident_char }
+kw_first = @{ "first" ~ !ident_char }
+kw_flags = @{ "flags" ~ !ident_char }
+kw_from = @{ "from" ~ !ident_char }
+kw_getschema = @{ "getschema" ~ !ident_char }
+kw_granny_asc = @{ "granny-asc" ~ !ident_char }
+kw_granny_desc = @{ "granny-desc" ~ !ident_char }
+kw_in = @{ "in" ~ !(ident_char | "~") }
+kw_invoke = @{ "invoke" ~ !ident_char }
+kw_isfuzzy = @{ "isfuzzy" ~ !ident_char }
+kw_join = @{ "join" ~ !ident_char }
+kw_kind = @{ "kind" ~ !ident_char }
+kw_last = @{ "last" ~ !ident_char }
+kw_let = @{ "let" ~ !ident_char }
+kw_limit = @{ "limit" ~ !ident_char }
+kw_lookup = @{ "lookup" ~ !ident_char }
+kw_make_series = @{ "make-series" ~ !ident_char }
+kw_mv_apply = @{ "mv-apply" ~ !ident_char }
+kw_mv_expand = @{ "mv-expand" ~ !ident_char }
+kw_mvapply = @{ "mvapply" ~ !ident_char }
+kw_mvexpand = @{ "mvexpand" ~ !ident_char }
+kw_nulls = @{ "nulls" ~ !ident_char }
+kw_of = @{ "of" ~ !ident_char }
+kw_on = @{ "on" ~ !ident_char }
+kw_or = @{ "or" ~ !ident_char }
+kw_order = @{ "order" ~ !ident_char }
+kw_parse = @{ "parse" ~ !(ident_char | "-") }
+kw_parse_kv = @{ "parse-kv" ~ !ident_char }
+kw_parse_where = @{ "parse-where" ~ !ident_char }
+kw_print = @{ "print" ~ !ident_char }
+kw_project = @{ "project" ~ !(ident_char | "-") }
+kw_project_away = @{ "project-away" ~ !ident_char }
+kw_project_keep = @{ "project-keep" ~ !ident_char }
+kw_project_rename = @{ "project-rename" ~ !ident_char }
+kw_project_reorder = @{ "project-reorder" ~ !ident_char }
+kw_project_smart = @{ "project-smart" ~ !ident_char }
+kw_range = @{ "range" ~ !ident_char }
+kw_render = @{ "render" ~ !ident_char }
+kw_sample = @{ "sample" ~ !(ident_char | "-") }
+kw_sample_distinct = @{ "sample-distinct" ~ !ident_char }
+kw_search = @{ "search" ~ !ident_char }
+kw_serialize = @{ "serialize" ~ !ident_char }
+kw_set = @{ "set" ~ !ident_char }
+kw_sort = @{ "sort" ~ !ident_char }
+kw_step = @{ "step" ~ !ident_char }
+kw_summarize = @{ "summarize" ~ !ident_char }
+kw_take = @{ "take" ~ !ident_char }
+kw_to = @{ "to" ~ !ident_char }
+kw_top = @{ "top" ~ !(ident_char | "-") }
+kw_top_hitters = @{ "top-hitters" ~ !ident_char }
+kw_typeof = @{ "typeof" ~ !ident_char }
+kw_union = @{ "union" ~ !ident_char }
+kw_view = @{ "view" ~ !ident_char }
+kw_where = @{ "where" ~ !ident_char }
+kw_with = @{ "with" ~ !ident_char }
+kw_with_itemindex = @{ "with_itemindex" ~ !ident_char }
+kw_with_source = @{ "with_source" ~ !ident_char }
+kw_withsource = @{ "withsource" ~ !ident_char }

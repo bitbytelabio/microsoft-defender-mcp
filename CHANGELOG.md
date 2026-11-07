@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `defender_hunting` actions `validate`, `schema` and `tables`. `validate` parses a query and applies the query policy without calling Defender; `schema` returns a table's columns (cached for an hour); `tables` lists the known Advanced Hunting tables with kind, time column and entity columns.
+- The KQL hunting skill as an MCP resource, `skill://ms-defender/kql-hunting` (markdown). The server now advertises the `resources` capability, and its instructions are short and point to the skill.
+- The `kql-parser` crate (`crates/kql-parser`, Apache-2.0): a KQL parser from a pest grammar derived from Microsoft's Kusto.Language, a query analysis and a read-only safety policy. The repository is now a Cargo workspace.
+- Investigation skills as MCP prompts: `kql_hunting_skill`, `ioc_sweep_skill`, `incident_investigation_skill`, `compromised_user_skill` and `persistence_hunt_skill`. They return read-only playbooks with KQL for the existing tools; `ioc_sweep_skill` refangs and classifies indicators into a ready-to-run sweep query. The server now advertises the `prompts` capability.
+- `--allowed-hosts` (`DEFENDER_ALLOWED_HOSTS`): `Host` header values the HTTP transport accepts. The default stays loopback only. Needed to serve behind a Kubernetes Service or a gateway that calls the server by its service name.
+
+### Changed
+
+- `defender_hunting` `run` checks the query with `kql-parser` before it reaches Graph and refuses outside data, other clusters, outbound plugins, `set`, unscoped `search`/`find`, wildcard tables, management commands, queries that do not parse or do not end with a tabular expression, and queries that read no table, with structured problems. It appends `| take <maxRows + 1>` (`maxRows` defaults to 1,000, at most 99,999) and answers with columns once, rows as arrays, `rowCount` and `truncated` instead of Graph's `schema`/`results` objects. On HTTP 400 the error carries Graph's own message (`upstreamMessage`).
+
+### Fixed
+
+- The HTTP transport also shuts down on SIGTERM, not only on Ctrl+C, so container orchestrators stop it promptly.
+
 ## [1.0.0] - 2026-10-08
 
 ### Breaking Changes

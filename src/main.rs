@@ -20,6 +20,7 @@ use microsoft_defender_mcp_server::cli::{
 };
 use microsoft_defender_mcp_server::client::{EndpointClient, GraphClient};
 use microsoft_defender_mcp_server::constants::{ENV_REMOVED_TOOL_MODE, REQUEST_TIMEOUT_SECS};
+use microsoft_defender_mcp_server::hunting::SchemaCache;
 use microsoft_defender_mcp_server::server::DefenderServer;
 
 #[tokio::main]
@@ -54,6 +55,12 @@ async fn main() -> anyhow::Result<()> {
         || cli.enable_triage;
     let cli_read_only = cli.read_only;
 
+    let allowed_hosts: Vec<String> = cli
+        .allowed_hosts
+        .iter()
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .collect();
     let config = ServerConfig::from_cli(cli);
 
     // Non-fatal notices to stderr.
@@ -125,7 +132,16 @@ async fn main() -> anyhow::Result<()> {
 
     // 7. Serve or bind HTTP.
     match config.transport {
-        TransportMode::Http => run_http(graph_client, endpoint_client, config, audit_sink).await,
+        TransportMode::Http => {
+            run_http(
+                graph_client,
+                endpoint_client,
+                config,
+                audit_sink,
+                allowed_hosts,
+            )
+            .await
+        }
         TransportMode::Stdio => run_stdio(graph_client, endpoint_client, config, audit_sink).await,
     }
 }
@@ -152,6 +168,7 @@ async fn run_http(
     endpoint_client: EndpointClient,
     config: ServerConfig,
     audit_sink: Option<Arc<AuditSink>>,
+    allowed_hosts: Vec<String>,
 ) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -160,16 +177,28 @@ async fn run_http(
     let bind_addr = config.bind_address.clone();
     let ct = tokio_util::sync::CancellationToken::new();
 
+    let mut http_config =
+        StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token());
+    if allowed_hosts.iter().any(|h| h == "*") {
+        tracing::warn!("Host header check disabled (--allowed-hosts '*')");
+        http_config = http_config.disable_allowed_hosts();
+    } else if !allowed_hosts.is_empty() {
+        tracing::info!(hosts = ?allowed_hosts, "accepting HTTP Host values");
+        http_config = http_config.with_allowed_hosts(allowed_hosts);
+    }
+
+    // One server per HTTP session; Advanced Hunting schemas are cached for all of them.
+    let schema_cache = SchemaCache::default();
     let service = StreamableHttpService::new(
         move || {
             let g = graph_client.clone();
             let e = endpoint_client.clone();
             let c = config.clone();
             let a = audit_sink.clone();
-            Ok(DefenderServer::new_with_config(g, e, c, a))
+            Ok(DefenderServer::new_with_config(g, e, c, a).with_schema_cache(schema_cache.clone()))
         },
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
+        http_config,
     );
 
     let router = axum::Router::new().nest_service("/mcp", service);
@@ -180,10 +209,25 @@ async fn run_http(
         res = axum::serve(listener, router) => {
             res?;
         }
-        _ = tokio::signal::ctrl_c() => {
+        _ = shutdown_signal() => {
             tracing::info!("Shutdown signal received, draining HTTP connections...");
             cancel.cancel();
         }
     }
     Ok(())
+}
+
+/// Ctrl+C, or SIGTERM on Unix (how Kubernetes and most supervisors stop a process).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }

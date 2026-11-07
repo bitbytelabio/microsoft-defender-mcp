@@ -1,0 +1,16 @@
+[package]
+name = "kql-parser"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "KQL (Kusto Query Language) parser: a pest grammar derived from Microsoft's Kusto.Language, a query analysis (tables, columns, operators, outside access) and a read-only safety policy"
+license = "Apache-2.0"
+repository = "https://github.com/bitbytelabio/microsoft-defender-mcp"
+keywords = ["kql", "kusto", "parser", "pest", "security"]
+categories = ["parser-implementations", "database"]
+publish = ["crates-io"]
+include = ["src/**/*", "tests/**/*", "Cargo.toml", "LICENSE", "NOTICE"]
+
+[dependencies]
+pest = "2.8"
+pest_derive = "2.8"

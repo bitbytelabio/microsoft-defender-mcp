@@ -171,6 +171,51 @@ impl ApiClient {
             .await
             .map(|r| r.body)
     }
+
+    /// POST whose HTTP 400 error also carries the upstream service's own message
+    /// (`upstreamMessage`), for requests where that message says how to fix the input.
+    async fn post_explained(
+        &self,
+        path: &str,
+        body: &Value,
+        category: PermissionCategory,
+    ) -> Result<Value, CallToolResult> {
+        let token = self.token().await?;
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.base_url))
+            .header(CONTENT_TYPE, "application/json; charset=utf-8")
+            .json(body)
+            .bearer_auth(&token)
+            .header(ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|e| network_error(&e, path))?;
+        if resp.status().as_u16() != 400 {
+            return read_json(resp, path, &self.token_manager, category)
+                .await
+                .map(|r| r.body);
+        }
+        let upstream = resp
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| v.pointer("/error/message")?.as_str().map(str::to_owned));
+        let base = http_error(400, path, self.token_manager.auth_kind(), category);
+        Err(match (upstream, base.structured_content.clone()) {
+            (Some(message), Some(Value::Object(mut m))) => {
+                let message: String = message.chars().take(2000).collect();
+                let error = m.get("error").and_then(Value::as_str).unwrap_or_default();
+                m.insert(
+                    "error".into(),
+                    Value::String(format!("{error} Upstream: {message}")),
+                );
+                m.insert("upstreamMessage".into(), Value::String(message));
+                CallToolResult::structured_error(Value::Object(m))
+            }
+            _ => base,
+        })
+    }
 }
 
 /// Reject non-success statuses with `http_error`, otherwise decode the JSON body.
@@ -289,6 +334,18 @@ impl GraphClient {
 
     pub async fn graph_post(&self, path: &str, body: &Value) -> Result<Value, CallToolResult> {
         self.graph_post_as(path, body, PermissionCategory::ReadGraph)
+            .await
+    }
+
+    /// Read-only POST that reports Graph's own message on HTTP 400 (`upstreamMessage`), such as
+    /// the KQL error of an Advanced Hunting query.
+    pub async fn graph_post_explained(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<Value, CallToolResult> {
+        self.0
+            .post_explained(path, body, PermissionCategory::ReadGraph)
             .await
     }
 
