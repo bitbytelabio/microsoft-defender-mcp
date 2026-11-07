@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-07
+
+### Breaking Changes
+
+- `defender_hunting` `run` checks the query with `kql-parser` before it reaches Graph and refuses outside data, other clusters, outbound plugins, `set`, unscoped `search`/`find`, wildcard tables, management commands, queries that do not parse or do not end with a tabular expression, and queries that read no table, with structured problems. It appends `| take <maxRows + 1>` (`maxRows` defaults to 1,000, at most 99,999) and answers with columns once, rows as arrays, `rowCount` and `truncated` instead of Graph's `schema`/`results` objects. On HTTP 400 the error carries Graph's own message (`upstreamMessage`).
+
 ### Added
 
 - `defender_hunting` actions `validate`, `schema` and `tables`. `validate` parses a query and applies the query policy without calling Defender; `schema` returns a table's columns (cached for an hour); `tables` lists the known Advanced Hunting tables with kind, time column and entity columns.
@@ -17,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `defender_hunting` `run` checks the query with `kql-parser` before it reaches Graph and refuses outside data, other clusters, outbound plugins, `set`, unscoped `search`/`find`, wildcard tables, management commands, queries that do not parse or do not end with a tabular expression, and queries that read no table, with structured problems. It appends `| take <maxRows + 1>` (`maxRows` defaults to 1,000, at most 99,999) and answers with columns once, rows as arrays, `rowCount` and `truncated` instead of Graph's `schema`/`results` objects. On HTTP 400 the error carries Graph's own message (`upstreamMessage`).
+- `rustls` 0.23.46, which closes the four open Dependabot alerts. Also `rmcp` 3.8.0, `schemars` 1.2.3, `serde_json` 1.0.154, `sha2` 0.11.1, `tokio-util` 0.7.20, and `Swatinem/rust-cache` 2.9.3.
 
 ### Fixed
 

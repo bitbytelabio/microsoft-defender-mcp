@@ -624,6 +624,13 @@ The test matrix exercises:
 - Forensic staging: `0700`/`0600` permissions, SHA-256 digests, package-not-ready reporting, and quarantine-directory confinement.
 ---
 
+## Migrating from 1.x
+
+**Breaking change.** Release 2.0.0 changes `defender_hunting` `run`.
+
+- The action checks the query locally and refuses queries outside the read-only policy, with structured problems and no Defender call.
+- A successful answer is columns once, rows as arrays, `rowCount` and `truncated`. It is no longer Graph's `schema` / `results` objects.
+
 ## Migrating from 0.x
 
 **Breaking change.** Release 1.0.0 removes granular mode, the `--tool-mode` flag, and the `DEFENDER_TOOL_MODE` variable.

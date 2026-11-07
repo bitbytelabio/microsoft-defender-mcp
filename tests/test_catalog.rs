@@ -438,11 +438,11 @@ fn test_all_categories_enabled_lists_ten_tools_full_annotations_and_server_info(
         let init_resp: Value = serde_json::from_str(&line).expect("valid JSON initialize response");
         let result = &init_resp["result"];
 
-        // Assert literal "1.0.0"
+        // Assert literal "2.0.0"
         let ver = result["serverInfo"]["version"]
             .as_str()
             .expect("version string");
-        assert_eq!(ver, "1.0.0", "serverInfo.version must be literal '1.0.0'");
+        assert_eq!(ver, "2.0.0", "serverInfo.version must be literal '2.0.0'");
 
         // Assert instructions contain NO migration-table name
         let instructions = result["instructions"]
